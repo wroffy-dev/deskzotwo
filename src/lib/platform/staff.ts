@@ -9,7 +9,7 @@ import { controlDb } from "@/lib/platform/control-db";
 import { sendPlatformMail } from "@/lib/platform/mailer";
 import { templateMail } from "@/lib/platform/mail/templates";
 import { staffTwoFactorPolicy } from "@/lib/platform/settings";
-import { PLATFORM_DOMAIN, protocolFor } from "@/lib/tenancy/host";
+import { PLATFORM_DOMAIN, consoleServedHere, protocolFor } from "@/lib/tenancy/host";
 
 /**
  * Looking after the platform's staff — from the console (owners only) and `npm run platform:staff`.
@@ -28,8 +28,26 @@ const sha256 = (value: string) => createHash("sha256").update(value).digest("hex
 
 export class StaffChangeRefused extends Error {}
 
+/**
+ * Where staff open the console — for links in alerts, support mail and owners' notices. The separate
+ * admin app's address when PLATFORM_CONSOLE_ORIGIN names it (e.g. https://console.deskzoadmin.com);
+ * otherwise this server's own admin.<domain>.
+ */
 export function consoleOrigin(): string {
+  const external = process.env.PLATFORM_CONSOLE_ORIGIN?.trim().replace(/\/+$/, "");
+  if (external && /^https?:\/\/[^/\s]+$/.test(external)) return external;
   const host = `admin.${PLATFORM_DOMAIN}${process.env.PLATFORM_PORT ? `:${process.env.PLATFORM_PORT}` : ""}`;
+  return `${protocolFor(host)}://${host}`;
+}
+
+/**
+ * Where the payment gateways and the scheduler reach this server's platform API (webhooks, ticks): the
+ * console's address while it is served here, else the bare domain — never the separate admin app,
+ * which has no such routes.
+ */
+export function platformApiOrigin(): string {
+  if (consoleServedHere() && !process.env.PLATFORM_CONSOLE_ORIGIN?.trim()) return consoleOrigin();
+  const host = `${PLATFORM_DOMAIN}${process.env.PLATFORM_PORT ? `:${process.env.PLATFORM_PORT}` : ""}`;
   return `${protocolFor(host)}://${host}`;
 }
 

@@ -85,6 +85,17 @@ export function classifyHost(host: string): HostKind {
   return { kind: "tenant", slug: sub, host };
 }
 
+/**
+ * Whether this server still serves the staff console on admin.<PLATFORM_DOMAIN>. DESKZO_CONSOLE=off once
+ * the console runs as its own app on its own VM and domain (wroffy-dev/deskzotwo-admin, through
+ * docs/internal-api.md): the address stays the platform's — never a workspace's — but its pages answer
+ * 404 and it gets no certificate. The scheduled ticks and payment webhooks still answer there, on their
+ * secrets, for a server whose DNS has not moved yet; they answer on the bare domain as well.
+ */
+export function consoleServedHere(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.DESKZO_CONSOLE?.trim().toLowerCase() !== "off";
+}
+
 export const HOST_MISMATCH = Symbol("host-mismatch");
 
 /**

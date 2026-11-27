@@ -1,0 +1,15 @@
+# The CRM VM in the split deployment (docs/deploy-split.md): deploy/azure/docker-compose.yml, plus the
+# internal API's listener on this VM's private address for the admin app. Run from deploy/azure:
+#
+#   docker compose -f docker-compose.yml -f ../split/docker-compose.crm.yml up -d
+#
+# Paths here are relative to deploy/azure, the project directory.
+services:
+  caddy:
+    ports:
+      # Only on the private address: never on the public one.
+      - "${CRM_PRIVATE_IP:?set CRM_PRIVATE_IP in .env}:8443:8443"
+    environment:
+      CRM_PRIVATE_IP: ${CRM_PRIVATE_IP}
+    volumes:
+      - ../split/Caddyfile:/etc/caddy/Caddyfile:ro

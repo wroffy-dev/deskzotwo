@@ -9,13 +9,12 @@ import { Panel } from "@/components/console/kit/panel";
 import { StatusPill } from "@/components/console/kit/status";
 import { DataTable, RowActionsCell, TBody, THead, Td, Th, Tr } from "@/components/console/kit/table";
 import { OutboundLink } from "@/components/ui/outbound-link";
-import { BUILTIN_PAGE_SLUGS } from "@/lib/cms/types";
 import { cmsAdminCount, cmsOrigin, listCmsUsers } from "@/lib/cms/users";
 import { PAGE_ROLES } from "@/lib/console-shared/nav";
 import { capsFor } from "@/lib/console-shared/roles";
 import { consoleClock } from "@/lib/platform/console-clock";
 import { consoleStaff } from "@/lib/platform/console-page";
-import { controlDb } from "@/lib/platform/control-db";
+import { websiteCounts } from "@/lib/platform/console-page-reads";
 import { InviteCmsAdminButton } from "./invite-cms-admin";
 
 export const metadata: Metadata = { title: "Website CMS" };
@@ -23,24 +22,6 @@ export const metadata: Metadata = { title: "Website CMS" };
 const num = (n: number) => n.toLocaleString("en-IN");
 
 /** What the CMS holds, in three numbers — read here, not in the CMS's own code, and nothing from inside a document. */
-async function websiteCounts(now = new Date()) {
-  const control = controlDb();
-  const [pagesPublished, builtinsPublished, postsLive, leadsNew] = await Promise.all([
-    control.sitePage.count({ where: { status: "PUBLISHED", archivedAt: null } }),
-    control.sitePage.count({ where: { status: "PUBLISHED", archivedAt: null, slug: { in: [...BUILTIN_PAGE_SLUGS] } } }),
-    control.sitePost.count({ where: { status: { in: ["PUBLISHED", "SCHEDULED"] }, archivedAt: null, publishAt: { lte: now } } }),
-    control.siteLead.count({ where: { status: "NEW" } }),
-  ]);
-  // Built-in pages nobody has published still show their default content on the site.
-  return { pages: pagesPublished + (BUILTIN_PAGE_SLUGS.length - builtinsPublished), pagesFromCms: pagesPublished, postsLive, leadsNew };
-}
-
-/**
- * The website's CMS, from the console (owners and admins): where it is, what it holds, and its admins.
- * The CMS is its own app with its own accounts at cms.<domain> — staff do not sign in to it. This page
- * is how it gets its first admin (an owner invites one; `npm run cms:user` does the same from the
- * server), and how an admin who lost their way in gets a new setup link.
- */
 export default async function ConsoleWebsitePage() {
   const staff = await consoleStaff(PAGE_ROLES.website);
   const caps = capsFor(staff.role);

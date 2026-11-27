@@ -1,0 +1,63 @@
+# HTTPS for Deskzo One. Caddy gets each certificate from Let's Encrypt the first time a name is
+# asked for, after asking the app whether the name is one of ours (src/lib/tenancy/certificates.ts):
+# the site, www., admin., cms., partners., every workspace, and workspaces' own verified domains.
+# A name the app doesn't serve gets no certificate, so nobody can spend the weekly limit.
+
+{
+	email {$ACME_EMAIL}
+	# The admin app calls the internal API by IP, and a client sends no SNI for an IP: such a handshake is
+	# answered with the internal address's certificate. Every public client names a host and is unaffected.
+	default_sni {$CRM_PRIVATE_IP}
+	on_demand_tls {
+		ask http://app:3000/api/platform/tls-ask
+	}
+}
+
+# The website's address is www.; the bare domain sends people there.
+{$PLATFORM_DOMAIN} {
+	redir https://www.{$PLATFORM_DOMAIN}{uri} permanent
+}
+
+# Plain HTTP: biometric terminals only. eSSL / ZKTeco firmware mostly speaks plain HTTP, can't follow a
+# redirect, and set up with the server's IP number has no name to ask a certificate for — so /iclock is
+# answered here on port 80 as it is. Everything else is sent to HTTPS, as Caddy would on its own.
+# The iclock protocol has no authentication either way (src/app/api/biometric/iclock/[[...path]]/route.ts).
+http:// {
+	@iclock path /iclock /iclock/*
+	handle @iclock {
+		reverse_proxy app:3000
+	}
+	handle {
+		redir https://{host}{uri} 308
+	}
+}
+
+# ─── The internal API, for the admin app only (docs/deploy-split.md) ─────────────────────────────
+# On this VM's PRIVATE address, port 8443, with a certificate from Caddy's own internal authority:
+# the admin app trusts that authority's root (NODE_EXTRA_CA_CERTS) and nothing else does. Only
+# /api/internal/* is passed on; the app checks the host, the private network and the signature again.
+# The NSG allows 8443 from the admin VM's private address alone.
+https://{$CRM_PRIVATE_IP}:8443 {
+	tls internal
+	@internal path /api/internal/*
+	handle @internal {
+		reverse_proxy app:3000
+	}
+	respond 404
+}
+
+# Every other name.
+https:// {
+	tls {
+		on_demand
+	}
+
+	# The certificate question is for Caddy inside the server, never for the internet.
+	@tlsAsk path /api/platform/tls-ask
+	respond @tlsAsk 404
+
+	encode zstd gzip
+
+	# Caddy sets X-Forwarded-For, -Host and -Proto itself; the app believes them (TRUST_PROXY=1).
+	reverse_proxy app:3000
+}

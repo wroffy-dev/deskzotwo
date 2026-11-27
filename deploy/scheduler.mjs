@@ -1,5 +1,5 @@
 // The platform's scheduled calls (docs/runbook.md §1), made to the app inside the server rather than
-// through the internet: on the console's address, so each one runs for every workspace.
+// through the internet: on the platform's bare address, so each one runs for every workspace.
 //
 //   marketing   every 5 minutes    /api/marketing/tick   campaigns, lead scores, sales wins
 //   backup      every 15 minutes   /api/backup/tick      each workspace's scheduled backups
@@ -38,8 +38,9 @@ function call(job, app) {
         ...app,
         path: job.path,
         method: "GET",
-        // The console's address: on it a tick runs for every workspace (src/lib/platform/fanout.ts).
-        headers: { host: `admin.${DOMAIN}`, authorization: `Bearer ${secret}` },
+        // The platform's own bare address: on it a tick runs for every workspace (src/lib/platform/fanout.ts),
+        // whether or not this server still serves the console (DESKZO_CONSOLE). SCHEDULER_TICK_HOST overrides.
+        headers: { host: process.env.SCHEDULER_TICK_HOST?.trim() || DOMAIN, authorization: `Bearer ${secret}` },
         timeout: 10 * MINUTE,
       },
       (res) => {

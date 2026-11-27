@@ -14,13 +14,14 @@ import { pageHiddenFor } from "@/lib/staff/hidden-pages";
 import { clientIpFrom } from "@/lib/client-ip";
 import { DEVICE_COOKIE, DEVICE_COOKIE_MAX_AGE, newDeviceToken, validDeviceToken } from "@/lib/access/device-token";
 import { browseRedirect } from "@/lib/tenancy/browse-host";
-import { HOST_MISMATCH, classifyHost, protocolFor, requestHost } from "@/lib/tenancy/host";
+import { HOST_MISMATCH, classifyHost, consoleServedHere, protocolFor, requestHost } from "@/lib/tenancy/host";
 import { referralCookieDays } from "@/lib/partners/settings";
 import { CONSENT_COOKIE, REFERRAL_COOKIE, isReferralCode } from "@/lib/partners/referral-cookie";
 import { redirectablePath } from "@/lib/cms/redirect-rules";
 import { matchRedirect, recordHit } from "@/lib/cms/redirects";
 import { searchPolicy } from "@/lib/cms/search-policy";
 import { tenantForKind } from "@/lib/tenancy/registry";
+import { INTERNAL_API_PATH, internalApiHost, internalApiReachable } from "@/lib/internal-api/gate";
 import { runAsTenant } from "@/lib/tenancy/resolve";
 import type { Tenant } from "@/lib/tenancy/state";
 import { billingHeldPage, noWorkspacePage, unavailableWorkspacePage } from "@/lib/tenancy/pages";
@@ -217,6 +218,15 @@ const withSession = edgeAuth(async (req: NextRequest & { auth: unknown }) => {
   if (host === HOST_MISMATCH) {
     return harden(new NextResponse("Misdirected request.", { status: 421, headers: { "content-type": "text/plain; charset=utf-8" } }) as NextResponse, pathname);
   }
+  /**
+   * The internal API the separate admin app controls the CRM through (src/lib/internal-api/gate.ts):
+   * on its own private host, from the private network, and nowhere else — before any workspace is
+   * looked up, so no workspace's address, the public site or a custom domain ever answers it.
+   */
+  if (INTERNAL_API_PATH.test(pathname) || (host && internalApiHost() === host)) {
+    if (INTERNAL_API_PATH.test(pathname) && internalApiReachable(host, req.headers)) return NextResponse.next();
+    return NextResponse.json({ error: "Not found." }, { status: 404, headers: { "cache-control": "no-store" } });
+  }
   const kind = host ? classifyHost(host) : null;
   const tenant = kind ? await tenantForKind(kind) : null;
   const api = pathname === "/api" || pathname.startsWith("/api/");
@@ -227,6 +237,10 @@ const withSession = edgeAuth(async (req: NextRequest & { auth: unknown }) => {
    */
   if (!tenant && api && (kind?.kind === "root" || kind?.kind === "console") && PLATFORM_API.test(pathname)) {
     return NextResponse.next();
+  }
+  // The console runs as its own app elsewhere (DESKZO_CONSOLE=off): nothing else answers on its old address.
+  if (kind?.kind === "console" && !consoleServedHere()) {
+    return harden(new NextResponse("Not found.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } }) as NextResponse, pathname);
   }
   /**
    * The HTTPS proxy asks whether a name is ours before it gets a certificate for it

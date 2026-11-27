@@ -35,7 +35,7 @@ import { PAGE_ROLES } from "@/lib/console-shared/nav";
 import { capsFor } from "@/lib/console-shared/roles";
 import type { Tone } from "@/lib/console-shared/types";
 import { consoleStaff, platformEnv } from "@/lib/platform/console-page";
-import { controlDb } from "@/lib/platform/control-db";
+import { ownerEmails, staffNameById, waitingTaxInvoices } from "@/lib/platform/console-page-reads";
 import { configurationPresence, securityFacts } from "@/lib/platform/health";
 import { linkedSignInSetting } from "@/lib/platform/linked/groups";
 import { autoDeprovision, customDomainsOffered, gatewayModes, settingsOverview, signupOpen, staffTwoFactorPolicy, trialDays, trialSeats, type SettingRow } from "@/lib/platform/settings";
@@ -82,7 +82,7 @@ export default async function ConsoleSettingsPage() {
   // First: signed out, the page ends here with a redirect to /login; support and read-only staff get "not found".
   const staff = await consoleStaff(PAGE_ROLES.settings);
   const caps = capsFor(staff.role);
-  const [seller, bank, waitingInvoices] = await Promise.all([readSeller(), readBank(), controlDb().invoice.count({ where: { taxNumber: null, currency: "INR", status: "PAID" } })]);
+  const [seller, bank, waitingInvoices] = await Promise.all([readSeller(), readBank(), waitingTaxInvoices()]);
   const sellerIssue = sellerProblem(seller);
   const [rows, modes, policy, open, days, people, autoClose, presence, tick, facts, support, linked, domainsOffered, timeZone, mail, automate, ai, offsite] = await Promise.all([
     settingsOverview(),
@@ -110,7 +110,7 @@ export default async function ConsoleSettingsPage() {
   const env = platformEnv();
   const production = env.key === "production";
   // Who the alerts are emailed to (src/lib/platform/alert-notify.ts): the setting, else every active owner.
-  const owners = (await controlDb().platformUser.findMany({ where: { role: "OWNER", active: true }, select: { email: true }, orderBy: { email: "asc" } })).map((o) => o.email);
+  const owners = await ownerEmails();
 
   const row = (key: SettingRow["key"]) => rows.find((r) => r.key === key) ?? null;
   // The three signup settings are always saved together, so the form says when it was last saved.
@@ -621,7 +621,7 @@ async function automateState(): Promise<{ running: boolean; change: SettingChang
   // Unreadable (the console still works without it): shown as running, as the worker reads it fresh anyway.
   const setting = await platformPause().catch(() => ({ paused: false, updatedBy: null, updatedAt: null }));
   if (!setting.updatedAt) return { running: !setting.paused, change: null };
-  const name = setting.updatedBy ? ((await controlDb().platformUser.findUnique({ where: { id: setting.updatedBy }, select: { name: true } }))?.name ?? "a former staff member") : null;
+  const name = setting.updatedBy ? ((await staffNameById(setting.updatedBy)) ?? "a former staff member") : null;
   return { running: !setting.paused, change: { by: name, at: setting.updatedAt } };
 }
 
@@ -631,6 +631,6 @@ async function linkedSignInState(): Promise<{ enabled: boolean; change: SettingC
   const by = setting.updatedBy;
   let name: string | null = null;
   if (by?.includes(":")) name = actorLabel("SCRIPT", by, new Map());
-  else if (by) name = (await controlDb().platformUser.findUnique({ where: { id: by }, select: { name: true } }))?.name ?? "a former staff member";
+  else if (by) name = (await staffNameById(by)) ?? "a former staff member";
   return { enabled: setting.enabled, change: { by: name, at: setting.updatedAt } };
 }

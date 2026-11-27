@@ -16,7 +16,8 @@ import { offsiteStatus, type RunRow } from "@/lib/offsite/status";
 import { consoleStaff } from "@/lib/platform/console-page";
 import { redactSecrets } from "@/lib/console-shared/redact";
 import { storageBoxState } from "@/lib/storage/box";
-import { getSecret, getSetting } from "@/lib/platform/settings";
+import { getSetting } from "@/lib/platform/settings";
+import { secretIsSet } from "@/lib/platform/console-page-reads";
 import { storageSummary } from "@/lib/platform/storage-summary";
 import { gb } from "@/lib/storage/allowance";
 import { FILE_COLUMNS } from "@/lib/storage/registry";
@@ -354,7 +355,7 @@ export default async function ConsoleOffsitePage() {
  * workspace's files in it and still waiting in its own database (owner, 24 Nov 2026).
  */
 async function StorageBoxPanel({ canEdit, canCheck }: { canEdit: boolean; canCheck: boolean }) {
-  const [box, savedHere, container] = await Promise.all([storageBoxState(), getSecret("storage.connection").then(Boolean, () => false), getSetting("storage.container").catch(() => null)]);
+  const [box, savedHere, container] = await Promise.all([storageBoxState(), secretIsSet("storage.connection"), getSetting("storage.container").catch(() => null)]);
   return (
     <Panel
       id="storage-box"

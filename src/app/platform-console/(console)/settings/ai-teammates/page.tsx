@@ -7,7 +7,7 @@ import { ConsoleAiTeammates, type ConsoleTeammatesData, type LookCell } from "@/
 import { PAGE_ROLES } from "@/lib/console-shared/nav";
 import { capsFor } from "@/lib/console-shared/roles";
 import { countryPack } from "@/lib/country-pack";
-import { controlDb } from "@/lib/platform/control-db";
+import { workspaceCountries } from "@/lib/platform/console-page-reads";
 import { notMigratedYet } from "@/lib/not-migrated";
 import { consoleStaff } from "@/lib/platform/console-page";
 import { DEFAULT_TEAMMATE_PHOTOS } from "@/lib/ai/teammate-default-photos";
@@ -24,7 +24,7 @@ export const metadata: Metadata = { title: "AI teammates" };
 export default async function ConsoleAiTeammatesPage() {
   const staff = await consoleStaff(PAGE_ROLES.settings);
   const canEdit = capsFor(staff.role).manage;
-  const loaded = await Promise.all([allLookRows(), controlDb().tenant.findMany({ distinct: ["country"], select: { country: true } })]).catch((err) => {
+  const loaded = await Promise.all([allLookRows(), workspaceCountries()]).catch((err) => {
     if (notMigratedYet(err) || (err instanceof Error && /platform_teammate_looks/.test(err.message))) return null;
     throw err;
   });

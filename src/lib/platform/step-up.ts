@@ -1,3 +1,4 @@
+import { INTERNAL_SESSION_PREFIX, internalActor } from "@/lib/internal-api/actor";
 import { controlDb } from "@/lib/platform/control-db";
 import { openForPlatform } from "@/lib/platform/kek";
 import { sendPlatformMail } from "@/lib/platform/mailer";
@@ -25,6 +26,15 @@ import { verifyTotpCodeOnce } from "@/lib/totp";
 export const STEP_UP_REFUSED = "That code is not right — enter a fresh code from your authenticator.";
 
 export async function confirmStaffCode(staff: Pick<Staff, "id">, code: unknown, options: { allowWithoutAuthenticator?: boolean } = {}): Promise<void> {
+  // Inside a call from the admin app, it checked the code against its own authenticators and says
+  // when, signed (src/lib/internal-api/actor.ts). A step-up older than the window does not count.
+  const actor = internalActor();
+  if (actor) {
+    if (actor.id !== staff.id || !actor.stepUpAt || Date.now() - actor.stepUpAt.getTime() > STEP_UP_WINDOW_MS || actor.stepUpAt.getTime() > Date.now() + 5000) {
+      throw new StaffChangeRefused(STEP_UP_REFUSED);
+    }
+    return;
+  }
   const keys = [`console|step-up:${staff.id}`];
   const locked = lockoutState(keys);
   if (locked.lockedOut) throw new StaffChangeRefused(`Too many wrong codes. Try again in ${Math.ceil(locked.retryInSeconds / 60)} minute(s).`);
@@ -78,6 +88,11 @@ export const STEP_UP_WINDOW_MS = 10 * 60_000;
  * same person, or the same cookie after the window, does not count.
  */
 export async function recordStepUp(staff: Pick<Staff, "id">, sessionId: string, code: unknown): Promise<Date> {
+  // The admin app records its own step-ups; inside its call, the one it vouched for is the answer.
+  if (sessionId.startsWith(INTERNAL_SESSION_PREFIX)) {
+    await confirmStaffCode(staff, code);
+    return internalActor()?.stepUpAt ?? new Date();
+  }
   await confirmStaffCode(staff, code);
   const at = new Date();
   await controlDb().platformSession.update({ where: { id: sessionId }, data: { stepUpAt: at } });
@@ -86,6 +101,10 @@ export async function recordStepUp(staff: Pick<Staff, "id">, sessionId: string, 
 
 /** Whether this console session gave a fresh code within the window. */
 export async function recentStepUp(sessionId: string, now: number = Date.now()): Promise<boolean> {
+  if (sessionId.startsWith(INTERNAL_SESSION_PREFIX)) {
+    const at = internalActor()?.stepUpAt?.getTime();
+    return at !== undefined && at <= now + 1000 && now - at <= STEP_UP_WINDOW_MS;
+  }
   const session = await controlDb().platformSession.findUnique({ where: { id: sessionId }, select: { stepUpAt: true } });
   const at = session?.stepUpAt?.getTime();
   return at !== undefined && at <= now + 1000 && now - at <= STEP_UP_WINDOW_MS;

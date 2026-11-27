@@ -1,3 +1,4 @@
+import { INTERNAL_SESSION_PREFIX, internalActor } from "@/lib/internal-api/actor";
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
 import { cookies, headers } from "next/headers";
@@ -84,6 +85,18 @@ async function cookieName(): Promise<string> {
 }
 
 export async function currentStaffSession(): Promise<StaffSession | null> {
+  // Inside a verified call from the admin app (src/lib/internal-api/actor.ts): its staff member, whose
+  // sign-in and second factor the admin app checked. No cookie and no address rule apply here.
+  const actor = internalActor();
+  if (actor) {
+    return {
+      staff: { id: actor.id, email: actor.email, name: actor.name, role: actor.role },
+      sessionId: `${INTERNAL_SESSION_PREFIX}${actor.sessionRef}`,
+      mfaDone: true,
+      enrolled: true,
+      twoFactorRequired: true,
+    };
+  }
   if (!(await consoleAddressAllowed())) return null;
   const token = (await cookies()).get(await cookieName())?.value;
   if (!token || token.length > 100) return null;

@@ -7,7 +7,7 @@ import { PAGE_ROLES } from "@/lib/console-shared/nav";
 import { capsFor } from "@/lib/console-shared/roles";
 import { MAIL_TEMPLATES } from "@/lib/console-shared/mail-templates";
 import { consoleStaff } from "@/lib/platform/console-page";
-import { controlDb } from "@/lib/platform/control-db";
+import { staffNamesByIds } from "@/lib/platform/console-page-reads";
 import { savedWordings, wordingOf } from "@/lib/platform/mail/templates";
 
 export const metadata: Metadata = { title: "Mail templates" };
@@ -22,7 +22,7 @@ export default async function ConsoleMailTemplatesPage() {
   const caps = capsFor(staff.role);
   const saved = await savedWordings();
   const by = [...new Set(Object.values(saved).map((w) => w?.updatedBy).filter((id): id is string => !!id))];
-  const people = by.length ? await controlDb().platformUser.findMany({ where: { id: { in: by } }, select: { id: true, name: true } }).catch(() => []) : [];
+  const people = by.length ? await staffNamesByIds(by).catch(() => []) : [];
   const names = new Map(people.map((p) => [p.id, p.name]));
   const rows: TemplateRow[] = MAIL_TEMPLATES.map((def) => {
     const wording = wordingOf(def, saved);
