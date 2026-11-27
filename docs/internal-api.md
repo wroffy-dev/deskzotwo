@@ -77,11 +77,13 @@ Only what is in the table:
 - **Loaders:** what console pages read, as `load.<function>`. Each carries its page's role set.
 - **Never callable:** staff accounts, staff sign-in, sessions and authenticators. The admin app owns those.
 
+The admin app is [wroffy-dev/deskzotwo-admin](https://github.com/wroffy-dev/deskzotwo-admin). It copies the console's pages from this repository and calls these operations by the same names (its `scripts/sync-from-crm.mjs`).
+
 | Phase | Area | Status |
 |---|---|---|
-| 1 | Workspaces: directory, Workspace 360 panels, hold/reopen/close, plans and limits, trials, billing details, notes and tags, support entry, admin password reset, nav counts, search | In the table |
-| 2 | Provisioning, migrations, backups and restore, mail, AI, alerts, announcements, help, invites, names, signups, partners and commissions, devices, reference data, settings, website/CMS page, privacy | Next |
-| 3 | Switch the CRM's `admin.` host off (`DESKZO_CONSOLE=off`), deploy files, docs | After the admin app covers everything |
+| 1 | Every console action module (`console*.ts`), staff accounts excepted. Loaders for the workspace directory, every Workspace 360 tab, nav counts, alerts, the console's time zone and the schema list | In the table. Tested end to end with the admin app: sign-in, two-factor, the directory, Workspace 360, hold and reopen. |
+| 2 | Loaders for the other console pages: overview, provisioning, migrations, backups, mail, AI, billing, partners, settings… | Added page by page, with the admin app |
+| 3 | Switch the CRM's own `admin.` host off (`DESKZO_CONSOLE=off`), deploy files, docs | After the admin app covers everything |
 
 ## Environment
 

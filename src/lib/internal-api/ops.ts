@@ -3,16 +3,28 @@ import { ALL_ROLES, SELLERS } from "@/lib/console-shared/roles";
 import { PAGE_ROLES } from "@/lib/console-shared/nav";
 
 import * as consoleActions from "@/actions/platform/console";
+import * as consoleAi from "@/actions/platform/console-ai";
 import * as consoleAdmin from "@/actions/platform/console-admin";
 import * as consoleBilling from "@/actions/platform/console-billing";
 import * as consoleDirectory from "@/actions/platform/console-directory";
+import * as consoleDomains from "@/actions/platform/console-domains";
+import * as consoleOffline from "@/actions/platform/console-offline";
+import * as consolePartners from "@/actions/platform/console-partners";
 import * as consoleShell from "@/actions/platform/console-shell";
 import * as consoleSupport from "@/actions/platform/console-support";
 import * as consoleWorkspace from "@/actions/platform/console-workspace";
 
-import { navCounts } from "@/lib/platform/nav-counts";
-import { closedWorkspaces, directoryFacets, workspaceDirectory } from "@/lib/platform/workspace-directory";
-import { workspaceBilling, workspaceHeader, workspaceNotes, workspaceOps, workspacePlan, workspaceSupport, workspaceTimeline, workspaceUsage } from "@/lib/platform/workspace-data";
+import * as aiCredits from "@/lib/ai/credits";
+import * as bundleData from "@/lib/bundle/console-data";
+import * as partnersData from "@/lib/partners/console-data";
+import * as adoptionView from "@/lib/platform/adoption-view";
+import * as alerts from "@/lib/platform/alerts";
+import { consoleZone } from "@/lib/platform/console-clock";
+import * as navCountsMod from "@/lib/platform/nav-counts";
+import { workspaceMigrationNames } from "@/lib/platform/schema-info";
+import * as supportData from "@/lib/support/console";
+import * as workspaceData from "@/lib/platform/workspace-data";
+import * as workspaceDirectory from "@/lib/platform/workspace-directory";
 
 /**
  * What the admin app may ask the CRM to do, by name. Nothing outside this table can be called.
@@ -66,26 +78,45 @@ function loader(fn: AnyFn, roles: readonly StaffRole[]): Op {
   return { kind: "loader", fn, roles };
 }
 
+/**
+ * The named read functions of a loader module, under `load.<function>`, with the role set of the page
+ * they serve. Named one by one: these modules also hold writers (chargeTurn, auditAttachmentOpen) and
+ * file access, which are never reachable this way.
+ */
+function loadersOf(mod: Record<string, unknown>, names: readonly string[], roles: readonly StaffRole[], overrides: Record<string, readonly StaffRole[]> = {}): [string, Op][] {
+  return names.map((name) => {
+    const fn = mod[name];
+    if (typeof fn !== "function") throw new Error(`internal API: ${name} is not a function`);
+    return [`load.${name}`, loader(fn as AnyFn, overrides[name] ?? roles)];
+  });
+}
+
+const sync = (fn: (...a: never[]) => unknown): AnyFn => (async (...a: never[]) => fn(...a)) as AnyFn;
+
 export const OPS: ReadonlyMap<string, Op> = new Map<string, Op>([
-  // Phase 1: workspaces (directory, Workspace 360, hold/reopen/close, plans, billing, support entry, admin reset).
+  // The console's actions: each checks its own roles.
   ...actionsOf("console", consoleActions),
+  ...actionsOf("console-ai", consoleAi),
   ...actionsOf("console-admin", consoleAdmin),
   ...actionsOf("console-billing", consoleBilling),
   ...actionsOf("console-directory", consoleDirectory),
+  ...actionsOf("console-domains", consoleDomains),
+  ...actionsOf("console-offline", consoleOffline),
+  ...actionsOf("console-partners", consolePartners),
   ...actionsOf("console-shell", consoleShell),
   ...actionsOf("console-support", consoleSupport),
   ...actionsOf("console-workspace", consoleWorkspace),
 
-  ["load.navCounts", loader(navCounts as AnyFn, every)],
-  ["load.workspaceDirectory", loader(workspaceDirectory as AnyFn, page("workspaces"))],
-  ["load.directoryFacets", loader(directoryFacets as AnyFn, page("workspaces"))],
-  ["load.closedWorkspaces", loader(closedWorkspaces as AnyFn, page("workspaces"))],
-  ["load.workspaceHeader", loader(workspaceHeader as AnyFn, page("workspaces"))],
-  ["load.workspaceNotes", loader(workspaceNotes as AnyFn, page("workspaces"))],
-  ["load.workspacePlan", loader(workspacePlan as AnyFn, page("workspaces"))],
-  ["load.workspaceBilling", loader(workspaceBilling as AnyFn, SELLERS as readonly StaffRole[])],
-  ["load.workspaceUsage", loader(workspaceUsage as AnyFn, page("workspaces"))],
-  ["load.workspaceSupport", loader(workspaceSupport as AnyFn, page("workspaces"))],
-  ["load.workspaceOps", loader(workspaceOps as AnyFn, page("workspaces"))],
-  ["load.workspaceTimeline", loader(workspaceTimeline as AnyFn, page("workspaces"))],
+  // What the pages read, with their pages' roles.
+  ...loadersOf(workspaceDirectory, ["workspaceDirectory", "directoryFacets", "workspacesCsv", "closedWorkspaces"], page("workspaces")),
+  ...loadersOf(workspaceData, ["workspaceNotes", "workspaceHeader", "workspacePlan", "workspaceBilling", "workspaceUsage", "workspaceSupport", "workspaceOps", "workspaceTimeline"], page("workspaces"), { workspaceBilling: SELLERS as readonly StaffRole[] }),
+  ...loadersOf(adoptionView, ["workspaceAdoption"], page("workspaces")),
+  ...loadersOf(alerts, ["alerts", "alertCounts", "alertsForTenant"], page("alerts")),
+  ...loadersOf(aiCredits, ["consoleCreditView"], page("workspaces")),
+  ...loadersOf(partnersData, ["workspaceAttribution", "partnerPicker"], page("partners")),
+  ...loadersOf(supportData, ["supportRequestsForTenant"], page("support")),
+  ...loadersOf(bundleData, ["backupCountFor"], page("backups")),
+  ...loadersOf(navCountsMod, ["navCounts"], every),
+  ["load.consoleZone", loader(consoleZone as AnyFn, every)],
+  ["load.workspaceMigrationNames", loader(sync(workspaceMigrationNames), every)],
 ]);

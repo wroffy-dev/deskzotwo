@@ -83,6 +83,10 @@ console.log("\n— What it can be asked —\n");
   }
   ok("staff sign-in is never an operation", !/actions\/platform\/staff-auth/.test(ops));
   ok("the public site's actions are never operations", !/actions\/platform\/(site|signup|partner-site|live-demo)"/.test(ops));
+  ok("loaders are named one by one, never a whole module", !/loadersOf\(\w+, page\(/.test(ops) && !/loadersOf\(\w+, every\)/.test(ops));
+  for (const writer of ["chargeTurn", "auditAttachmentOpen", "forgetAuditedOpens", "supportAttachmentForStaff", "billingManagers"]) {
+    ok(`${writer} is never reachable as a loader`, !new RegExp(`"${writer}"`).test(ops));
+  }
   const route = readFileSync(join(root, "src/app/api/internal/v1/rpc/route.ts"), "utf8");
   ok("the route checks the gate itself too", route.includes("internalApiReachable("));
   ok("the route checks loader roles", route.includes('op.kind === "loader" && !op.roles.includes(actor.role)'));
