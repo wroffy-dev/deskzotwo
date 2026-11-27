@@ -4,7 +4,7 @@ import { latestMigrationName } from "@/lib/platform/migrate";
 import { activeSupportGrant } from "@/lib/platform/support";
 import { parseEntitlements } from "@/lib/entitlements";
 import { billingStanding } from "@/lib/billing/lifecycle";
-import { consoleOrigin } from "@/lib/platform/staff";
+import { platformApiOrigin } from "@/lib/platform/staff";
 import { autoDeprovision, gatewayModes, getSetting, secretsSet, signupOpen, trialDays } from "@/lib/platform/settings";
 import { subdomainHost } from "@/lib/tenancy/registry";
 import { PLATFORM_DOMAIN, protocolFor } from "@/lib/tenancy/host";
@@ -363,7 +363,7 @@ export async function billingOverview() {
     trialCount(),
     lastTick(),
   ]);
-  const origin = consoleOrigin();
+  const origin = platformApiOrigin();
   const lastEventAt = (gateway: "STRIPE" | "RAZORPAY") => lastByGateway.find((r) => r.gateway === gateway)?._max.receivedAt ?? null;
   const failingAt = (gateway: "STRIPE" | "RAZORPAY") => failingByGatewayRows.find((r) => r.gateway === gateway)?._count._all ?? 0;
   return {

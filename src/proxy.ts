@@ -14,7 +14,7 @@ import { pageHiddenFor } from "@/lib/staff/hidden-pages";
 import { clientIpFrom } from "@/lib/client-ip";
 import { DEVICE_COOKIE, DEVICE_COOKIE_MAX_AGE, newDeviceToken, validDeviceToken } from "@/lib/access/device-token";
 import { browseRedirect } from "@/lib/tenancy/browse-host";
-import { HOST_MISMATCH, classifyHost, protocolFor, requestHost } from "@/lib/tenancy/host";
+import { HOST_MISMATCH, classifyHost, consoleServedHere, protocolFor, requestHost } from "@/lib/tenancy/host";
 import { referralCookieDays } from "@/lib/partners/settings";
 import { CONSENT_COOKIE, REFERRAL_COOKIE, isReferralCode } from "@/lib/partners/referral-cookie";
 import { redirectablePath } from "@/lib/cms/redirect-rules";
@@ -237,6 +237,10 @@ const withSession = edgeAuth(async (req: NextRequest & { auth: unknown }) => {
    */
   if (!tenant && api && (kind?.kind === "root" || kind?.kind === "console") && PLATFORM_API.test(pathname)) {
     return NextResponse.next();
+  }
+  // The console runs as its own app elsewhere (DESKZO_CONSOLE=off): nothing else answers on its old address.
+  if (kind?.kind === "console" && !consoleServedHere()) {
+    return harden(new NextResponse("Not found.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } }) as NextResponse, pathname);
   }
   /**
    * The HTTPS proxy asks whether a name is ours before it gets a certificate for it

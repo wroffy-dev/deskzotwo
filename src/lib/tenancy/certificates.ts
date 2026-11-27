@@ -1,4 +1,4 @@
-import { classifyHost } from "@/lib/tenancy/host";
+import { classifyHost, consoleServedHere } from "@/lib/tenancy/host";
 import { tenantForKind } from "@/lib/tenancy/registry";
 
 /**
@@ -17,7 +17,8 @@ export async function certificateAllowed(input: string | null | undefined): Prom
   const host = String(input ?? "").trim().toLowerCase().replace(/\.$/, "");
   if (!host || host.length > 253 || host.includes(":") || host.includes("/")) return false;
   const kind = classifyHost(host);
-  if (kind.kind === "root" || kind.kind === "console" || kind.kind === "cms" || kind.kind === "partners") return true;
+  if (kind.kind === "console") return consoleServedHere();
+  if (kind.kind === "root" || kind.kind === "cms" || kind.kind === "partners") return true;
   if (kind.kind !== "tenant" && kind.kind !== "other") return false;
   const tenant = await tenantForKind(kind);
   // A closed workspace's database is gone; a held or migrating one still shows its notice.

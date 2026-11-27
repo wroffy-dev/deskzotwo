@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { decode, encode } from "../src/lib/internal-api/codec";
 import { internalApiReachable } from "../src/lib/internal-api/gate";
+import { consoleServedHere } from "../src/lib/tenancy/host";
 import { MAX_SKEW_MS, acceptedSecrets, sign, signaturesMatch, spendNonce } from "../src/lib/internal-api/signing";
 
 let failures = 0;
@@ -105,6 +106,24 @@ console.log("\n— What it can be asked —\n");
   ok("requireStaff sees the admin app's staff member", session.includes("internalActor()"));
   const stepUp = readFileSync(join(root, "src/lib/platform/step-up.ts"), "utf8");
   ok("step-up codes are vouched for by the admin app, inside the window", stepUp.includes("actor.stepUpAt") && stepUp.includes("STEP_UP_WINDOW_MS"));
+}
+
+console.log("\n— The old console, switched off here —\n");
+{
+  ok("served here by default", consoleServedHere({} as NodeJS.ProcessEnv));
+  ok("not with DESKZO_CONSOLE=off", !consoleServedHere({ DESKZO_CONSOLE: "off" } as NodeJS.ProcessEnv) && !consoleServedHere({ DESKZO_CONSOLE: " OFF " } as NodeJS.ProcessEnv));
+  const proxy = readFileSync(join(root, "src/proxy.ts"), "utf8");
+  const apiAt = proxy.indexOf("PLATFORM_API.test(pathname)) {");
+  const offAt = proxy.indexOf('kind?.kind === "console" && !consoleServedHere()');
+  ok("switched off, the console's address answers 404 — after the ticks and webhooks, which still run", offAt > apiAt && apiAt > 0);
+  const certs = readFileSync(join(root, "src/lib/tenancy/certificates.ts"), "utf8");
+  ok("and gets no certificate", certs.includes('if (kind.kind === "console") return consoleServedHere();'));
+  const staff = readFileSync(join(root, "src/lib/platform/staff.ts"), "utf8");
+  ok("links in mail go to the admin app when PLATFORM_CONSOLE_ORIGIN names it", staff.includes("PLATFORM_CONSOLE_ORIGIN"));
+  const data = readFileSync(join(root, "src/lib/platform/console-data.ts"), "utf8");
+  ok("webhook addresses shown on Billing are this server's, never the admin app's", data.includes("platformApiOrigin()"));
+  const scheduler = readFileSync(join(root, "deploy/scheduler.mjs"), "utf8");
+  ok("the scheduler ticks on the bare domain", scheduler.includes("process.env.SCHEDULER_TICK_HOST?.trim() || DOMAIN"));
 }
 
 console.log(failures ? `\n${failures} failed.\n` : "\nAll passed.\n");
