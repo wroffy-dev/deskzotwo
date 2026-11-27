@@ -21,6 +21,7 @@ import { redirectablePath } from "@/lib/cms/redirect-rules";
 import { matchRedirect, recordHit } from "@/lib/cms/redirects";
 import { searchPolicy } from "@/lib/cms/search-policy";
 import { tenantForKind } from "@/lib/tenancy/registry";
+import { INTERNAL_API_PATH, internalApiHost, internalApiReachable } from "@/lib/internal-api/gate";
 import { runAsTenant } from "@/lib/tenancy/resolve";
 import type { Tenant } from "@/lib/tenancy/state";
 import { billingHeldPage, noWorkspacePage, unavailableWorkspacePage } from "@/lib/tenancy/pages";
@@ -216,6 +217,15 @@ const withSession = edgeAuth(async (req: NextRequest & { auth: unknown }) => {
   const host = requestHost(req.headers);
   if (host === HOST_MISMATCH) {
     return harden(new NextResponse("Misdirected request.", { status: 421, headers: { "content-type": "text/plain; charset=utf-8" } }) as NextResponse, pathname);
+  }
+  /**
+   * The internal API the separate admin app controls the CRM through (src/lib/internal-api/gate.ts):
+   * on its own private host, from the private network, and nowhere else — before any workspace is
+   * looked up, so no workspace's address, the public site or a custom domain ever answers it.
+   */
+  if (INTERNAL_API_PATH.test(pathname) || (host && internalApiHost() === host)) {
+    if (INTERNAL_API_PATH.test(pathname) && internalApiReachable(host, req.headers)) return NextResponse.next();
+    return NextResponse.json({ error: "Not found." }, { status: 404, headers: { "cache-control": "no-store" } });
   }
   const kind = host ? classifyHost(host) : null;
   const tenant = kind ? await tenantForKind(kind) : null;
