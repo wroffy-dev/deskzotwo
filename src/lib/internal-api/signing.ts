@@ -27,15 +27,15 @@ export type SignedHeaders = {
   "x-deskzo-signature": string;
 };
 
-export function bodyHash(body: string): string {
-  return createHash("sha256").update(body, "utf8").digest("hex");
+export function bodyHash(body: string | Uint8Array): string {
+  return createHash("sha256").update(typeof body === "string" ? Buffer.from(body, "utf8") : body).digest("hex");
 }
 
-export function canonical(input: { method: string; path: string; ts: string; nonce: string; actor: string; body: string }): string {
+export function canonical(input: { method: string; path: string; ts: string; nonce: string; actor: string; body: string | Uint8Array }): string {
   return [SIGNATURE_VERSION, input.method.toUpperCase(), input.path, input.ts, input.nonce, input.actor, bodyHash(input.body)].join("\n");
 }
 
-export function sign(secret: string, input: { method: string; path: string; ts: string; nonce: string; actor: string; body: string }): string {
+export function sign(secret: string, input: { method: string; path: string; ts: string; nonce: string; actor: string; body: string | Uint8Array }): string {
   return createHmac("sha256", secret).update(canonical(input), "utf8").digest("hex");
 }
 

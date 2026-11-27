@@ -87,10 +87,18 @@ console.log("\n— What it can be asked —\n");
   for (const writer of ["chargeTurn", "auditAttachmentOpen", "forgetAuditedOpens", "supportAttachmentForStaff", "billingManagers"]) {
     ok(`${writer} is never reachable as a loader`, !new RegExp(`"${writer}"`).test(ops));
   }
+  ok("getSecret is never reachable as a loader", !/"getSecret"/.test(ops));
   const route = readFileSync(join(root, "src/app/api/internal/v1/rpc/route.ts"), "utf8");
-  ok("the route checks the gate itself too", route.includes("internalApiReachable("));
+  const verify = readFileSync(join(root, "src/lib/internal-api/verify.ts"), "utf8");
+  ok("every route checks the gate itself too", verify.includes("internalApiReachable(") && route.includes("verifyInternalCall("));
+  const bridge = readFileSync(join(root, "src/app/api/internal/v1/http/route.ts"), "utf8");
+  ok("the file bridge verifies the call, its target included", bridge.includes("verifyInternalCall(request, body, `${PATH} ${target}`)"));
+  ok("the file bridge reaches only the console's four file routes", (bridge.match(/\{ re: \/\^/g) ?? []).length === 4);
+  ok("the file bridge runs the route as the admin app's staff member", bridge.includes("runAsInternalActor(actor"));
+  const mail = readFileSync(join(root, "src/lib/internal-api/staff-mail.ts"), "utf8");
+  ok("staff mail: only inside a verified call, only the staff templates", mail.includes("if (!internalActor())") && mail.includes('["staff.setup", "staff.reactivated", "staff.passwordLink"]'));
   ok("the route checks loader roles", route.includes('op.kind === "loader" && !op.roles.includes(actor.role)'));
-  ok("the route spends the nonce after the signature", route.indexOf("signaturesMatch(") < route.indexOf("spendNonce("));
+  ok("the nonce is spent after the signature", verify.indexOf("signaturesMatch(") < verify.indexOf("spendNonce("));
   const proxy = readFileSync(join(root, "src/proxy.ts"), "utf8");
   ok("the proxy gates /api/internal before any workspace lookup", proxy.indexOf("INTERNAL_API_PATH.test(pathname)") > 0 && proxy.indexOf("INTERNAL_API_PATH.test(pathname)") < proxy.indexOf("await tenantForKind(kind)"));
   const session = readFileSync(join(root, "src/lib/platform/staff-session.ts"), "utf8");

@@ -81,9 +81,42 @@ The admin app is [wroffy-dev/deskzotwo-admin](https://github.com/wroffy-dev/desk
 
 | Phase | Area | Status |
 |---|---|---|
-| 1 | Every console action module (`console*.ts`), staff accounts excepted. Loaders for the workspace directory, every Workspace 360 tab, nav counts, alerts, the console's time zone and the schema list | In the table. Tested end to end with the admin app: sign-in, two-factor, the directory, Workspace 360, hold and reopen. |
-| 2 | Loaders for the other console pages: overview, provisioning, migrations, backups, mail, AI, billing, partners, settings… | Added page by page, with the admin app |
-| 3 | Switch the CRM's own `admin.` host off (`DESKZO_CONSOLE=off`), deploy files, docs | After the admin app covers everything |
+| 1 | Every console action module (`console*.ts`), staff accounts excepted. Loaders for the workspace directory and Workspace 360 | Done |
+| 2 | Loaders for every other console page, each with its page's roles (`pages(...)`). `console-page-reads.ts` for what pages read inline. The file bridge. Staff mail | Done. All 42 pages tested from the admin app against a local CRM |
+| 3 | Switch the CRM's own `admin.` host off (`DESKZO_CONSOLE=off`), deploy files, docs | Next |
+
+### Files: `/api/internal/v1/http`
+
+The console's file routes are bridged here for the admin app:
+
+- `backup-files/[id]`
+- `backup-uploads`
+- `backup-uploads/[id]`
+- `support-files/[id]`
+
+How a call works:
+
+- The admin app sends the browser's request as it came: method, `x-deskzo-target` (the console path), a few named headers and the body, up to one 16 MB part.
+- The signature covers the target as well as the method and the body bytes.
+- The route handler runs as the admin app's staff member, and its response is streamed back.
+- Nothing but those four routes can be reached.
+
+### Staff mail: `admin.sendStaffMail`
+
+The admin app has no mail of its own. This operation sends, through the CRM's mail, only:
+
+- the three staff templates (`staff.setup`, `staff.reactivated`, `staff.passwordLink`);
+- a plain note to owners;
+
+and only inside a verified call.
+
+### Never reachable
+
+- `getSecret`: pages ask `secretIsSet`.
+- The writers that share modules with loaders: `chargeTurn`, attachment access and audit.
+- Staff accounts, sessions and authenticators.
+
+`check:internal-api` holds all three.
 
 ## Environment
 
