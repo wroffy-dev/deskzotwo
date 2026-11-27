@@ -1,0 +1,68 @@
+import { z } from "zod";
+import { tooLong } from "@/lib/validation/text";
+import { isSystemAddress } from "@/lib/people";
+
+
+/**
+ * A role key, checked against the database rather than against a union.
+ *
+ * This was `z.enum(ROLES)`, which could enumerate the eight roles the enum declared. Roles are rows
+ * now, so the schema can only say "a non-empty string" and the action behind it calls `roleExists`
+ * before writing — with the foreign key on `users.role` as the backstop if anything ever slips past
+ * both.
+ */
+const roleKey = z.string().trim().max(100, tooLong(100)).min(1, "Pick a role");
+
+export const updateUserAssignmentSchema = z.object({
+  id: z.string().max(100, tooLong(100)).min(1),
+  role: roleKey,
+  departmentId: z.string().max(100, tooLong(100)).min(1).nullable(),
+  managerId: z.string().max(100, tooLong(100)).min(1).nullable(),
+});
+
+export type UpdateUserAssignmentInput = z.infer<typeof updateUserAssignmentSchema>;
+
+/**
+ * The work profile a card and a signature print: the job title (the HR record's designation) and the
+ * work phone on the account. Editable from Staff & roles, so a workspace without People can still fill
+ * them in. Empty clears either.
+ */
+export const updateWorkProfileSchema = z.object({
+  id: z.string().max(100, tooLong(100)).min(1),
+  jobTitle: z.string().trim().max(80, "Keep the job title under 80 characters"),
+  phone: z.string().trim().max(32, "That is too long for a phone number"),
+});
+
+/** An account's address, adding it or changing it — as sign-in looks it up: trimmed, in small letters. */
+export const accountEmail = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(254, tooLong(254))
+  .email("Enter a valid email")
+  // Platform support's and the Automation account's addresses (src/lib/people.ts) are nobody's.
+  .refine((email) => !isSystemAddress(email), "That address is reserved. Enter the person's own email.");
+
+/**
+ * No password: the person chooses their own from the setup email (src/lib/account-setup.ts). A
+ * `temporaryPassword` an older caller still sends is dropped, like any other key the schema doesn't know.
+ */
+export const createUserSchema = z.object({
+  name: z.string().trim().max(200, tooLong(200)).min(2, "Name is required"),
+  email: accountEmail,
+  role: roleKey,
+  departmentId: z.string().max(100, tooLong(100)).optional().or(z.literal("")),
+  /** "This person already uses another workspace on this platform": the setup email is the one-step invite, which also offers linking. */
+  usesAnotherWorkspace: z.boolean().optional(),
+  /**
+   * Added with Staff & roles' Add staff form, and optional so every older caller is unchanged. The job
+   * title is their designation on the HR record (EmployeeProfile), the phone their work number on the
+   * account — the one a quote prints, never their personal mobile.
+   */
+  jobTitle: z.string().trim().max(80, "Keep the job title under 80 characters").optional().or(z.literal("")),
+  phone: z.string().trim().max(32, "That is too long for a phone number").optional().or(z.literal("")),
+  /** False makes the account switched off: no seat, and no setup email until somebody switches it on. Default on. */
+  active: z.boolean().optional(),
+});
+
+export type CreateUserInput = z.infer<typeof createUserSchema>;

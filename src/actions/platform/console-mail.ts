@@ -1,0 +1,174 @@
+"use server";
+
+import type { StaffRole } from "@deskzo/control-client";
+import type { ConsoleResult } from "@/actions/platform/console";
+import { OWNERS, consoleAudit, consoleRefusal, revalidateConsole } from "@/lib/platform/console-guard";
+import { deliverMail } from "@/lib/platform/mailer";
+import { MAIL_STREAMS, type MailType } from "@/lib/console-shared/mail-catalogue";
+import { recordTest, removeConnection, saveConnection, saveRoutes } from "@/lib/platform/mail/store";
+import { controlDb } from "@/lib/platform/control-db";
+import { ConsoleRefused } from "@/lib/platform/refused";
+import { StaffRefused, requireStaff, type Staff } from "@/lib/platform/staff-session";
+import { saveDocumentMailLimits, type DocumentMailLimits } from "@/lib/platform/document-mail-limits";
+import { saveHelpdeskFromOwnAddress } from "@/lib/platform/helpdesk-from";
+import { renderPlatformMail, saveWording } from "@/lib/platform/mail/templates";
+import { MAIL_TEMPLATES, type MailTemplateKey } from "@/lib/console-shared/mail-templates";
+import { sampleValues } from "@/lib/console-shared/mail-template-engine";
+
+/**
+ * Settings › Mail (src/lib/platform/mail): the accounts the platform's mail goes through and which
+ * one each type uses. Owners only, like every platform setting — an account's secret sends mail as
+ * the company. Every change is in the platform audit log, by field name; a secret never is.
+ *
+ *   consoleSaveMailConnection     add an account, or change one (a blank secret keeps the saved one)
+ *   consoleRemoveMailConnection   its types fall back to the default
+ *   consoleSaveMailRoutes         every type's account, From and Reply-To, at once
+ *   consoleSendTestMail           to the owner's own address: through one account, or as one type goes
+ */
+
+async function asStaff<T>(roles: readonly StaffRole[], work: (staff: Staff) => Promise<T>): Promise<ConsoleResult<T>> {
+  let staff: Staff;
+  try {
+    staff = await requireStaff(roles);
+  } catch (err) {
+    if (err instanceof StaffRefused) return { ok: false, error: err.message };
+    throw err;
+  }
+  try {
+    return { ok: true, data: await work(staff) };
+  } catch (err) {
+    const refusal = consoleRefusal(err);
+    if (refusal !== null) return { ok: false, error: refusal };
+    throw err;
+  }
+}
+
+/** Whether helpdesk replies through Deskzo's mail go from each workspace's own helpdesk address (src/lib/platform/helpdesk-from.ts). Owners only. */
+export async function consoleSaveHelpdeskFrom(on: boolean): Promise<ConsoleResult<boolean>> {
+  return asStaff(OWNERS, async (staff) => {
+    const saved = await saveHelpdeskFromOwnAddress(on === true, staff.id);
+    await consoleAudit(staff, "mail.helpdeskFrom", { on: saved });
+    revalidateConsole();
+    return saved;
+  });
+}
+
+/** Deskzo's daily limits on documents workspaces send through its mail (src/lib/platform/document-mail-limits.ts). Owners only. */
+export async function consoleSaveDocumentMailLimits(input: { personDaily: unknown; workspaceDaily: unknown }): Promise<ConsoleResult<DocumentMailLimits>> {
+  return asStaff(OWNERS, async (staff) => {
+    const saved = await saveDocumentMailLimits(input ?? { personDaily: null, workspaceDaily: null }, staff.id);
+    if (typeof saved === "string") throw new ConsoleRefused(saved);
+    await consoleAudit(staff, "mail.documentLimits", { personDaily: saved.personDaily, workspaceDaily: saved.workspaceDaily });
+    revalidateConsole();
+    return saved;
+  });
+}
+
+export async function consoleSaveMailConnection(input: unknown): Promise<ConsoleResult<{ id: string; created: boolean }>> {
+  return asStaff(OWNERS, async (staff) => {
+    const saved = await saveConnection(input, staff.id);
+    if (saved.created) await consoleAudit(staff, "mail.account.add", { name: saved.name, provider: saved.provider });
+    else if (saved.changed.length) await consoleAudit(staff, "mail.account.change", { name: saved.name, provider: saved.provider, changed: saved.changed });
+    revalidateConsole();
+    return { id: saved.id, created: saved.created };
+  });
+}
+
+export async function consoleRemoveMailConnection(id: unknown): Promise<ConsoleResult> {
+  return asStaff(OWNERS, async (staff) => {
+    const removed = await removeConnection(id);
+    await consoleAudit(staff, "mail.account.remove", { name: removed.name, provider: removed.provider, streams: removed.streams });
+    revalidateConsole();
+    return null;
+  });
+}
+
+export async function consoleSaveMailRoutes(routes: unknown): Promise<ConsoleResult<{ changed: string[] }>> {
+  return asStaff(OWNERS, async (staff) => {
+    const changed = await saveRoutes(routes, staff.id);
+    if (changed.length) await consoleAudit(staff, "mail.routes", { changed });
+    revalidateConsole();
+    return { changed };
+  });
+}
+
+/**
+ * A test mail to the owner's own address — through one account (`connectionId`, its own From; the
+ * result kept on the account), or as one type of mail goes now (`stream`). Logged like any mail, and
+ * marked as a test. A refusal from the server is the answer, not an error: it says what to fix.
+ */
+export async function consoleSendTestMail(input: { connectionId?: unknown; stream?: unknown }): Promise<ConsoleResult<{ ok: boolean; via: string; to: string; error: string | null }>> {
+  return asStaff(OWNERS, async (staff) => {
+    const connectionId = typeof input?.connectionId === "string" && input.connectionId ? input.connectionId : null;
+    const stream = MAIL_STREAMS.find((s) => s.key === input?.stream && s.key !== "DEFAULT")?.key as MailType | undefined;
+    if (!connectionId && !stream) throw new ConsoleRefused("Choose an account or a type of mail to test.");
+    const what = connectionId ? "this account" : `${MAIL_STREAMS.find((s) => s.key === stream)!.label} mail`;
+    const mail = {
+      type: stream ?? ("ACCOUNT" as const),
+      to: staff.email,
+      subject: "Test mail from the Deskzo console",
+      text: [`Hello ${staff.name},`, "", `This is a test of ${what}, sent from Settings › Mail in the console.`, "", "If it arrived, the account works. Nothing to do."].join("\n"),
+    };
+    let result: { ok: boolean; via: string; error: string | null };
+    try {
+      const sent = await deliverMail(mail, { connectionId: connectionId ?? undefined, test: true });
+      result = { ok: true, via: sent.via, error: null };
+    } catch (err) {
+      if (err instanceof ConsoleRefused) throw err;
+      // The reason as the Mail log has just recorded it — secrets masked there once, the same here.
+      const logged = await controlDb().mailDelivery.findFirst({ where: { test: true, status: "FAILED", toAddresses: { has: staff.email } }, orderBy: { at: "desc" }, select: { error: true } });
+      result = { ok: false, via: "", error: logged?.error ?? "The mail server refused it." };
+    }
+    if (connectionId) await recordTest(connectionId, result.ok, result.error);
+    await consoleAudit(staff, "mail.test", { target: connectionId ? "account" : stream, ok: result.ok });
+    revalidateConsole();
+    return { ...result, to: staff.email };
+  });
+}
+
+// ─── Templates: the wording of Deskzo's own emails (owner, 1 Nov 2026; src/lib/platform/mail/templates.ts) ───
+
+function templateKeyOf(key: unknown): MailTemplateKey {
+  const def = MAIL_TEMPLATES.find((t) => t.key === key);
+  if (!def) throw new ConsoleRefused("There's no such email.");
+  return def.key;
+}
+
+/** An email's subject and text, as an owner words it. Refused, with the reason, if it breaks a rule. */
+export async function consoleSaveMailTemplate(input: { key: unknown; subject: unknown; text: unknown }): Promise<ConsoleResult<null>> {
+  return asStaff(OWNERS, async (staff) => {
+    const key = templateKeyOf(input?.key);
+    const saved = await saveWording(key, { subject: String(input?.subject ?? ""), text: String(input?.text ?? "") }, staff.id);
+    if (!saved.ok) throw new ConsoleRefused(saved.error);
+    await consoleAudit(staff, "mail.template", { key, change: "edited" });
+    revalidateConsole();
+    return null;
+  });
+}
+
+/** Back to Deskzo's wording. */
+export async function consoleResetMailTemplate(key: unknown): Promise<ConsoleResult<null>> {
+  return asStaff(OWNERS, async (staff) => {
+    const k = templateKeyOf(key);
+    await saveWording(k, null, staff.id);
+    await consoleAudit(staff, "mail.template", { key: k, change: "reset" });
+    revalidateConsole();
+    return null;
+  });
+}
+
+/** The email as it would go now, with the sample values, to the owner's own address — marked a test. */
+export async function consoleSendTemplateTest(key: unknown): Promise<ConsoleResult<{ to: string }>> {
+  return asStaff(OWNERS, async (staff) => {
+    const def = MAIL_TEMPLATES.find((t) => t.key === templateKeyOf(key))!;
+    const mail = await renderPlatformMail(def.key, sampleValues(def.fields));
+    try {
+      await deliverMail({ type: def.type, to: staff.email, subject: `[Test] ${mail.subject}`, text: mail.text, html: mail.html, ...(def.fromWorkspace ? { fromName: `${sampleValues(def.fields).workspace ?? "Your workspace"} via Deskzo` } : {}) }, { test: true });
+    } catch (err) {
+      if (err instanceof ConsoleRefused) throw err;
+      throw new ConsoleRefused("The test couldn't be sent — check the Mail log for the reason.");
+    }
+    await consoleAudit(staff, "mail.template", { key: def.key, change: "tested" });
+    return { to: staff.email };
+  });
+}

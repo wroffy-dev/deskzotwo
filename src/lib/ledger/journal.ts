@@ -1,0 +1,1806 @@
+/**
+ * The ledger's write path.
+ *
+ * Deliberately NOT a "use server" module: every function here takes the caller's Prisma transaction
+ * so a posting commits with whatever caused it, and a transaction client can't cross a server-action
+ * boundary. Exporting these as actions would also publish them as endpoints with no auth check.
+ * The user-facing actions live in `src/actions/ledger.ts` and call into this.
+ */
+import type { JournalSource, Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import {
+  DEFAULT_CHART,
+  EXPENSE_CATEGORY_ACCOUNT,
+  SYSTEM_ACCOUNTS,
+  type SystemAccountKey,
+} from "@/lib/ledger/chart";
+import { formatExpenseId } from "@/lib/expenses";
+import {
+  entryTotals,
+  hasOneSidedLines,
+  isBalanced,
+  postAssetDisposal,
+  postChequeClearing,
+  postCreditNote,
+  postDebitNote,
+  sourceIn,
+  postDepreciation,
+  postExchangeDifference,
+  postExpenseClaim,
+  postExpenseReimbursement,
+  postPaymentMade,
+  postPaymentReceived,
+  postPayrollPayment,
+  postPayrollRun,
+  postLoanDisbursal,
+  postLoanRepayment,
+  postSalesInvoice,
+  postVendorBill,
+  postVendorCredit,
+  postYearEndClose,
+  bookingRate,
+  inRupees,
+  settlementDifference,
+  DOCUMENT_SOURCES,
+  PAYMENT_SOURCES,
+  reverseLines,
+  revenueOf,
+  type PayrollTotals,
+  type DocumentFinancials,
+  type DraftLine,
+} from "@/lib/ledger/posting";
+import { financialYearOf } from "@/lib/gst-engine";
+import { isLockedDate } from "@/lib/ledger/period";
+import { workspacePack } from "@/lib/country-pack";
+import {
+  applyCreditReduction,
+  createInvoiceSchedules,
+  onCreditNoteCancelled,
+  onInvoiceCancelled,
+  planCreditReduction,
+  planInvoiceDeferral,
+  type RevenueEntryDraft,
+} from "@/lib/revenue/deferral";
+
+type Tx = Prisma.TransactionClient;
+
+/**
+ * Creates the default chart the first time the ledger is opened.
+ *
+ * Idempotent, and safe to call on every read: a business that has already edited its chart keeps
+ * what it has, and only genuinely missing system accounts are added back — which is what happens
+ * when a later release introduces one, as TDS Payable did.
+ *
+ * `client` is the global client, or a posting's own transaction (see `resolveAccounts`).
+ */
+/**
+ * A seeded account's name in this workspace's country: outside India the one tax books to the IGST keys, so those are
+ * "Input VAT" and "Output VAT" in the UAE (src/lib/vat). India's chart is as it always was.
+ */
+function seededName(seed: { name: string; systemKey?: string | null }): string {
+  const pack = workspacePack();
+  if (pack.india) return seed.name;
+  if (seed.systemKey === SYSTEM_ACCOUNTS.INPUT_IGST) return `Input ${pack.tax.name}`;
+  if (seed.systemKey === SYSTEM_ACCOUNTS.OUTPUT_IGST) return `Output ${pack.tax.name}`;
+  return seed.name;
+}
+
+/** India's own tax accounts: no use in a workspace elsewhere, which has one tax booked to the IGST keys. */
+const INDIA_ONLY_KEYS: string[] = [
+  SYSTEM_ACCOUNTS.INPUT_CGST, SYSTEM_ACCOUNTS.INPUT_SGST, SYSTEM_ACCOUNTS.OUTPUT_CGST, SYSTEM_ACCOUNTS.OUTPUT_SGST,
+  SYSTEM_ACCOUNTS.TDS_RECEIVABLE, SYSTEM_ACCOUNTS.TCS_PAYABLE, SYSTEM_ACCOUNTS.TDS_PAYABLE,
+];
+
+/**
+ * A workspace outside India, tidied (owner, 14 Nov 2026: a UAE workspace's Trial Balance read "Output IGST" and listed
+ * CGST, SGST, TDS and TCS): the one tax's accounts named for it — "Input VAT", "Output VAT" — where they still carry
+ * India's seeded name, and India's own tax accounts switched off where nothing was ever posted to them. A name somebody
+ * typed, or an account with postings, is left as it is. Postings find accounts by key, not by name or whether they're on.
+ */
+async function tidyChartForCountry(client: Pick<Tx, "ledgerAccount">): Promise<void> {
+  const pack = workspacePack();
+  if (pack.india) return;
+  const rows = await client.ledgerAccount.findMany({
+    where: { systemKey: { in: [SYSTEM_ACCOUNTS.INPUT_IGST, SYSTEM_ACCOUNTS.OUTPUT_IGST, ...INDIA_ONLY_KEYS] } },
+    select: { id: true, name: true, systemKey: true, active: true, _count: { select: { lines: true } } },
+  });
+  for (const r of rows) {
+    const seed = DEFAULT_CHART.find((s) => s.systemKey === r.systemKey);
+    if (!seed) continue;
+    const wanted = seededName(seed);
+    if ((r.systemKey === SYSTEM_ACCOUNTS.INPUT_IGST || r.systemKey === SYSTEM_ACCOUNTS.OUTPUT_IGST) && r.name === seed.name && wanted !== seed.name) {
+      await client.ledgerAccount.update({ where: { id: r.id }, data: { name: wanted } });
+    }
+    if (INDIA_ONLY_KEYS.includes(r.systemKey ?? "") && r.active && r._count.lines === 0) {
+      await client.ledgerAccount.update({ where: { id: r.id }, data: { active: false } });
+    }
+  }
+}
+
+export async function ensureChartOfAccounts(client: Pick<Tx, "ledgerAccount"> = db): Promise<void> {
+  await ensureChart(client);
+  await tidyChartForCountry(client);
+}
+
+async function ensureChart(client: Pick<Tx, "ledgerAccount">): Promise<void> {
+  const existing = await client.ledgerAccount.findMany({ select: { id: true, code: true, name: true, systemKey: true } });
+  const haveCodes = new Set(existing.map((a) => a.code));
+  const haveKeys = new Set(existing.filter((a) => a.systemKey).map((a) => a.systemKey));
+
+  // An account that already exists under the right code but predates its system key adopts it,
+  // rather than a second account appearing beside it under a different code. Books that have been
+  // posting to "Travel & Conveyance" for a year should keep doing so once claims start posting —
+  // otherwise the history splits across two accounts with the same name.
+  for (const seed of DEFAULT_CHART) {
+    if (!seed.systemKey || haveKeys.has(seed.systemKey)) continue;
+    const match = existing.find((a) => a.code === seed.code && !a.systemKey);
+    if (!match) continue;
+    // A later system account takes over its code's account only when it is plainly the same one by name
+    // (chart.ts `adoptOnlySameName`); somebody's own account on that code keeps its meaning.
+    if (seed.adoptOnlySameName && match.name.trim().toLowerCase() !== seed.name.toLowerCase()) continue;
+    await client.ledgerAccount.update({ where: { id: match.id }, data: { systemKey: seed.systemKey } });
+    haveKeys.add(seed.systemKey);
+  }
+
+  // A later system account whose code is somebody's own account goes on the next free code beside it.
+  const relocated = DEFAULT_CHART.filter((a) => a.adoptOnlySameName && a.systemKey && !haveKeys.has(a.systemKey) && haveCodes.has(a.code)).map((a) => {
+    let n = Number(a.code) + 1;
+    while (haveCodes.has(String(n))) n += 1;
+    haveCodes.add(String(n));
+    return { ...a, code: String(n) };
+  });
+
+  const missing = [
+    ...DEFAULT_CHART.filter((a) => !haveCodes.has(a.code) && !(a.systemKey && haveKeys.has(a.systemKey))),
+    ...relocated,
+  ];
+  if (missing.length === 0) return;
+
+  // Parents first, so a child always finds its parent's id.
+  const byCode = new Map<string, string>(
+    (await client.ledgerAccount.findMany({ select: { id: true, code: true } })).map((a) => [a.code, a.id]),
+  );
+  // `missing` was worked out before any of these ran, and this function is called by several report
+  // queries that a single page fires in parallel: they all compute the same missing set, and the second
+  // one to reach a code hit the unique constraint on it — a P2002 that took the whole Accounting page
+  // down. An upsert didn't settle it: Prisma reads, then inserts, so both could insert. ON CONFLICT DO
+  // NOTHING (`skipDuplicates`) does — whoever arrives second inserts nothing, raises nothing (which inside
+  // a posting's transaction would abort it), and reads the row that is there.
+  for (const seed of missing.sort((a, b) => a.code.localeCompare(b.code))) {
+    await client.ledgerAccount.createMany({
+      data: [
+        {
+          code: seed.code,
+          name: seededName(seed),
+          type: seed.type,
+          isGroup: seed.isGroup ?? false,
+          systemKey: seed.systemKey ?? null,
+          description: seed.description ?? null,
+          parentId: seed.parent ? (byCode.get(seed.parent) ?? null) : null,
+          ...(!workspacePack().india && seed.systemKey && INDIA_ONLY_KEYS.includes(seed.systemKey) ? { active: false } : {}),
+        },
+      ],
+      skipDuplicates: true,
+    });
+    const row = await client.ledgerAccount.findUnique({ where: { code: seed.code }, select: { id: true, code: true } });
+    if (row) byCode.set(row.code, row.id);
+  }
+}
+
+/**
+ * Holds a transaction-scoped lock on one posting's key (owner, 22 Oct 2026), so two requests posting the same
+ * document, payment or voucher at once take turns: the second waits until the first commits, then finds
+ * its entry and writes nothing. The checks below ("posted already if it has an entry") were right but read
+ * before writing, which two concurrent requests could both pass.
+ */
+export async function lockPosting(tx: Tx, key: string) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`deskzo:posting:${key}`}))`;
+}
+
+/**
+ * Refuses anything dated into closed books.
+ *
+ * Checked here rather than in each action, because `writeEntry` is the single door every entry goes
+ * through — a lock that each caller has to remember is a lock that one of them will forget. It
+ * applies to reversals and corrections too: the way to fix something in a closed period is to post
+ * the correction in an open one, which is what an accountant would do on paper.
+ */
+export async function assertPeriodOpen(tx: Tx, date: Date) {
+  const lock = await tx.ledgerLock.findUnique({ where: { id: "global" }, select: { lockedUntil: true } });
+  if (!lock?.lockedUntil) return;
+  // By calendar day in India (period.ts): the lock is a date, and an entry at 12:00 UTC on the
+  // locked day — every payroll and depreciation entry — is on that day, not after it.
+  if (isLockedDate(date, lock.lockedUntil)) {
+    const until = lock.lockedUntil.toISOString().slice(0, 10);
+    throw new Error(
+      `The books are closed to ${until}. Post this in an open period instead — reopening a closed one changes a trial balance somebody has already been given.`,
+    );
+  }
+}
+
+/**
+ * Resolves system keys to account ids, failing loudly if the chart is incomplete.
+ *
+ * A workspace whose ledger nobody has opened yet has no chart at all, and only the accounting
+ * screens used to create it — so a new workspace's first invoice (or payment) failed with "Chart of
+ * accounts is missing". Now the first posting that finds accounts missing creates the default chart in
+ * its own transaction and looks again; only a chart somebody has since broken still fails.
+ */
+export async function resolveAccounts(tx: Tx, keys: SystemAccountKey[]) {
+  const lookup = async () => {
+    const rows = await tx.ledgerAccount.findMany({
+      where: { systemKey: { in: keys } },
+      select: { id: true, systemKey: true },
+    });
+    return new Map(rows.map((r) => [r.systemKey as SystemAccountKey, r.id]));
+  };
+  let map = await lookup();
+  if (keys.some((k) => !map.has(k))) {
+    await ensureChartOfAccounts(tx);
+    map = await lookup();
+  }
+  const missing = keys.filter((k) => !map.has(k));
+  if (missing.length > 0) {
+    throw new Error(`Chart of accounts is missing: ${missing.join(", ")}. Open Accounting → Chart of accounts to restore it.`);
+  }
+  return map;
+}
+
+/**
+ * The next journal entry number for the financial year the entry falls in.
+ *
+ * Read from a counter row rather than from the entries themselves. Deriving it as
+ * `max(entryNumber) + 1` looked reasonable and was wrong twice over: the maximum was taken
+ * *lexicographically*, so "JV/2026-27/9999" outranked "JV/2026-27/10000" and the number stopped
+ * advancing at ten thousand — after which every posting in that year failed on the unique index,
+ * for good. And two concurrent transactions both read the same maximum, so an accountant issuing an
+ * invoice while a colleague recorded a receipt could collide today, rolling one of them back with a
+ * raw Prisma error.
+ *
+ * The upsert runs inside the caller's transaction, so the row lock it takes serialises the two.
+ */
+async function nextEntryNumber(tx: Tx, date: Date) {
+  const fy = financialYearOf(date);
+  const prefix = `JV/${fy}/`;
+
+  // Only on the first entry of a year, and only on a database that already has entries from before
+  // this counter existed: start past whatever is already in use rather than reissuing numbers.
+  let seed = 1;
+  const counter = await tx.journalCounter.findUnique({ where: { financialYear: fy }, select: { lastNumber: true } });
+  if (!counter) {
+    const existing = await tx.journalEntry.findMany({
+      where: { entryNumber: { startsWith: prefix } },
+      select: { entryNumber: true },
+    });
+    const highest = existing.reduce((max, row) => {
+      const n = Number(row.entryNumber.slice(prefix.length));
+      return Number.isFinite(n) && n > max ? n : max;
+    }, 0);
+    seed = highest + 1;
+  }
+
+  const row = await tx.journalCounter.upsert({
+    where: { financialYear: fy },
+    create: { financialYear: fy, lastNumber: seed },
+    update: { lastNumber: { increment: 1 } },
+    select: { lastNumber: true },
+  });
+
+  // Padded to four, and simply wider beyond that. The width is cosmetic now that ordering does not
+  // depend on it.
+  return `${prefix}${String(row.lastNumber).padStart(4, "0")}`;
+}
+
+/**
+ * Writes one balanced entry. The balance check lives here rather than in a database constraint
+ * because Postgres can't express "these rows must sum to each other" — so every path that creates an
+ * entry goes through this one function.
+ *
+ * Branch and GST registration are tags on the lines, not separate books (spec §8): `branchId` and
+ * `gstRegistrationId` given here apply to every line that has no value of its own. Documents, payments
+ * and expense claims are tagged, and so is a reversal, which copies its original's lines. Payroll,
+ * payroll payments, depreciation, disposals, cheque clearings, exchange differences and the year-end
+ * close are deliberately left untagged — null means "not attributed to a branch", which the P&L shows
+ * as its own column rather than guessing one.
+ */
+export async function writeEntry(
+  tx: Tx,
+  params: {
+    date: Date;
+    narration: string;
+    source: JournalSource;
+    userId: string;
+    lines: {
+      accountId: string;
+      debit: number;
+      credit: number;
+      companyId?: string | null;
+      departmentId?: string | null;
+      narration?: string | null;
+      branchId?: string | null;
+      gstRegistrationId?: string | null;
+    }[];
+    documentId?: string | null;
+    payrollRunId?: string | null;
+    paymentId?: string | null;
+    expenseId?: string | null;
+    vendorCreditId?: string | null;
+    companyId?: string | null;
+    reversesId?: string | null;
+    branchId?: string | null;
+    gstRegistrationId?: string | null;
+    /**
+     * Finance → Accounts (owner, 22 Oct 2026): what this entry is the one posting of ("voucher:<id>",
+     * "stock:…"). Unique in the database; writing it again returns the entry already there rather than a
+     * second one, so a retried or double-clicked posting can't post twice.
+     */
+    postingKey?: string | null;
+    accountVoucherId?: string | null;
+    stockDocumentId?: string | null;
+  },
+) {
+  if (params.postingKey) {
+    // Two requests posting the same thing wait for each other here, and the second finds the first's entry.
+    await lockPosting(tx, params.postingKey);
+    const already = await tx.journalEntry.findUnique({ where: { postingKey: params.postingKey }, select: { id: true, entryNumber: true } });
+    if (already) return already;
+  }
+  await assertPeriodOpen(tx, params.date);
+  if (params.lines.length < 2) throw new Error("A journal entry needs at least two lines.");
+  if (!hasOneSidedLines(params.lines)) throw new Error("A line carries either a debit or a credit, not both.");
+  if (!isBalanced(params.lines)) {
+    const { debit, credit } = entryTotals(params.lines);
+    throw new Error(`Entry does not balance: debits ${debit.toFixed(2)} vs credits ${credit.toFixed(2)}.`);
+  }
+
+  return tx.journalEntry.create({
+    data: {
+      entryNumber: await nextEntryNumber(tx, params.date),
+      date: params.date,
+      narration: params.narration,
+      source: params.source,
+      documentId: params.documentId ?? null,
+      paymentId: params.paymentId ?? null,
+      expenseId: params.expenseId ?? null,
+      vendorCreditId: params.vendorCreditId ?? null,
+      payrollRunId: params.payrollRunId ?? null,
+      companyId: params.companyId ?? null,
+      reversesId: params.reversesId ?? null,
+      createdById: params.userId,
+      // Only where given, so a workspace whose database predates the columns still posts as it did.
+      ...(params.postingKey ? { postingKey: params.postingKey } : {}),
+      ...(params.accountVoucherId ? { accountVoucherId: params.accountVoucherId } : {}),
+      ...(params.stockDocumentId ? { stockDocumentId: params.stockDocumentId } : {}),
+      lines: {
+        create: params.lines.map((l, i) => ({
+          accountId: l.accountId,
+          debit: l.debit,
+          credit: l.credit,
+          companyId: l.companyId ?? null,
+          departmentId: l.departmentId ?? null,
+          narration: l.narration ?? null,
+          branchId: l.branchId ?? params.branchId ?? null,
+          gstRegistrationId: l.gstRegistrationId ?? params.gstRegistrationId ?? null,
+          sortOrder: i,
+        })),
+      },
+    },
+    select: { id: true, entryNumber: true },
+  });
+}
+
+/**
+ * A posting-engine line, plus the two tags. The engine (`posting.ts`) doesn't set them today — the
+ * entry-level defaults in `writeEntry` do — but a line that carries its own is passed straight through.
+ */
+type TaggedDraftLine = DraftLine & { branchId?: string | null; gstRegistrationId?: string | null };
+
+/** Turns the posting engine's keyed lines into rows with real account ids. */
+async function materialise(tx: Tx, draft: { narration: string; lines: TaggedDraftLine[] }) {
+  const keys = [...new Set(draft.lines.filter((l) => !l.accountIdOverride).map((l) => l.account))];
+  const accounts = await resolveAccounts(tx, keys);
+  return draft.lines.map((l: TaggedDraftLine) => ({
+    // A line that named a real account wins: an asset's own account, or one P&L account being
+    // closed, is chosen from data and has no system key to look up.
+    accountId: l.accountIdOverride ?? accounts.get(l.account)!,
+    debit: l.debit,
+    credit: l.credit,
+    companyId: l.companyId ?? null,
+    departmentId: l.departmentId ?? null,
+    narration: l.narration ?? null,
+    branchId: l.branchId ?? null,
+    gstRegistrationId: l.gstRegistrationId ?? null,
+  }));
+}
+
+/**
+ * The head office, read through the caller's transaction.
+ *
+ * Not `ensureHeadOffice()` or `branchIdentity()`: those go through `db` — another connection — and may
+ * write (`adoptUnassigned` updates `trade_documents`), so inside a posting they could wait on the very
+ * row this transaction holds, while it waits on them. With no head office the tag stays null.
+ */
+async function headOfficeOf(tx: Tx): Promise<{ id: string; gstRegistrationId: string | null } | null> {
+  return tx.branch.findFirst({ where: { isHeadOffice: true }, select: { id: true, gstRegistrationId: true } });
+}
+
+/** What a document's posting reads from it: the figures, and the rate that brings them into rupees. */
+export const documentPostingSelect = {
+  id: true, docType: true, docNumber: true, companyId: true, issueDate: true,
+  taxableValue: true, cgstAmount: true, sgstAmount: true, igstAmount: true,
+  shippingCharge: true, withholdingAmount: true, adjustment: true, adjustmentLabel: true,
+  roundOff: true, total: true, currency: true, exchangeRate: true, branchId: true, gstRegistrationId: true,
+  // Outside India, a bill under the reverse charge self-assesses its tax (src/lib/vat).
+  reverseCharge: true,
+  // A credit note's invoice, whose revenue schedules it may reduce (src/lib/revenue/deferral.ts).
+  againstDocumentId: true,
+} satisfies Prisma.TradeDocumentSelect;
+
+export type PostableDocument = Prisma.TradeDocumentGetPayload<{ select: typeof documentPostingSelect }>;
+
+/**
+ * The books are kept in rupees. A document written in another currency posts converted at the rate
+ * agreed on the day it was raised (`inRupees`); the difference when it settles is booked separately,
+ * on the payment. Until the rate was added to `documentPostingSelect` it never reached here, so every
+ * foreign document posted at 1 — a $1,000 invoice booked ₹1,000 (`npm run ledger:repost-fx`).
+ */
+function financialsOf(doc: PostableDocument): DocumentFinancials {
+  const n = (v: Prisma.Decimal | number) => Number(v);
+  return inRupees(
+    {
+      companyId: doc.companyId,
+      docNumber: doc.docNumber,
+      taxableValue: n(doc.taxableValue),
+      cgstAmount: n(doc.cgstAmount),
+      sgstAmount: n(doc.sgstAmount),
+      igstAmount: n(doc.igstAmount),
+      shippingCharge: n(doc.shippingCharge),
+      withholdingAmount: n(doc.withholdingAmount),
+      adjustment: n(doc.adjustment),
+      adjustmentLabel: doc.adjustmentLabel,
+      roundOff: n(doc.roundOff),
+      total: n(doc.total),
+      ...(doc.reverseCharge && doc.docType === "BILL" && !workspacePack().india ? { taxSelfAssessed: true } : {}),
+    },
+    bookingRate(doc),
+  );
+}
+
+/**
+ * A document's revenue in rupees exactly as its entry books it: taxable value less freight, each
+ * converted at the document's rate. What Revenue & Close shares across the lines (src/lib/revenue).
+ */
+export function revenueInRupees(doc: PostableDocument): number {
+  return revenueOf(financialsOf(doc));
+}
+
+// DOCUMENT_SOURCES and PAYMENT_SOURCES live in posting.ts, which is pure, so a read-only check can ask
+// the same question without loading the write path; they are re-exported here for the ledger's callers.
+export { DOCUMENT_SOURCES, PAYMENT_SOURCES } from "@/lib/ledger/posting";
+
+/**
+ * The entry that books a document now: its own posting, not a reversal, and not reversed since.
+ *
+ * A document normally has one posting. After `ledger:repost-fx` has repaired it, it has two — the
+ * original, reversed, and the re-post — and only the re-post is live, so that is the one a
+ * cancellation must reverse. An `FX` entry carries the document too, which is why the source is
+ * part of the question.
+ */
+function currentDocumentEntryWhere(documentId: string) {
+  return {
+    documentId,
+    source: sourceIn(DOCUMENT_SOURCES),
+    reversesId: null,
+    reversedBy: { is: null },
+  } satisfies Prisma.JournalEntryWhereInput;
+}
+
+export async function currentDocumentEntry(tx: Tx, documentId: string) {
+  return tx.journalEntry.findFirst({
+    where: currentDocumentEntryWhere(documentId),
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entryNumber: true },
+  });
+}
+
+/**
+ * Writes a document's entry: at its issue date when it is first posted, or on the day the repair
+ * chooses when `ledger:repost-fx` posts it again. The repair passes the original's branch and GSTIN
+ * so the re-post lands where the original did.
+ *
+ * `deferred` (an invoice) and `deferredReduction` (a credit note) are Revenue & Close's, in rupees:
+ * what goes to Deferred Revenue instead of Sales or Sales Returns. Left out, the entry is as it always was.
+ */
+export async function writeDocumentEntry(
+  tx: Tx,
+  doc: PostableDocument,
+  userId: string,
+  at: {
+    date: Date;
+    note?: string;
+    tags?: { branchId: string | null; gstRegistrationId: string | null };
+    deferred?: number;
+    deferredReduction?: number;
+  },
+): Promise<{ id: string; entryNumber: string }> {
+  if (doc.docType !== "INVOICE" && doc.docType !== "CREDIT_NOTE" && doc.docType !== "DEBIT_NOTE" && doc.docType !== "BILL") {
+    throw new Error(`A ${doc.docType} does not post to the ledger.`);
+  }
+  const financials: DocumentFinancials = {
+    ...financialsOf(doc),
+    ...(at.deferred ? { deferred: at.deferred } : {}),
+    ...(at.deferredReduction ? { deferredReduction: at.deferredReduction } : {}),
+  };
+  const draft =
+    doc.docType === "INVOICE"
+      ? postSalesInvoice(financials)
+      : doc.docType === "CREDIT_NOTE"
+        ? postCreditNote(financials)
+        : doc.docType === "DEBIT_NOTE"
+          ? postDebitNote(financials)
+          : postVendorBill(financials);
+
+  // Every line, receivable and revenue included, carries the document's branch and GSTIN: the tax
+  // lines are what a return per registration sums, the rest are what a P&L per branch sums. A document
+  // an older build wrote without a branch is the head office's, as readers take it (spec §13.2).
+  const tags = at.tags ?? {
+    branchId: doc.branchId ?? (await headOfficeOf(tx))?.id ?? null,
+    gstRegistrationId: doc.gstRegistrationId,
+  };
+
+  return writeEntry(tx, {
+    date: at.date,
+    narration: at.note ? `${draft.narration} — ${at.note}` : draft.narration,
+    source: doc.docType,
+    userId,
+    lines: await materialise(tx, draft),
+    documentId: doc.id,
+    companyId: doc.companyId,
+    branchId: tags.branchId,
+    gstRegistrationId: tags.gstRegistrationId,
+  });
+}
+
+/**
+ * Posts a document to the ledger. Called when an invoice, credit note or bill is issued.
+ *
+ * Runs inside the caller's transaction so a document can never be issued without its entry, or an
+ * entry written for a document that then failed to issue. Posting the same document twice is a
+ * no-op rather than an error — issuing is idempotent in places and double-posting would silently
+ * double the revenue.
+ *
+ * Revenue & Close (src/lib/revenue/deferral.ts), in the same transaction:
+ *
+ *   · **An invoice** with lines earned over time — a service period past the issue month, a
+ *     subscription, a project stage not yet delivered — credits their share of its revenue to
+ *     Deferred Revenue instead of Sales, and gets a schedule per such line. Only while the add-on is
+ *     on; otherwise, and for every other invoice, the entry is exactly what it always was.
+ *   · **A credit note** against an invoice with schedules takes what it can off their unrecognised
+ *     balance first (Dr Deferred Revenue), the rest being a sales return as before.
+ *
+ * Both happen only when the entry is first written, so issuing again never touches a schedule.
+ *
+ * `history`: a document brought across with the rest of its financial year (src/lib/migration) posts its
+ * plain entry on its own date and nothing else — its revenue was recognised, and its credits applied, in
+ * the old system, so neither schedules nor a reduction of them are made here.
+ */
+export async function postDocumentToLedger(
+  tx: Tx,
+  documentId: string,
+  userId: string,
+  options: { history?: boolean } = {},
+): Promise<{ id: string; entryNumber: string } | null> {
+  await lockPosting(tx, `document:${documentId}`);
+  const doc = await tx.tradeDocument.findUnique({ where: { id: documentId }, select: documentPostingSelect });
+  if (!doc) return null;
+  // Quotes, proformas and purchase orders are commitments, not transactions — nothing has happened
+  // in accounting terms until an invoice, a note against one, or a bill exists.
+  if (doc.docType !== "INVOICE" && doc.docType !== "CREDIT_NOTE" && doc.docType !== "DEBIT_NOTE" && doc.docType !== "BILL") return null;
+
+  // Posted already if it has any posting of its own, reversed or not: the live one is returned when
+  // there is one (a repaired document's re-post), and a cancelled document's reversed original
+  // otherwise — cancelling is final, and posting again would put its revenue back.
+  const posted = await tx.journalEntry.findMany({
+    where: { documentId, source: sourceIn(DOCUMENT_SOURCES), reversesId: null },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entryNumber: true, reversedBy: { select: { id: true } } },
+  });
+  if (posted.length > 0) {
+    const entry = posted.find((e) => !e.reversedBy) ?? posted[0];
+    return { id: entry.id, entryNumber: entry.entryNumber };
+  }
+
+  if (options.history) return writeDocumentEntry(tx, doc, userId, { date: doc.issueDate });
+
+  if (doc.docType === "INVOICE") {
+    const plan = await planInvoiceDeferral(tx, doc, revenueInRupees(doc));
+    if (plan) {
+      // The schedules go under the branch and GSTIN the entry does, so recognition lands where the
+      // invoice did.
+      const tags = { branchId: doc.branchId ?? (await headOfficeOf(tx))?.id ?? null, gstRegistrationId: doc.gstRegistrationId };
+      const entry = await writeDocumentEntry(tx, doc, userId, { date: doc.issueDate, tags, deferred: plan.deferred });
+      await createInvoiceSchedules(tx, doc, plan, { userId, ...tags });
+      return entry;
+    }
+  } else if (doc.docType === "CREDIT_NOTE") {
+    const plan = await planCreditReduction(tx, doc, revenueInRupees(doc));
+    if (plan) {
+      const entry = await writeDocumentEntry(tx, doc, userId, { date: doc.issueDate, deferredReduction: plan.total });
+      await applyCreditReduction(tx, doc.id, plan);
+      return entry;
+    }
+  }
+
+  return writeDocumentEntry(tx, doc, userId, { date: doc.issueDate });
+}
+
+/** Writes one of Revenue & Close's own entries (src/lib/revenue/deferral.ts) through the write door. */
+async function writeRevenueEntry(tx: Tx, draft: RevenueEntryDraft, userId: string) {
+  return writeEntry(tx, {
+    date: draft.date,
+    narration: draft.narration,
+    source: "REVENUE",
+    userId,
+    lines: await materialise(tx, draft),
+    companyId: draft.companyId,
+  });
+}
+
+/** Posts a payment. Direction decides whether it settles a receivable or a payable. */
+export async function postPaymentToLedger(
+  tx: Tx,
+  paymentId: string,
+  userId: string,
+): Promise<{ id: string; entryNumber: string } | null> {
+  const payment = await tx.payment.findUnique({
+    where: { id: paymentId },
+    select: {
+      id: true, companyId: true, amount: true, paidOn: true, method: true, reference: true, direction: true,
+      bankAccountId: true, clearedOn: true, currency: true, exchangeRate: true, branchId: true,
+      company: { select: { name: true } },
+    },
+  });
+  if (!payment) return null;
+  await lockPosting(tx, `payment:${paymentId}`);
+
+  // Its own posting, not an exchange difference or a cheque clearing that also names it. This runs as
+  // the payment is recorded, before either can exist, so the first PAYMENT entry is the payment's.
+  const already = await tx.journalEntry.findFirst({
+    where: { paymentId, source: "PAYMENT", reversesId: null },
+    select: { id: true, entryNumber: true },
+  });
+  if (already) return already;
+
+  const intoCash = payment.method === "CASH";
+  // In rupees, which is what the ledger holds — a foreign receipt is converted at its own rate, and a
+  // rupee one is taken as written whatever rate it carries (`bookingRate`), as a rupee document is.
+  const amount = Math.round(Number(payment.amount) * bookingRate(payment) * 100) / 100;
+  const draft =
+    payment.direction === "PAID"
+      ? postPaymentMade({
+          companyId: payment.companyId,
+          amount,
+          reference: payment.reference,
+          fromCash: intoCash,
+          partyName: payment.company.name,
+        })
+      : postPaymentReceived({
+          companyId: payment.companyId,
+          amount,
+          reference: payment.reference,
+          intoCash,
+          partyName: payment.company.name,
+        });
+
+  // Which pot the money landed in: a named bank account, cash, or — for a cheque nobody has banked
+  // yet — cheques in hand. The posting functions name it BANK or CASH generically; this is where
+  // that becomes a real account.
+  const money = await resolveMoneyAccount(tx, payment);
+  const moneyIndex = payment.direction === "PAID" ? 1 : 0;
+  const lines = (await materialise(tx, draft)).map((l, i) =>
+    i === moneyIndex ? { ...l, accountId: money.accountId } : l,
+  );
+
+  return writeEntry(tx, {
+    date: payment.paidOn,
+    narration: draft.narration,
+    source: "PAYMENT",
+    userId,
+    lines,
+    paymentId: payment.id,
+    companyId: payment.companyId,
+    // The branch that took or made the payment. No GSTIN: money moving carries no tax.
+    branchId: payment.branchId ?? (await headOfficeOf(tx))?.id ?? null,
+  });
+}
+
+/**
+ * What a reversal reads from each original line: everything but the direction, which it swaps.
+ *
+ * The cost centre and the branch and GSTIN tags go with the amount — a reversal that dropped them
+ * would leave the original's branch, GSTIN or team carrying a figure the company as a whole had
+ * cancelled. The cost centre was dropped until the branch tags were added (X8).
+ */
+export const reversibleLineSelect = {
+  accountId: true, debit: true, credit: true, companyId: true, departmentId: true, narration: true,
+  branchId: true, gstRegistrationId: true,
+} satisfies Prisma.JournalLineSelect;
+
+/**
+ * Posts a vendor credit — a distributor's or an OEM's credit note, or a rebate paid into the bank
+ * (src/actions/vendor-credit.ts): Dr Accounts Payable (the issuer) or the bank, Cr Purchase Rebates &
+ * Discounts and any input GST it reverses. Dated the credit's own date, tagged to the head office.
+ * Once only — a credit already posted is answered with its entry. In the caller's transaction, so the
+ * credit and its entry stand or fall together.
+ */
+export async function postVendorCreditToLedger(tx: Tx, vendorCreditId: string, userId: string) {
+  const existing = await tx.journalEntry.findFirst({
+    where: { vendorCreditId, reversesId: null, reversedBy: { is: null } },
+    select: { id: true, entryNumber: true },
+  });
+  if (existing) return existing;
+  const c = await tx.vendorCredit.findUniqueOrThrow({
+    where: { id: vendorCreditId },
+    select: {
+      id: true, form: true, vendorId: true, reference: true, date: true,
+      taxableAmount: true, cgstAmount: true, sgstAmount: true, igstAmount: true, total: true,
+      vendor: { select: { name: true } },
+      bankAccount: { select: { ledgerAccountId: true } },
+    },
+  });
+  let bankLedgerAccountId = c.bankAccount?.ledgerAccountId ?? null;
+  if (c.form === "PAYOUT" && !bankLedgerAccountId) {
+    const fallback = await tx.bankAccount.findFirst({ where: { isDefault: true, active: true }, select: { ledgerAccountId: true } });
+    bankLedgerAccountId = fallback?.ledgerAccountId ?? null;
+  }
+  const draft = postVendorCredit({
+    form: c.form,
+    vendorId: c.vendorId,
+    vendorName: c.vendor.name,
+    reference: c.reference,
+    taxable: Number(c.taxableAmount),
+    cgst: Number(c.cgstAmount),
+    sgst: Number(c.sgstAmount),
+    igst: Number(c.igstAmount),
+    total: Number(c.total),
+    bankLedgerAccountId,
+  });
+  const head = await headOfficeOf(tx);
+  return writeEntry(tx, {
+    date: c.date,
+    narration: draft.narration,
+    source: "VENDOR_CREDIT",
+    userId,
+    lines: await materialise(tx, draft),
+    vendorCreditId: c.id,
+    companyId: c.vendorId,
+    branchId: head?.id ?? null,
+    gstRegistrationId: head?.gstRegistrationId ?? null,
+  });
+}
+
+/** Reverses a vendor credit's posting, when it is cancelled — today, every line swapped. Quiet when it never posted. */
+export async function reverseVendorCreditPosting(tx: Tx, vendorCreditId: string, userId: string) {
+  const original = await tx.journalEntry.findFirst({
+    where: { vendorCreditId, reversesId: null, reversedBy: { is: null } },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entryNumber: true, companyId: true, lines: { orderBy: { sortOrder: "asc" }, select: reversibleLineSelect } },
+  });
+  if (!original) return null;
+  return writeEntry(tx, {
+    date: new Date(),
+    narration: `Reversal of ${original.entryNumber} — vendor credit cancelled`,
+    source: "VENDOR_CREDIT",
+    userId,
+    lines: reversedLines(original.lines),
+    companyId: original.companyId,
+    vendorCreditId,
+    reversesId: original.id,
+  });
+}
+
+/** The original's lines, debit and credit swapped, every tag kept — ready for `writeEntry`. */
+export function reversedLines(lines: Prisma.JournalLineGetPayload<{ select: typeof reversibleLineSelect }>[]) {
+  return reverseLines(lines.map((l) => ({ ...l, debit: Number(l.debit), credit: Number(l.credit) })));
+}
+
+/** Every entry of a payment's that is still standing: its own sources, not a reversal, not reversed since. */
+function livePaymentEntriesWhere(paymentId: string) {
+  return {
+    paymentId,
+    source: sourceIn(PAYMENT_SOURCES),
+    reversesId: null,
+    reversedBy: { is: null },
+  } satisfies Prisma.JournalEntryWhereInput;
+}
+
+const reversibleEntrySelect = {
+  id: true, entryNumber: true, companyId: true, paymentId: true, documentId: true,
+  lines: { orderBy: { sortOrder: "asc" }, select: reversibleLineSelect },
+} satisfies Prisma.JournalEntrySelect;
+
+/**
+ * One entry reversed, today, through the write door: every line swapped with its tags, and the
+ * reversal carrying the payment and document the original named so both trails show it.
+ */
+async function reverseEntry(
+  tx: Tx,
+  original: Prisma.JournalEntryGetPayload<{ select: typeof reversibleEntrySelect }>,
+  userId: string,
+  why: string,
+) {
+  return writeEntry(tx, {
+    date: new Date(),
+    narration: `Reversal of ${original.entryNumber} — ${why}`,
+    source: "MANUAL",
+    userId,
+    lines: reversedLines(original.lines),
+    companyId: original.companyId,
+    paymentId: original.paymentId,
+    documentId: original.documentId,
+    reversesId: original.id,
+  });
+}
+
+/**
+ * Reverses whatever a document posted, used when it's cancelled.
+ *
+ * Runs inside the caller's transaction and is quiet about a document that was never posted — a
+ * cancelled draft has no entry to reverse, and that isn't an error.
+ *
+ * It reverses the document's *current* entry. It used to take the first entry carrying the document,
+ * which after a repair is the original the repair already reversed — so it found nothing to do and
+ * left the re-post standing — and could be an exchange difference, which is the payment's.
+ *
+ * Revenue & Close follows in the same transaction (src/lib/revenue/deferral.ts). An invoice's
+ * schedules are cancelled, and one more entry takes back out of Sales what they had recognised since,
+ * so Sales and Deferred Revenue net to nil over the invoice's life. A credit note's reductions go back
+ * onto its invoice's schedules. Both run only when there was an entry to reverse, so cancelling twice
+ * does nothing more.
+ */
+export async function reverseDocumentPosting(tx: Tx, documentId: string, userId: string) {
+  const original = await tx.journalEntry.findFirst({
+    where: currentDocumentEntryWhere(documentId),
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true, entryNumber: true, companyId: true, source: true,
+      document: { select: { docNumber: true } },
+      lines: { orderBy: { sortOrder: "asc" }, select: reversibleLineSelect },
+    },
+  });
+  if (!original) return null;
+
+  const reversal = await writeEntry(tx, {
+    date: new Date(),
+    narration: `Reversal of ${original.entryNumber} — document cancelled`,
+    source: "MANUAL",
+    userId,
+    lines: reversedLines(original.lines),
+    companyId: original.companyId,
+    reversesId: original.id,
+  });
+
+  // The exchange differences booked by payments settling it go too. A cancelled document settles
+  // nothing, so the money set against it is back on the party's account at the rate it came in at —
+  // which is where the payment's own entry already put it; the gain or loss measured against the
+  // document's rate no longer has a document. Left standing, the party was out by exactly that
+  // difference, and the close's receivables tie-out (which stops counting an allocation to a
+  // cancelled document) said so. The allocations themselves stay, as the record of what happened.
+  const exchange = await tx.journalEntry.findMany({
+    where: { documentId, source: "FX", reversesId: null, reversedBy: { is: null } },
+    orderBy: { entryNumber: "asc" },
+    select: reversibleEntrySelect,
+  });
+  for (const fx of exchange) await reverseEntry(tx, fx, userId, "document cancelled");
+
+  const docNumber = original.document?.docNumber ?? original.entryNumber;
+  const revenue =
+    original.source === "INVOICE"
+      ? await onInvoiceCancelled(
+          tx,
+          { id: documentId, docNumber, companyId: original.companyId },
+          original.lines.map((l) => ({ ...l, debit: Number(l.debit), credit: Number(l.credit) })),
+        )
+      : original.source === "CREDIT_NOTE"
+        ? await onCreditNoteCancelled(tx, { id: documentId, docNumber })
+        : null;
+  if (revenue) await writeRevenueEntry(tx, revenue, userId);
+
+  return reversal;
+}
+
+/**
+ * Unposts a payment, the way `reverseDocumentPosting` unposts a document.
+ *
+ * Deleting a payment used to leave its journal entry standing with a dangling `paymentId`, so the
+ * bank was overstated and receivables understated by the amount — permanently, and invisibly, since
+ * a trial balance still balanced. The entry is reversed rather than deleted for the same reason a
+ * cancelled invoice is: a posted period is a statement somebody may already have filed, and the way
+ * to undo a statement is another statement.
+ *
+ * **Every** live entry of the payment's is reversed: the payment, its cheque clearing, and the exchange
+ * difference on each allocation. It used to take the first entry carrying the payment's id, in no
+ * particular order — so deleting a foreign receipt could reverse its exchange gain and leave the
+ * receipt itself in the bank, or reverse the receipt and leave the gain in the P&L. Reversals are
+ * dated today, as a document's are. Deleting twice finds nothing live and writes nothing.
+ */
+export async function reversePaymentPosting(tx: Tx, paymentId: string, userId: string) {
+  const live = await tx.journalEntry.findMany({
+    where: livePaymentEntriesWhere(paymentId),
+    orderBy: { entryNumber: "asc" },
+    select: reversibleEntrySelect,
+  });
+  const reversals: { id: string; entryNumber: string }[] = [];
+  for (const original of live) reversals.push(await reverseEntry(tx, original, userId, "payment deleted"));
+  return reversals;
+}
+
+/**
+ * Reverses the exchange difference one allocation booked, when the allocation is removed and the
+ * payment stays. Returns null when it booked none (a rupee settlement, or one at the document's rate).
+ *
+ * The entry is found among the pair's live `FX` entries by its amount, which is the allocation's own
+ * (`settlementDifference`): neither rate can move after posting — a payment has no edit path, and a
+ * document is editable only as a draft — so the figure it booked is the figure it books now. Two
+ * allocations of one payment to one document with the same difference booked identical entries, and
+ * reversing either is the same.
+ */
+export async function reverseAllocationExchange(tx: Tx, allocationId: string, userId: string) {
+  const allocation = await tx.paymentAllocation.findUnique({
+    where: { id: allocationId },
+    select: {
+      paymentId: true, documentId: true, amount: true, paymentAmount: true,
+      payment: { select: { currency: true, exchangeRate: true } },
+      document: { select: { docType: true, currency: true, exchangeRate: true } },
+    },
+  });
+  if (!allocation?.documentId || !allocation.document) return null;
+
+  const difference = settlementDifference(
+    { amount: Number(allocation.amount), paymentAmount: allocation.paymentAmount === null ? null : Number(allocation.paymentAmount) },
+    allocation.payment,
+    allocation.document,
+  );
+  if (!difference) return null;
+
+  const receivable = allocation.document.docType !== "BILL";
+  const party = await resolveAccounts(tx, [receivable ? SYSTEM_ACCOUNTS.AR : SYSTEM_ACCOUNTS.AP]);
+  const partyId = party.get(receivable ? SYSTEM_ACCOUNTS.AR : SYSTEM_ACCOUNTS.AP)!;
+  const live = await tx.journalEntry.findMany({
+    where: { paymentId: allocation.paymentId, documentId: allocation.documentId, source: "FX", reversesId: null, reversedBy: { is: null } },
+    orderBy: { entryNumber: "asc" },
+    select: reversibleEntrySelect,
+  });
+  // The difference an entry booked, signed as `settlementDifference` signs it: more rupees moved than
+  // booked debits a receivable (and credits a payable).
+  const booked = (entry: (typeof live)[number]) =>
+    Math.round(
+      entry.lines
+        .filter((l) => l.accountId === partyId)
+        .reduce((t, l) => t + (receivable ? Number(l.debit) - Number(l.credit) : Number(l.credit) - Number(l.debit)), 0) * 100,
+    ) / 100;
+  let match = live.find((entry) => booked(entry) === difference);
+  if (!match && live.length === 1) {
+    // An entry from before the difference was taken as a difference of rounded postings (posting.ts
+    // `exchangeDifference`) can be a paisa off today's figure. When it is the pair's only one and this
+    // is the pair's only allocation, it can only be this allocation's.
+    const siblings = await tx.paymentAllocation.count({ where: { paymentId: allocation.paymentId, documentId: allocation.documentId } });
+    if (siblings === 1 && Math.abs(booked(live[0]!) - difference) <= 0.02) match = live[0];
+  }
+  if (!match) return null;
+  return reverseEntry(tx, match, userId, "allocation removed");
+}
+
+
+// ─── Where money actually sits ────────────────────────────────────────────────
+
+/**
+ * The account a payment moves through.
+ *
+ * Three things decide it, in order:
+ *
+ *   · An uncleared cheque is not in the bank. It sits in cheques-in-hand (received) or
+ *     cheques-issued (paid) until it clears, which is what lets a bank balance reconcile at all.
+ *   · Cash is cash.
+ *   · Otherwise it is a specific bank account if one was chosen, the default bank account if not,
+ *     and the plain BANK account if nobody has set any up — which is what every payment recorded
+ *     before bank accounts existed did.
+ */
+export async function resolveMoneyAccount(
+  tx: Tx,
+  payment: { method: string; bankAccountId: string | null; clearedOn: Date | null; direction: string },
+): Promise<{ accountId: string; kind: "CASH" | "BANK" | "CHEQUE" }> {
+  const keys = await resolveAccounts(tx, [
+    SYSTEM_ACCOUNTS.CASH,
+    SYSTEM_ACCOUNTS.BANK,
+    SYSTEM_ACCOUNTS.CHEQUES_IN_HAND,
+    SYSTEM_ACCOUNTS.CHEQUES_ISSUED,
+  ]);
+
+  if (payment.method === "CHEQUE" && !payment.clearedOn) {
+    return {
+      accountId:
+        payment.direction === "PAID"
+          ? keys.get(SYSTEM_ACCOUNTS.CHEQUES_ISSUED)!
+          : keys.get(SYSTEM_ACCOUNTS.CHEQUES_IN_HAND)!,
+      kind: "CHEQUE",
+    };
+  }
+  if (payment.method === "CASH") return { accountId: keys.get(SYSTEM_ACCOUNTS.CASH)!, kind: "CASH" };
+
+  if (payment.bankAccountId) {
+    const chosen = await tx.bankAccount.findUnique({
+      where: { id: payment.bankAccountId },
+      select: { ledgerAccountId: true },
+    });
+    if (chosen) return { accountId: chosen.ledgerAccountId, kind: "BANK" };
+  }
+  const fallback = await tx.bankAccount.findFirst({
+    where: { isDefault: true, active: true },
+    select: { ledgerAccountId: true },
+  });
+  return { accountId: fallback?.ledgerAccountId ?? keys.get(SYSTEM_ACCOUNTS.BANK)!, kind: "BANK" };
+}
+
+/** The ledger account behind a bank, for the reconciliation and cash-flow views. */
+export async function bankLedgerAccountId(bankAccountId: string): Promise<string | null> {
+  const row = await db.bankAccount.findUnique({
+    where: { id: bankAccountId },
+    select: { ledgerAccountId: true },
+  });
+  return row?.ledgerAccountId ?? null;
+}
+
+// ─── Expenses ─────────────────────────────────────────────────────────────────
+
+/**
+ * Where a claim books: the claimant's branch while it is active, else the head office; and that
+ * branch's GSTIN, else the head office's, else none — on every line (spec §8.2).
+ *
+ * Taking the input tax under the claimant's GSTIN is a default, not the law: ITC belongs to the GSTIN
+ * named on the supplier's invoice, which a claim does not record (CA question C7).
+ */
+async function expenseTags(
+  tx: Tx,
+  branch: { id: string; active: boolean; gstRegistrationId: string | null } | null,
+): Promise<{ branchId: string | null; gstRegistrationId: string | null }> {
+  const own = branch?.active ? branch : null;
+  const headOffice = own?.gstRegistrationId ? null : await headOfficeOf(tx);
+  return {
+    branchId: own?.id ?? headOffice?.id ?? null,
+    gstRegistrationId: own?.gstRegistrationId ?? headOffice?.gstRegistrationId ?? null,
+  };
+}
+
+/**
+ * Posts an approved claim.
+ *
+ * Idempotent on the expense, like every other posting here: approving twice, or an approval that
+ * retries, must not book the cost twice. A claim the company paid directly still posts — the cost
+ * is just as real, there is simply nobody to reimburse.
+ */
+export async function postExpenseToLedger(
+  tx: Tx,
+  expenseId: string,
+  userId: string,
+): Promise<{ id: string; entryNumber: string } | null> {
+  // Security audit, 11 Nov 2026 (SEC-15): two postings of one claim (the unposted list clicked twice,
+  // an approval racing it) wait for each other here, and the second finds the first's entry.
+  await lockPosting(tx, `expense:${expenseId}`);
+  const expense = await tx.expense.findUnique({
+    where: { id: expenseId },
+    select: {
+      id: true,
+      expenseSeq: true,
+      status: true,
+      category: true,
+      amount: true,
+      taxAmount: true,
+      spentOn: true,
+      description: true,
+      paymentMode: true,
+      reimbursable: true,
+      companyId: true,
+      user: { select: { name: true, departmentId: true, branch: { select: { id: true, active: true, gstRegistrationId: true } } } },
+    },
+  });
+  if (!expense) return null;
+  // Security audit, 11 Nov 2026 (SEC-15): only a claim that was signed off is a cost. A draft, a
+  // submitted or a rejected claim posted from the unposted list would book spend nobody approved.
+  if (expense.status !== "APPROVED" && expense.status !== "REIMBURSED") {
+    throw new Error(`${formatExpenseId(expense.expenseSeq)} isn't approved, so it can't be posted.`);
+  }
+
+  const already = await tx.journalEntry.findFirst({
+    where: { expenseId, reversesId: null, source: "EXPENSE" },
+    select: { id: true, entryNumber: true },
+  });
+  if (already) return already;
+
+  const draft = postExpenseClaim({
+    amount: Number(expense.amount),
+    taxAmount: Number(expense.taxAmount ?? 0),
+    categoryAccount: EXPENSE_CATEGORY_ACCOUNT[expense.category],
+    claimant: expense.user.name,
+    description: expense.description,
+    reference: formatExpenseId(expense.expenseSeq),
+    // Company-card and direct-debit spend is money that has already left; nobody is owed it.
+    companyPaid: !expense.reimbursable,
+    fromCash: expense.paymentMode === "CASH",
+    departmentId: expense.user.departmentId,
+  });
+
+  return writeEntry(tx, {
+    date: expense.spentOn,
+    narration: draft.narration,
+    source: "EXPENSE",
+    userId,
+    lines: await materialise(tx, draft),
+    expenseId: expense.id,
+    companyId: expense.companyId,
+    // SEC-15: the database's own guarantee of one claim posting, beside the lock above.
+    postingKey: `expense:${expense.id}`,
+    ...(await expenseTags(tx, expense.user.branch)),
+  });
+}
+
+/** Posts the reimbursement itself — the day the employee is actually paid back. */
+export async function postExpenseReimbursementToLedger(
+  tx: Tx,
+  expenseId: string,
+  userId: string,
+  paidOn: Date,
+): Promise<{ id: string; entryNumber: string } | null> {
+  // Security audit, 11 Nov 2026 (SEC-15): one reimbursement posting per claim, as with the claim itself.
+  await lockPosting(tx, `expense-paid:${expenseId}`);
+  const expense = await tx.expense.findUnique({
+    where: { id: expenseId },
+    select: {
+      id: true,
+      expenseSeq: true,
+      status: true,
+      amount: true,
+      reimbursable: true,
+      paymentMode: true,
+      user: { select: { name: true, branch: { select: { id: true, active: true, gstRegistrationId: true } } } },
+    },
+  });
+  // Nothing to settle on spend the company already paid for directly.
+  if (!expense || !expense.reimbursable) return null;
+  // SEC-15: money goes out only on a claim marked paid back.
+  if (expense.status !== "REIMBURSED") {
+    throw new Error(`${formatExpenseId(expense.expenseSeq)} isn't marked reimbursed, so its payment can't be posted.`);
+  }
+
+  const already = await tx.journalEntry.findFirst({
+    where: { expenseId, source: "PAYMENT", reversesId: null },
+    select: { id: true, entryNumber: true },
+  });
+  if (already) return already;
+
+  const draft = postExpenseReimbursement({
+    amount: Number(expense.amount),
+    claimant: expense.user.name,
+    reference: formatExpenseId(expense.expenseSeq),
+    fromCash: expense.paymentMode === "CASH",
+  });
+
+  return writeEntry(tx, {
+    date: paidOn,
+    narration: draft.narration,
+    source: "PAYMENT",
+    userId,
+    lines: await materialise(tx, draft),
+    expenseId: expense.id,
+    postingKey: `expense-paid:${expense.id}`,
+    // Tagged as the claim was, so the branch that owed the money is the branch that paid it.
+    ...(await expenseTags(tx, expense.user.branch)),
+  });
+}
+
+// ─── Payroll ──────────────────────────────────────────────────────────────────
+
+/**
+ * Posts a month's payroll, once the run is locked.
+ *
+ * Locked and not draft on purpose: a draft run is still being corrected, and a wage bill that moves
+ * after it has been booked is how a P&L ends up disagreeing with the payslips behind it.
+ */
+export async function postPayrollToLedger(
+  tx: Tx,
+  runId: string,
+  userId: string,
+): Promise<{ id: string; entryNumber: string } | null> {
+  const run = await tx.payrollRun.findUnique({
+    where: { id: runId },
+    select: {
+      id: true,
+      month: true,
+      year: true,
+      payslips: {
+        select: {
+          grossEarnings: true,
+          pfEmployee: true,
+          pfEmployer: true,
+          esiEmployee: true,
+          esiEmployer: true,
+          professionalTax: true,
+          incomeTax: true,
+          otherDeduction: true,
+          loanRecovery: true,
+          netPay: true,
+          user: { select: { departmentId: true } },
+        },
+      },
+    },
+  });
+  if (!run || run.payslips.length === 0) return null;
+
+  // Security audit round three, 14 Nov 2026 (R3-04): a run taken back to draft has its entry reversed
+  // (reversePayrollPosting), so "already posted" means an entry that still stands — one reversed since is history, and
+  // locking again posts afresh. Each posting is keyed `payroll:<run>:<n>`, n counting the run's postings so far, so
+  // two locks at once (or a retry) write one entry between them, never two.
+  const already = await tx.journalEntry.findFirst({
+    where: { payrollRunId: runId, source: "PAYROLL", reversesId: null, reversedBy: { is: null } },
+    select: { id: true, entryNumber: true },
+  });
+  if (already) return already;
+  const postedBefore = await tx.journalEntry.count({ where: { payrollRunId: runId, source: "PAYROLL", reversesId: null } });
+
+  const n = (v: Prisma.Decimal | number) => Number(v);
+  const totals: PayrollTotals = run.payslips.reduce(
+    (t, p) => ({
+      grossEarnings: t.grossEarnings + n(p.grossEarnings),
+      pfEmployee: t.pfEmployee + n(p.pfEmployee),
+      pfEmployer: t.pfEmployer + n(p.pfEmployer),
+      esiEmployee: t.esiEmployee + n(p.esiEmployee),
+      esiEmployer: t.esiEmployer + n(p.esiEmployer),
+      professionalTax: t.professionalTax + n(p.professionalTax),
+      incomeTax: t.incomeTax + n(p.incomeTax),
+      otherDeduction: t.otherDeduction + n(p.otherDeduction),
+      loanRecovery: (t.loanRecovery ?? 0) + n(p.loanRecovery),
+      netPay: t.netPay + n(p.netPay),
+    }),
+    {
+      grossEarnings: 0, pfEmployee: 0, pfEmployer: 0, esiEmployee: 0, esiEmployer: 0,
+      professionalTax: 0, incomeTax: 0, otherDeduction: 0, loanRecovery: 0, netPay: 0,
+    },
+  );
+
+  // Gross per team, so the wage line carries a cost centre.
+  const byTeam = new Map<string | null, number>();
+  for (const p of run.payslips) {
+    const key = p.user.departmentId ?? null;
+    byTeam.set(key, (byTeam.get(key) ?? 0) + n(p.grossEarnings));
+  }
+
+  const draft = postPayrollRun({
+    totals,
+    monthLabel: payrollMonthLabel(run.month, run.year),
+    byDepartment: [...byTeam].map(([departmentId, grossEarnings]) => ({ departmentId, grossEarnings })),
+  });
+
+  return writeEntry(tx, {
+    date: lastDayOfMonth(run.month, run.year),
+    narration: draft.narration,
+    source: "PAYROLL",
+    userId,
+    lines: await materialise(tx, draft),
+    payrollRunId: run.id,
+    postingKey: `payroll:${run.id}:${postedBefore + 1}`,
+  });
+}
+
+/**
+ * Takes a run's wage entry back out of the books, when the run goes from locked back to draft (security audit round
+ * three, 14 Nov 2026 — R3-04). Unlocking used to leave the entry standing, so a run recalculated and locked again
+ * kept the first figures in the ledger. The reversal is dated as the entry was — the month the payroll is for — so
+ * that month's P&L ends with whatever is posted when it's locked again; a month whose books are closed refuses it
+ * (writeEntry), and so refuses the unlock. In the caller's transaction, with the status change. Quiet when the run
+ * never reached the ledger.
+ */
+export async function reversePayrollPosting(tx: Tx, runId: string, userId: string): Promise<{ id: string; entryNumber: string } | null> {
+  const original = await tx.journalEntry.findFirst({
+    where: { payrollRunId: runId, source: "PAYROLL", reversesId: null, reversedBy: { is: null } },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entryNumber: true, date: true, lines: { orderBy: { sortOrder: "asc" }, select: reversibleLineSelect } },
+  });
+  if (!original) return null;
+  return writeEntry(tx, {
+    date: original.date,
+    narration: `Reversal of ${original.entryNumber} — payroll reopened for correction`,
+    source: "PAYROLL",
+    userId,
+    lines: reversedLines(original.lines),
+    payrollRunId: runId,
+    reversesId: original.id,
+    postingKey: `payroll-reversal:${original.id}`,
+  });
+}
+
+// ─── Bad debts ────────────────────────────────────────────────────────────────
+
+/**
+ * An invoice written off (owner, 15 Nov 2026 — src/lib/receivables/write-off.ts): Bad Debts for what's lost, the
+ * customer's balance down by all of it, and — in the UAE, where the VAT on it is claimed back as bad-debt relief — that
+ * VAT out of Output VAT rather than into Bad Debts. In the workspace's currency. Keyed `write-off:<id>`, so once.
+ */
+export async function postInvoiceWriteOffToLedger(
+  tx: Tx,
+  params: { writeOffId: string; companyId: string; baseAmount: number; reliefVat: number; on: Date; label: string; userId: string },
+): Promise<{ id: string; entryNumber: string }> {
+  const round = (n: number) => Math.round(n * 100) / 100;
+  const relief = round(Math.max(0, Math.min(params.reliefVat, params.baseAmount)));
+  const draft = {
+    narration: `Written off as bad debt — ${params.label}`,
+    lines: [
+      { account: SYSTEM_ACCOUNTS.BAD_DEBTS, debit: round(params.baseAmount - relief), credit: 0 },
+      ...(relief > 0 ? [{ account: SYSTEM_ACCOUNTS.OUTPUT_IGST, debit: relief, credit: 0, narration: "VAT bad-debt relief" }] : []),
+      { account: SYSTEM_ACCOUNTS.AR, debit: 0, credit: round(params.baseAmount), companyId: params.companyId },
+    ].filter((l) => l.debit > 0 || l.credit > 0),
+  };
+  return writeEntry(tx, { date: params.on, narration: draft.narration, source: "WRITE_OFF", userId: params.userId, lines: await materialise(tx, draft), postingKey: `write-off:${params.writeOffId}` });
+}
+
+/** A write-off undone — the customer paid after all, or it was a mistake: its entry reversed on the day it's undone. */
+export async function reverseInvoiceWriteOff(tx: Tx, journalEntryId: string, on: Date, userId: string): Promise<{ id: string; entryNumber: string } | null> {
+  const original = await tx.journalEntry.findUnique({ where: { id: journalEntryId }, select: { id: true, entryNumber: true, reversedBy: { select: { id: true } }, lines: { orderBy: { sortOrder: "asc" }, select: reversibleLineSelect } } });
+  if (!original || original.reversedBy) return null;
+  return writeEntry(tx, { date: on, narration: `Reversal of ${original.entryNumber} — write-off undone`, source: "WRITE_OFF", userId, lines: reversedLines(original.lines), reversesId: original.id, postingKey: `write-off-reversal:${original.id}` });
+}
+
+// ─── UAE payroll ──────────────────────────────────────────────────────────────
+
+/**
+ * A UAE month's wages into the books once it's locked (owner, 15 Nov 2026 — src/lib/uae): the salaries earned, the
+ * deductions typed, and what's owed to the staff — the same entry India's payroll writes, with no PF, ESI or tax.
+ * Dated the month's last day. UAE runs aren't PayrollRuns, so the entry is found by its key,
+ * `uae-payroll:<run>:<n>`, n counting the run's postings; unlocking reverses the one standing.
+ */
+export async function postUaePayrollToLedger(tx: Tx, runId: string, userId: string): Promise<{ id: string; entryNumber: string } | null> {
+  const run = await tx.uaePayrollRun.findUnique({ where: { id: runId }, select: { id: true, month: true, year: true, payslips: { select: { fixed: true, deductions: true, overtime: true, bonus: true, net: true } } } });
+  if (!run || run.payslips.length === 0) return null;
+  const prefix = `uae-payroll:${run.id}:`;
+  const standing = await tx.journalEntry.findFirst({ where: { postingKey: { startsWith: prefix }, reversesId: null, reversedBy: { is: null } }, select: { id: true, entryNumber: true } });
+  if (standing) return standing;
+  const postedBefore = await tx.journalEntry.count({ where: { postingKey: { startsWith: prefix }, reversesId: null } });
+  const t = run.payslips.reduce(
+    (a, p) => {
+      const deductions = Number(p.deductions);
+      return { gross: a.gross + Number(p.fixed) + deductions + Number(p.overtime) + Number(p.bonus), deductions: a.deductions + deductions, net: a.net + Number(p.net) };
+    },
+    { gross: 0, deductions: 0, net: 0 },
+  );
+  if (t.gross <= 0) return null;
+  const draft = postPayrollRun({
+    totals: { grossEarnings: t.gross, pfEmployee: 0, pfEmployer: 0, esiEmployee: 0, esiEmployer: 0, professionalTax: 0, incomeTax: 0, otherDeduction: t.deductions, loanRecovery: 0, netPay: t.net },
+    monthLabel: payrollMonthLabel(run.month, run.year),
+  });
+  return writeEntry(tx, { date: lastDayOfMonth(run.month, run.year), narration: draft.narration, source: "PAYROLL", userId, lines: await materialise(tx, draft), postingKey: `${prefix}${postedBefore + 1}` });
+}
+
+/** Takes a UAE month's wage entry back out, when it's unlocked — dated as the entry was, as India's (R3-04). */
+export async function reverseUaePayrollPosting(tx: Tx, runId: string, userId: string): Promise<{ id: string; entryNumber: string } | null> {
+  const original = await tx.journalEntry.findFirst({
+    where: { postingKey: { startsWith: `uae-payroll:${runId}:` }, reversesId: null, reversedBy: { is: null } },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entryNumber: true, date: true, lines: { orderBy: { sortOrder: "asc" }, select: reversibleLineSelect } },
+  });
+  if (!original) return null;
+  return writeEntry(tx, { date: original.date, narration: `Reversal of ${original.entryNumber} — payroll reopened for correction`, source: "PAYROLL", userId, lines: reversedLines(original.lines), reversesId: original.id, postingKey: `uae-payroll-reversal:${original.id}` });
+}
+
+/** Payday for a UAE month: what's owed to the staff paid from the bank, once. */
+export async function postUaePayrollPaymentToLedger(tx: Tx, runId: string, userId: string, paidOn: Date): Promise<{ id: string; entryNumber: string } | null> {
+  const run = await tx.uaePayrollRun.findUnique({ where: { id: runId }, select: { id: true, month: true, year: true, payslips: { select: { net: true } } } });
+  if (!run || run.payslips.length === 0) return null;
+  const key = `uae-payroll-paid:${run.id}`;
+  const already = await tx.journalEntry.findFirst({ where: { postingKey: key }, select: { id: true, entryNumber: true } });
+  if (already) return already;
+  const netPay = run.payslips.reduce((t, p) => t + Number(p.net), 0);
+  if (netPay <= 0) return null;
+  const draft = postPayrollPayment({ netPay, monthLabel: payrollMonthLabel(run.month, run.year), fromCash: false });
+  return writeEntry(tx, { date: paidOn, narration: draft.narration, source: "PAYMENT", userId, lines: await materialise(tx, draft), postingKey: key });
+}
+
+/** A loan or advance paid out to an employee, or paid back by hand (src/actions/loan.ts). */
+export async function postLoanMovementToLedger(
+  tx: Tx,
+  params: { kind: "DISBURSAL" | "REPAYMENT"; amount: number; label: string; cash: boolean; on: Date; userId: string },
+): Promise<{ id: string; entryNumber: string }> {
+  const draft = params.kind === "DISBURSAL" ? postLoanDisbursal({ amount: params.amount, label: params.label, fromCash: params.cash }) : postLoanRepayment({ amount: params.amount, label: params.label, toCash: params.cash });
+  return writeEntry(tx, { date: params.on, narration: draft.narration, source: "PAYMENT", userId: params.userId, lines: await materialise(tx, draft) });
+}
+
+/** Payday — the net pay actually leaving the bank. */
+export async function postPayrollPaymentToLedger(
+  tx: Tx,
+  runId: string,
+  userId: string,
+  paidOn: Date,
+): Promise<{ id: string; entryNumber: string } | null> {
+  const run = await tx.payrollRun.findUnique({
+    where: { id: runId },
+    select: { id: true, month: true, year: true, payslips: { select: { netPay: true } } },
+  });
+  if (!run || run.payslips.length === 0) return null;
+
+  const already = await tx.journalEntry.findFirst({
+    where: { payrollRunId: runId, source: "PAYMENT", reversesId: null },
+    select: { id: true, entryNumber: true },
+  });
+  if (already) return already;
+
+  const netPay = run.payslips.reduce((t, p) => t + Number(p.netPay), 0);
+  const draft = postPayrollPayment({
+    netPay,
+    monthLabel: payrollMonthLabel(run.month, run.year),
+    fromCash: false,
+  });
+
+  return writeEntry(tx, {
+    date: paidOn,
+    narration: draft.narration,
+    source: "PAYMENT",
+    userId,
+    lines: await materialise(tx, draft),
+    payrollRunId: run.id,
+    // R3-04: a paid run never leaves PAID, so its payment is posted once — keyed, so a retry can't post it twice.
+    postingKey: `payroll-paid:${run.id}`,
+  });
+}
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+function payrollMonthLabel(month: number, year: number) {
+  return (MONTH_NAMES[month - 1] ?? String(month)) + " " + year;
+}
+
+/**
+ * Payroll is dated to the last day of the month it is for, not to the day somebody pressed the
+ * button — a September run locked in October belongs in September's P&L.
+ */
+function lastDayOfMonth(month: number, year: number) {
+  return new Date(Date.UTC(year, month, 0, 12, 0, 0));
+}
+
+// ─── Cheques ──────────────────────────────────────────────────────────────────
+
+/** Moves a cheque out of cheques-in-hand (or cheques-issued) and into the bank it cleared through. */
+export async function postChequeClearingToLedger(
+  tx: Tx,
+  paymentId: string,
+  userId: string,
+  clearedOn: Date,
+): Promise<{ id: string; entryNumber: string } | null> {
+  const payment = await tx.payment.findUnique({
+    where: { id: paymentId },
+    select: {
+      id: true, amount: true, reference: true, direction: true, method: true,
+      bankAccountId: true, exchangeRate: true, currency: true,
+      company: { select: { name: true } },
+    },
+  });
+  if (!payment || payment.method !== "CHEQUE") return null;
+
+  const already = await tx.journalEntry.findFirst({
+    where: { paymentId, source: "PAYMENT", narration: { contains: "cleared" }, reversesId: null },
+    select: { id: true, entryNumber: true },
+  });
+  if (already) return already;
+
+  const received = payment.direction !== "PAID";
+  const draft = postChequeClearing({
+    // In rupees, as the payment's own posting converted it — so the clearing empties cheques in hand exactly.
+    amount: Number(payment.amount) * bookingRate(payment),
+    received,
+    partyName: payment.company.name,
+    reference: payment.reference,
+  });
+
+  // The bank half goes to the real account the cheque cleared through.
+  const bank = await resolveMoneyAccount(tx, {
+    method: "BANK_TRANSFER",
+    bankAccountId: payment.bankAccountId,
+    clearedOn,
+    direction: payment.direction,
+  });
+  const lines = (await materialise(tx, draft)).map((l, i) =>
+    (received && i === 0) || (!received && i === 1) ? { ...l, accountId: bank.accountId } : l,
+  );
+
+  return writeEntry(tx, {
+    date: clearedOn,
+    narration: draft.narration,
+    source: "PAYMENT",
+    userId,
+    lines,
+    paymentId: payment.id,
+  });
+}
+
+// ─── Depreciation ─────────────────────────────────────────────────────────────
+
+/** Posts one asset's charge for a period, and records it so the same period can't be charged twice. */
+export async function postDepreciationToLedger(
+  tx: Tx,
+  params: {
+    assetId: string;
+    amount: number;
+    fromDate: Date;
+    toDate: Date;
+    periodLabel: string;
+    userId: string;
+  },
+): Promise<{ id: string; entryNumber: string } | null> {
+  if (params.amount <= 0) return null;
+
+  const asset = await tx.fixedAsset.findUnique({
+    where: { id: params.assetId },
+    select: { id: true, name: true, tag: true, departmentId: true, accumulatedAccountId: true },
+  });
+  if (!asset) return null;
+
+  const existing = await tx.depreciationCharge.findUnique({
+    where: { assetId_toDate: { assetId: asset.id, toDate: params.toDate } },
+    select: { entryId: true, entry: { select: { id: true, entryNumber: true } } },
+  });
+  if (existing?.entry) return existing.entry;
+
+  const draft = postDepreciation({
+    amount: params.amount,
+    periodLabel: params.periodLabel,
+    assetName: asset.tag + " " + asset.name,
+    departmentId: asset.departmentId,
+  });
+
+  let lines = await materialise(tx, draft);
+  // An asset with its own accumulated-depreciation account uses it; otherwise the shared one.
+  if (asset.accumulatedAccountId) {
+    lines = lines.map((l, i) => (i === 1 ? { ...l, accountId: asset.accumulatedAccountId! } : l));
+  }
+
+  const entry = await writeEntry(tx, {
+    date: params.toDate,
+    narration: draft.narration,
+    source: "DEPRECIATION",
+    userId: params.userId,
+    lines,
+  });
+
+  await tx.depreciationCharge.upsert({
+    where: { assetId_toDate: { assetId: asset.id, toDate: params.toDate } },
+    create: {
+      assetId: asset.id,
+      fromDate: params.fromDate,
+      toDate: params.toDate,
+      amount: params.amount,
+      entryId: entry.id,
+      createdById: params.userId,
+    },
+    update: { entryId: entry.id, amount: params.amount },
+  });
+
+  return entry;
+}
+
+/** Takes an asset off the books, with the gain or loss falling out of the figures. */
+export async function postAssetDisposalToLedger(
+  tx: Tx,
+  params: { assetId: string; proceeds: number; disposedOn: Date; userId: string },
+): Promise<{ id: string; entryNumber: string } | null> {
+  const asset = await tx.fixedAsset.findUnique({
+    where: { id: params.assetId },
+    select: {
+      id: true, name: true, tag: true, cost: true, assetAccountId: true, disposalEntryId: true,
+      charges: { select: { amount: true } },
+    },
+  });
+  if (!asset || asset.disposalEntryId) return null;
+
+  const accumulated = asset.charges.reduce((t, c) => t + Number(c.amount), 0);
+  const draft = postAssetDisposal({
+    cost: Number(asset.cost),
+    accumulated,
+    proceeds: params.proceeds,
+    assetAccountId: asset.assetAccountId,
+    assetName: asset.tag + " " + asset.name,
+    fromCash: false,
+  });
+
+  return writeEntry(tx, {
+    date: params.disposedOn,
+    narration: draft.narration,
+    source: "MANUAL",
+    userId: params.userId,
+    lines: await materialise(tx, { narration: draft.narration, lines: draft.lines }),
+  });
+}
+
+// ─── Foreign currency ─────────────────────────────────────────────────────────
+
+/**
+ * Books the exchange difference when a payment settles a document raised at a different rate.
+ *
+ * Called on allocation rather than on the payment, because the difference only exists once you know
+ * which document the money is against — the same $1,000 could be settling an invoice raised at ₹83
+ * or one raised at ₹86, and those are different gains.
+ *
+ * Domestic settlements pass through untouched: both rates are 1, the difference is zero, and
+ * nothing is written.
+ *
+ * Measured against the rate the document was booked at (posting.ts `bookingRate`), which is what the
+ * receivable or payable holds — see `settlementDifference` for both kinds of allocation. An allocation
+ * across currencies (rupees on account set against a USD invoice) passes `paymentAmount`, the rupees it
+ * took out of the payment; every other one leaves it out and is measured at the payment's own rate.
+ *
+ * Dated on the payment's day unless `date` says otherwise: money on account set against an invoice
+ * raised after it settles it no earlier than the invoice (receivable.ts `applyPaymentToInvoice`).
+ */
+export async function postExchangeDifferenceToLedger(
+  tx: Tx,
+  params: {
+    paymentId: string;
+    documentId: string;
+    /** In the document's currency — the part of it the allocation settles. */
+    allocatedAmount: number;
+    /** Across currencies only: what the allocation took out of the payment, in the payment's currency. */
+    paymentAmount?: number | null;
+    date?: Date;
+    userId: string;
+  },
+): Promise<{ id: string; entryNumber: string } | null> {
+  const [payment, doc] = await Promise.all([
+    tx.payment.findUnique({
+      where: { id: params.paymentId },
+      select: {
+        id: true, companyId: true, currency: true, exchangeRate: true, paidOn: true, direction: true,
+        company: { select: { name: true } },
+      },
+    }),
+    tx.tradeDocument.findUnique({
+      where: { id: params.documentId },
+      select: { id: true, docNumber: true, docType: true, currency: true, exchangeRate: true },
+    }),
+  ]);
+  if (!payment || !doc) return null;
+
+  // Null when the two currencies differ and nothing says at what rate — not a gain, a mistake.
+  const difference = settlementDifference(
+    { amount: params.allocatedAmount, paymentAmount: params.paymentAmount ?? null },
+    payment,
+    doc,
+  );
+  if (!difference) return null;
+  const draft = postExchangeDifference({
+    companyId: payment.companyId,
+    difference,
+    receivable: doc.docType !== "BILL",
+    partyName: payment.company.name,
+    docNumber: doc.docNumber,
+  });
+  if (!draft) return null;
+
+  return writeEntry(tx, {
+    date: params.date ?? payment.paidOn,
+    narration: draft.narration,
+    source: "FX",
+    userId: params.userId,
+    lines: await materialise(tx, draft),
+    paymentId: payment.id,
+    documentId: doc.id,
+    companyId: payment.companyId,
+  });
+}
+
+// ─── Customer groups ─────────────────────────────────────────────────────────
+
+/**
+ * One group company's payment settling another's invoice (owner, 17 Nov 2026 — src/lib/companies/groups.ts): the
+ * payment credited the payer's receivable, the invoice debited its own customer's, so the amount moves between them —
+ * Dr AR the payer, Cr AR the invoice's customer. Each account then reads as its documents and payments do: the payer's
+ * money is spent, the invoice is settled. In rupees, on the allocation's day; once per allocation, by its key.
+ * Nothing when the payment is the invoice's own customer's.
+ */
+export async function postGroupTransferToLedger(
+  tx: Tx,
+  params: { allocationId: string; paymentId: string; documentId: string; amount: number; date: Date; userId: string },
+): Promise<{ id: string; entryNumber: string } | null> {
+  const [payment, doc] = await Promise.all([
+    tx.payment.findUnique({ where: { id: params.paymentId }, select: { companyId: true, company: { select: { name: true } } } }),
+    tx.tradeDocument.findUnique({ where: { id: params.documentId }, select: { companyId: true, docNumber: true, issueDate: true, company: { select: { name: true } } } }),
+  ]);
+  if (!payment || !doc || payment.companyId === doc.companyId) return null;
+  // Money paid ahead of the invoice is on the payer's account until the invoice exists (the statement says the same).
+  const date = params.date > doc.issueDate ? params.date : doc.issueDate;
+  const amount = Math.round(params.amount * 100) / 100;
+  if (amount <= 0) return null;
+  const ar = (await resolveAccounts(tx, [SYSTEM_ACCOUNTS.AR])).get(SYSTEM_ACCOUNTS.AR)!;
+  const narration = `${payment.company.name}'s payment set against ${doc.company.name}'s ${doc.docNumber}`;
+  return writeEntry(tx, {
+    date,
+    narration,
+    source: "GROUP_TRANSFER",
+    userId: params.userId,
+    lines: [
+      { accountId: ar, debit: amount, credit: 0, companyId: payment.companyId, narration: `Paid ${doc.company.name}'s ${doc.docNumber}` },
+      { accountId: ar, debit: 0, credit: amount, companyId: doc.companyId, narration: `Paid by ${payment.company.name}` },
+    ],
+    paymentId: params.paymentId,
+    documentId: params.documentId,
+    companyId: payment.companyId,
+    branchId: (await headOfficeOf(tx))?.id ?? null,
+    postingKey: `group-transfer:${params.allocationId}`,
+  });
+}
+
+/** Reverses the transfer one allocation posted, when the allocation is removed and the payment stays. */
+export async function reverseGroupTransfer(tx: Tx, allocationId: string, userId: string) {
+  const original = await tx.journalEntry.findFirst({
+    where: { postingKey: `group-transfer:${allocationId}`, reversedBy: { is: null } },
+    select: reversibleEntrySelect,
+  });
+  return original ? reverseEntry(tx, original, userId, "allocation removed") : null;
+}
+
+// ─── Year end ─────────────────────────────────────────────────────────────────
+
+/**
+ * Writes the closing entry for a financial year.
+ *
+ * The balances are read from the journal rather than passed in, so what is closed is exactly what
+ * the trial balance says — a closing entry built from a figure somebody typed is a closing entry
+ * that leaves a remainder.
+ *
+ * `from` and `to` are a half-open window of instants — 1 April 00:00 IST up to the next 1 April
+ * (src/lib/india-time.ts `financialYearWindow`). The year end used to be midnight UTC on 31 March,
+ * compared with `lte`: that is 05:30 IST on the year's last day, so March's payroll and depreciation
+ * (12:00 UTC) and everything else posted later that day stayed out of the closing entry. `date` is
+ * the day the entry itself is dated, inside the year.
+ */
+export async function postYearEndCloseToLedger(
+  tx: Tx,
+  params: { from: Date; to: Date; date: Date; label: string; userId: string },
+): Promise<{ entry: { id: string; entryNumber: string } | null; netProfit: number }> {
+  const accounts = await tx.ledgerAccount.findMany({
+    where: { isGroup: false, type: { in: ["INCOME", "EXPENSE"] } },
+    select: { id: true, type: true },
+  });
+  if (accounts.length === 0) return { entry: null, netProfit: 0 };
+
+  const sums = await tx.journalLine.groupBy({
+    by: ["accountId"],
+    where: {
+      accountId: { in: accounts.map((a) => a.id) },
+      entry: { date: { gte: params.from, lt: params.to } },
+    },
+    _sum: { debit: true, credit: true },
+  });
+
+  const balances = accounts
+    .map((a) => {
+      const row = sums.find((s) => s.accountId === a.id);
+      const debit = Number(row?._sum.debit ?? 0);
+      const credit = Number(row?._sum.credit ?? 0);
+      // Each in its own natural direction: income is credit-natured, expense debit-natured, so a
+      // positive number means "this account did what it normally does".
+      const balance = a.type === "INCOME" ? credit - debit : debit - credit;
+      return { accountId: a.id, type: a.type as "INCOME" | "EXPENSE", balance: Math.round(balance * 100) / 100 };
+    })
+    .filter((a) => a.balance !== 0);
+
+  const draft = postYearEndClose({ label: params.label, accounts: balances });
+  if (draft.lines.length === 0) return { entry: null, netProfit: 0 };
+
+  const entry = await writeEntry(tx, {
+    date: params.date,
+    narration: draft.narration,
+    source: "CLOSING",
+    userId: params.userId,
+    lines: await materialise(tx, { narration: draft.narration, lines: draft.lines }),
+  });
+  return { entry, netProfit: draft.netProfit };
+}

@@ -1,0 +1,518 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { Copy, Download } from "lucide-react";
+import { createCaptureKey, revokeCaptureKey, setCaptureKeyCredit } from "@/actions/lead-capture";
+import { CREDIT_MODES, DEFAULT_CREDIT_LABEL, type CreditMode, type KeyCredit } from "@/lib/lead-capture/credit-modes";
+import { Button } from "@/components/ui/button";
+import { Badge, Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Dialog } from "@/components/ui/dialog";
+import { Input, Label, Select } from "@/components/ui/input";
+import {
+  API_PATH,
+  LEAD_FIELDS,
+  OWN_FIELDS_INTRO,
+  OWN_FIELD_VALUES,
+  RESPONSES,
+  curlExample,
+  nodeExample,
+  phpExample,
+  postmanCollection,
+  renderMarkdown,
+  type OwnFieldGroup,
+} from "@/lib/lead-capture/spec";
+import { useClock } from "@/components/time/clock-provider";
+import type { Clock } from "@/lib/time/zone";
+
+type Key = {
+  id: string;
+  name: string;
+  keyId: string;
+  sourceLabel: string | null;
+  active: boolean;
+  lastUsedAt: Date | string | null;
+  useCount: number;
+  createdAt: Date | string;
+  revokedAt: Date | string | null;
+  leads: number;
+  createdBy: string | null;
+  /** Where this key's Elementor form posts (src/lib/lead-capture/elementor.ts); null once revoked. */
+  elementorPath: string | null;
+  /** Who its leads are raised by (src/lib/lead-capture/credit.ts). */
+  credit: KeyCredit;
+};
+type Person = { id: string; name: string };
+const MODE_WORDS: Record<CreditMode, string> = { NOBODY: "No person — show a name", MAKER: "Whoever made the key", PERSON: "A person" };
+
+/**
+ * Who a key's leads are raised and sourced by (owner, 9 Nov 2026 — src/lib/lead-capture/credit.ts): what it says now, and
+ * the choice to change it. Leads already in keep what they had.
+ */
+function CreditCell({ k, people }: { k: Key; people: Person[] }) {
+  const router = useRouter();
+  const [editing, setEditing] = useState(false);
+  const [mode, setMode] = useState<CreditMode>(k.credit.mode);
+  const [userId, setUserId] = useState(k.credit.userId ?? "");
+  const [label, setLabel] = useState(k.credit.mode === "NOBODY" && k.credit.label !== DEFAULT_CREDIT_LABEL ? k.credit.label : "");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, start] = useTransition();
+  const now =
+    k.credit.mode === "PERSON"
+      ? (people.find((p) => p.id === k.credit.userId)?.name ?? "A person no longer here")
+      : k.credit.mode === "MAKER"
+        ? (k.createdBy ?? "Whoever made it")
+        : `“${k.credit.label}”`;
+  if (!editing) {
+    return (
+      <div className="text-xs">
+        <span className="text-text">{now}</span>
+        {!k.revokedAt && (
+          <button type="button" className="ml-2 text-brand hover:underline" onClick={() => setEditing(true)}>
+            Change
+          </button>
+        )}
+      </div>
+    );
+  }
+  const save = () =>
+    start(async () => {
+      setError(null);
+      const r = await setCaptureKeyCredit({ id: k.id, mode, userId: mode === "PERSON" ? userId : null, label });
+      if (!r.ok) return setError(r.error);
+      setEditing(false);
+      router.refresh();
+    });
+  return (
+    <div className="min-w-56 space-y-1.5 text-xs">
+      <Select aria-label="Its leads are raised by" value={mode} onChange={(e) => setMode(e.target.value as CreditMode)}>
+        {CREDIT_MODES.map((m) => (
+          <option key={m} value={m}>
+            {MODE_WORDS[m]}
+          </option>
+        ))}
+      </Select>
+      {mode === "NOBODY" && <Input aria-label="Name shown as Raised by" value={label} onChange={(e) => setLabel(e.target.value)} placeholder={DEFAULT_CREDIT_LABEL} maxLength={60} />}
+      {mode === "PERSON" && (
+        <Select aria-label="Person its leads are raised by" value={userId} onChange={(e) => setUserId(e.target.value)}>
+          <option value="">Choose somebody…</option>
+          {people.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </Select>
+      )}
+      <p className="text-subtle">{mode === "NOBODY" ? "Nobody is paid for these leads as raised by them." : "This person counts as raising every lead the form brings — and is paid for them in Leads raised incentives."}</p>
+      {error && <p className="text-danger">{error}</p>}
+      <div className="flex gap-2">
+        <Button type="button" size="sm" disabled={saving || (mode === "PERSON" && !userId)} onClick={save}>
+          {saving ? "Saving…" : "Save"}
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(false)}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+
+/** When a key was last used, on the workspace's clock — or "Never". */
+const when = (v: Date | string | null, clock: Clock) => (v ? clock.dateTimeShort(v) : "Never");
+
+function CopyButton({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <Button
+      type="button"
+      variant="secondary"
+      size="sm"
+      aria-label={`Copy ${label}`}
+      onClick={() => {
+        void navigator.clipboard?.writeText(value).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        });
+      }}
+    >
+      <Copy className="h-3.5 w-3.5" /> {copied ? "Copied" : "Copy"}
+    </Button>
+  );
+}
+
+function Code({ children }: { children: string }) {
+  return (
+    <pre className="overflow-x-auto rounded-md border border-line bg-surface-sunken p-3 font-mono text-xs leading-5 text-text">
+      {children}
+    </pre>
+  );
+}
+
+/** Text with the request's own words — `custom_fields` — set as code, as the Markdown has them. */
+function WithCode({ text }: { text: string }) {
+  return (
+    <>
+      {text.split("`").map((part, i) =>
+        i % 2 === 1 ? (
+          <code key={i} className="font-mono text-xs text-text">
+            {part}
+          </code>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
+/** The workspace's own fields a website can fill: what a developer maps a form to. */
+function OwnFields({ groups }: { groups: OwnFieldGroup[] }) {
+  const any = groups.some((g) => g.fields.length > 0);
+  return (
+    <div className="space-y-2">
+      <p className="font-medium text-text">Your own fields</p>
+      {OWN_FIELDS_INTRO.map((p) => (
+        <p key={p} className="text-muted">
+          <WithCode text={p} />
+        </p>
+      ))}
+      {!any && (
+        <p className="text-muted">
+          None yet. Fields added in Settings → Custom fields to leads, companies and contacts appear here — all but the
+          restricted ones, the retired ones and the ones that name a person in the workspace.
+        </p>
+      )}
+      {groups
+        .filter((g) => g.fields.length > 0)
+        .map((g) => (
+          <div key={g.name} className="space-y-1">
+            <p className="text-xs text-muted">
+              <code className="font-mono text-text">{g.name}</code> — {g.record}
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="border-b border-line text-left uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="py-1.5 pr-3">Key</th>
+                    <th className="py-1.5 pr-3">Field</th>
+                    <th className="py-1.5 pr-3">Value</th>
+                    <th className="py-1.5">Options</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {g.fields.map((f) => (
+                    <tr key={f.key} className="border-b border-line align-top last:border-0">
+                      <td className="py-1.5 pr-3 font-mono text-text">{f.key}</td>
+                      <td className="py-1.5 pr-3 text-muted">
+                        {f.label}
+                        {f.help && <span className="block text-[11px] text-subtle">{f.help}</span>}
+                        {f.required && <span className="block text-[11px] text-subtle">Required in the CRM, not here</span>}
+                      </td>
+                      <td className="py-1.5 pr-3 text-muted">{OWN_FIELD_VALUES[f.type]}</td>
+                      <td className="py-1.5 text-muted">
+                        {f.options.map((o, i) => (
+                          <span key={o.value}>
+                            {i > 0 && ", "}
+                            <code className="font-mono text-text">{o.value}</code> ({o.label})
+                          </span>
+                        ))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))}
+    </div>
+  );
+}
+
+/**
+ * A key's Elementor address, and the three clicks that use it (owner, 27 Oct 2026): pasted into the form's Webhook
+ * action, each enquiry is a lead, its fields read by what they are whatever their labels.
+ */
+function ElementorAddress({ name, url }: { name: string; url: string }) {
+  return (
+    <div className="mt-3 space-y-2 rounded-lg border border-line bg-surface-sunken p-3 text-sm">
+      <p className="font-medium text-text">Elementor form — {name}</p>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 break-all rounded-md border border-line bg-surface px-2 py-1.5 font-mono text-xs">{url}</code>
+        <CopyButton value={url} label="Elementor address" />
+      </div>
+      <ol className="list-decimal space-y-1 pl-5 text-xs text-muted">
+        <li>In Elementor, open the form › Actions After Submit, and add Webhook.</li>
+        <li>Paste this address as the Webhook URL, then update the page.</li>
+        <li>Send a test enquiry from the website: it arrives under Leads, source Website.</li>
+      </ol>
+      <p className="text-xs text-subtle">
+        Name, email, phone, company and message are found by what they are, whatever the form calls them; anything else the form asks is kept in the lead&apos;s message. Keep this address to the website&apos;s settings — anyone who has it can send leads. Revoking the key ends it.
+      </p>
+    </div>
+  );
+}
+
+export function LeadCaptureManager({ keys, baseUrl, ownFields, people }: { keys: Key[]; baseUrl: string; ownFields: OwnFieldGroup[]; people: Person[] }) {
+  const router = useRouter();
+  const clock = useClock();
+  const [pending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [sourceLabel, setSourceLabel] = useState("");
+  const [issued, setIssued] = useState<{ keyId: string; secret: string; name: string } | null>(null);
+  const [revoking, setRevoking] = useState<Key | null>(null);
+  const [elementorFor, setElementorFor] = useState<string | null>(null);
+  const [example, setExample] = useState<"curl" | "php" | "node">("curl");
+
+  function create(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    startTransition(async () => {
+      const result = await createCaptureKey({ name, sourceLabel });
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      setIssued({ ...result.data, name });
+      setName("");
+      setSourceLabel("");
+      router.refresh();
+    });
+  }
+
+  /** The documentation as a file — Markdown to read, or a Postman collection to try it in (src/lib/lead-capture/spec.ts). */
+  function download(kind: "md" | "postman") {
+    const blob =
+      kind === "md"
+        ? new Blob([renderMarkdown(baseUrl, ownFields)], { type: "text/markdown;charset=utf-8" })
+        : new Blob([postmanCollection(baseUrl, ownFields)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = kind === "md" ? "lead-capture-api.md" : "lead-capture-api.postman_collection.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader className="text-sm font-medium text-text">API keys</CardHeader>
+        <CardContent className="space-y-4 text-sm">
+          {error && <p className="rounded-md bg-danger-bg px-3 py-2 text-danger">{error}</p>}
+
+          {keys.length === 0 ? (
+            <p className="text-muted">No keys yet. Create one for each website or form that should send leads.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="border-b border-line text-left text-xs uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="py-2 pr-4">Name</th>
+                    <th className="py-2 pr-4">Key ID</th>
+                    <th className="py-2 pr-4">Leads</th>
+                    <th className="py-2 pr-4">Raised by</th>
+                    <th className="py-2 pr-4">Last used</th>
+                    <th className="py-2 pr-4">Status</th>
+                    <th className="py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {keys.map((k) => (
+                    <tr key={k.id} className="border-b border-line last:border-0">
+                      <td className="py-2 pr-4">
+                        <div className="font-medium text-text">{k.name}</div>
+                        {k.sourceLabel && <div className="text-xs text-subtle">{k.sourceLabel}</div>}
+                      </td>
+                      <td className="py-2 pr-4 font-mono text-xs text-muted">{k.keyId}</td>
+                      <td className="py-2 pr-4 tabular-nums text-muted">{k.leads}</td>
+                      <td className="py-2 pr-4 align-top">
+                        <CreditCell k={k} people={people} />
+                      </td>
+                      <td className="py-2 pr-4 text-muted">{when(k.lastUsedAt, clock)}</td>
+                      <td className="py-2 pr-4">{k.revokedAt ? <Badge tone="red">Revoked</Badge> : <Badge tone="green">Active</Badge>}</td>
+                      <td className="py-2 text-right">
+                        {k.elementorPath && (
+                          <Button type="button" variant="ghost" size="sm" aria-expanded={elementorFor === k.id} onClick={() => setElementorFor(elementorFor === k.id ? null : k.id)}>
+                            Elementor
+                          </Button>
+                        )}
+                        {!k.revokedAt && (
+                          <Button type="button" variant="ghost" size="sm" onClick={() => setRevoking(k)}>
+                            Revoke
+                          </Button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {keys.map((k) =>
+                elementorFor === k.id && k.elementorPath ? <ElementorAddress key={k.id} name={k.name} url={`${baseUrl}${k.elementorPath}`} /> : null,
+              )}
+            </div>
+          )}
+
+          <form onSubmit={create} className="flex flex-wrap items-end gap-3 border-t border-line pt-4">
+            <div className="min-w-56 flex-1 space-y-1.5">
+              <Label htmlFor="lck-name">New key for</Label>
+              <Input id="lck-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="acme.com contact form" autoComplete="off" />
+            </div>
+            <div className="min-w-56 flex-1 space-y-1.5">
+              <Label htmlFor="lck-source">Source label (optional)</Label>
+              <Input
+                id="lck-source"
+                value={sourceLabel}
+                onChange={(e) => setSourceLabel(e.target.value)}
+                placeholder="What leads from it should say they came from"
+                autoComplete="off"
+              />
+            </div>
+            <Button type="submit" disabled={pending || name.trim().length < 2}>
+              {pending ? "Creating…" : "Create API key"}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex items-center justify-between text-sm font-medium text-text">
+          <span>Documentation for your website developers</span>
+          <span className="flex flex-wrap gap-2">
+            <Button type="button" variant="secondary" size="sm" onClick={() => download("md")}>
+              <Download className="h-3.5 w-3.5" /> Download (.md)
+            </Button>
+            <Button type="button" variant="secondary" size="sm" onClick={() => download("postman")} title="Import into Postman, Insomnia or Bruno, then fill in the key ID and secret">
+              <Download className="h-3.5 w-3.5" /> Postman collection
+            </Button>
+          </span>
+        </CardHeader>
+        <CardContent className="space-y-5 text-sm">
+          <div className="space-y-1.5">
+            <p className="font-medium text-text">Endpoint</p>
+            <Code>{`POST ${baseUrl}${API_PATH}`}</Code>
+            <p className="text-muted">
+              HTTP Basic authentication — the <span className="font-medium text-text">key ID</span> is the username and the{" "}
+              <span className="font-medium text-text">secret</span> is the password. <span className="font-medium text-danger">Call it from the website&apos;s server, never from browser JavaScript</span> — anything in a page&apos;s
+              script can be read by every visitor. A <code className="font-mono text-xs">GET</code> to the same address with the same credentials checks a key without creating anything.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <p className="font-medium text-text">Fields</p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="border-b border-line text-left uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="py-1.5 pr-3">Field</th>
+                    <th className="py-1.5 pr-3">Type</th>
+                    <th className="py-1.5 pr-3">Required</th>
+                    <th className="py-1.5">What it does</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {LEAD_FIELDS.map((f) => (
+                    <tr key={f.name} className="border-b border-line align-top last:border-0">
+                      <td className="py-1.5 pr-3 font-mono text-text">{f.name}</td>
+                      <td className="py-1.5 pr-3 text-muted">{f.type}</td>
+                      <td className="py-1.5 pr-3 text-muted">{f.required === true ? "Yes" : f.required === false ? "No" : f.required}</td>
+                      <td className="py-1.5 text-muted">{f.description}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <OwnFields groups={ownFields} />
+
+          <div className="space-y-1.5">
+            <p className="font-medium text-text">Responses</p>
+            <ul className="space-y-1 text-muted">
+              {RESPONSES.map((r) => (
+                <li key={r.status}>
+                  <span className="font-mono text-xs text-text">{r.status}</span> — {r.meaning}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <p className="font-medium text-text">Example</p>
+              {(["curl", "php", "node"] as const).map((e) => (
+                <Button key={e} type="button" size="sm" variant={example === e ? "primary" : "ghost"} onClick={() => setExample(e)}>
+                  {e === "curl" ? "curl" : e === "php" ? "PHP" : "Node.js"}
+                </Button>
+              ))}
+            </div>
+            <Code>{example === "curl" ? curlExample(baseUrl) : example === "php" ? phpExample(baseUrl) : nodeExample(baseUrl)}</Code>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Dialog open={!!issued} onClose={() => setIssued(null)} title="Copy these now">
+        {issued && (
+          <div className="space-y-3 text-sm">
+            <p className="text-muted">
+              The key for <span className="font-medium text-text">{issued.name}</span>. The secret is shown this once and cannot be
+              shown again — if it is lost, revoke the key and create another.
+            </p>
+            <div className="space-y-1">
+              <Label>Key ID (username)</Label>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 break-all rounded-md border border-line bg-surface-sunken px-2 py-1.5 font-mono text-xs">{issued.keyId}</code>
+                <CopyButton value={issued.keyId} label="key ID" />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <Label>Secret (password)</Label>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 break-all rounded-md border border-line bg-surface-sunken px-2 py-1.5 font-mono text-xs">{issued.secret}</code>
+                <CopyButton value={issued.secret} label="secret" />
+              </div>
+            </div>
+            <div className="flex justify-end pt-1">
+              <Button type="button" onClick={() => setIssued(null)}>
+                I&apos;ve saved them
+              </Button>
+            </div>
+          </div>
+        )}
+      </Dialog>
+
+      <Dialog open={!!revoking} onClose={() => setRevoking(null)} title="Revoke this key?">
+        {revoking && (
+          <div className="space-y-3 text-sm">
+            <p className="text-muted">
+              <span className="font-medium text-text">{revoking.name}</span> will stop being able to send leads immediately. Leads it
+              already sent stay. This cannot be undone — to resume, create a new key.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button type="button" variant="ghost" size="sm" onClick={() => setRevoking(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="danger"
+                size="sm"
+                disabled={pending}
+                onClick={() =>
+                  startTransition(async () => {
+                    const result = await revokeCaptureKey(revoking.id);
+                    if (!result.ok) setError(result.error);
+                    setRevoking(null);
+                    router.refresh();
+                  })
+                }
+              >
+                Revoke
+              </Button>
+            </div>
+          </div>
+        )}
+      </Dialog>
+    </div>
+  );
+}

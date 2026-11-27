@@ -1,0 +1,245 @@
+"use server";
+
+import { customSearchWhere } from "@/lib/custom-fields/server";
+import { customFilterWhere, type CustomFilterInputs } from "@/lib/custom-fields/filters";
+import { Prisma, type ContactDesignation, type CompanyRelationshipType } from "@prisma/client";
+import { db } from "@/lib/db";
+import { requireUser } from "@/lib/session";
+import { contactScope, contactIdsInScope, NO_CONTACTS, seesResellerContactDetails } from "@/lib/authz/contact-access";
+import { isResellerManaged, redactContactDetails } from "@/lib/reseller";
+import { maskContactRows, maskedInLists } from "@/lib/contacts/masking";
+import { UNPAGED_LIST_CEILING, pageSlice } from "@/lib/pagination";
+import { noteRecordsRead } from "@/lib/security/bulk-read";
+import { revalidatePath } from "next/cache";
+import { recordAudit } from "@/lib/audit";
+import { bulkUpdateContactsSchema, isContactDetailField } from "@/lib/validation/company";
+import type { ActionResult } from "@/actions/company";
+import { STILL_THERE, leftAmong } from "@/lib/contacts/left";
+import { designationData, designationNamesOf } from "@/lib/contacts/designations";
+
+type ContactListParams = {
+  search?: string;
+  designation?: ContactDesignation;
+  /** One designation from the workspace's list (src/lib/contacts/designations.ts). */
+  designationId?: string;
+  /**
+   * Who is listed (owner, 8 Oct 2026): those still at their company by default, those who have left, or
+   * everybody — src/lib/contacts/left.ts.
+   */
+  status?: "current" | "left" | "all";
+  relationshipType?: CompanyRelationshipType;
+  industryId?: string;
+  primaryOnly?: boolean;
+  /** The workspace's own contact fields filtered on, as the page read them (src/lib/custom-fields/filters.ts). */
+  customFilters?: CustomFilterInputs;
+};
+
+/** `hidden`: the details this person sees masked in lists — a search doesn't match on them, or which rows came back would say what they hold. */
+function contactListWhere(params?: ContactListParams, custom: Prisma.ContactWhereInput[] = [], hidden = { name: false, email: false, phone: false }): Prisma.ContactWhereInput {
+  return {
+    ...(params?.designation ? { designation: params.designation } : {}),
+    ...(params?.designationId ? { designationId: params.designationId } : {}),
+    ...(params?.status === "all" ? {} : params?.status === "left" ? { leftAt: { not: null } } : STILL_THERE),
+    ...(params?.primaryOnly ? { isPrimary: true } : {}),
+    ...(params?.search
+      ? {
+          OR: [
+            // Security audit round three, 14 Nov 2026 (R3-21): not the name when it is masked in lists for this person —
+            // a match answered it letter by letter.
+            ...(hidden.name ? [] : [{ name: { contains: params.search, mode: "insensitive" as const } }]),
+            ...(hidden.email ? [] : [{ email: { contains: params.search, mode: "insensitive" as const } }]),
+            ...(hidden.phone ? [] : [{ phone: { contains: params.search, mode: "insensitive" as const } }]),
+            { company: { name: { contains: params.search, mode: "insensitive" as const } } },
+            // The workspace's own contact fields this person may see (src/lib/custom-fields).
+            ...custom,
+          ],
+        }
+      : {}),
+    company: {
+      ...(params?.relationshipType ? { relationshipType: params.relationshipType } : {}),
+      ...(params?.industryId ? { industryId: params.industryId } : {}),
+    },
+  };
+}
+
+/**
+ * The list's filters plus the account scope — a contact hangs off a company directly, so its
+ * account manager is whose contact it is.
+ *
+ * `AND` rather than a spread, and that is the whole reason this helper exists: `contactListWhere`
+ * already writes a `company` key for the relationship-type and industry filters, so spreading
+ * `viaCompanyScope` over it would drop whichever of the two came first — silently widening the
+ * list back out, or silently dropping the filter the user chose.
+ *
+ * This is a different axis from `contacts.viewRestricted` below and neither replaces the other:
+ * the scope decides which rows come back at all, redaction decides whether a row that did come
+ * back shows its email and phone. A reseller-managed contact out of scope is caught by both.
+ *
+ * The field filters join the same `AND`, a clause each, for the same reason: one can be an `OR`.
+ */
+async function scopedContactWhere(userId: string, params?: ContactListParams): Promise<Prisma.ContactWhereInput> {
+  const [custom, filters, hidden] = await Promise.all([
+    customSearchWhere("CONTACT", userId, params?.search),
+    contactFieldFilters(userId, params?.customFilters),
+    maskedInLists(userId),
+  ]);
+  return { AND: [contactListWhere(params, custom as Prisma.ContactWhereInput[], hidden), await contactScope(userId), ...filters] };
+}
+
+/**
+ * The list's order. By name — unless the name is masked in lists for this person (security audit round three,
+ * 14 Nov 2026 — R3-21): rows sorted by a name they can't read put it in order for them, so by company instead.
+ */
+async function contactListOrder(userId: string): Promise<Prisma.ContactOrderByWithRelationInput[]> {
+  const hidden = await maskedInLists(userId);
+  return hidden.name ? [{ isPrimary: "desc" }, { company: { name: "asc" } }, { createdAt: "asc" }] : [{ isPrimary: "desc" }, { name: "asc" }];
+}
+
+/**
+ * The field filters for the contacts list. On a reseller's end customer the contact-detail fields —
+ * another email, a second phone — are hidden from somebody without `contacts.viewRestricted`, as its
+ * email and phone are (src/lib/reseller.ts); a filter on one of them therefore never matches there
+ * for that person, or which rows came back would say what the hidden value is.
+ */
+async function contactFieldFilters(userId: string, filters: CustomFilterInputs | undefined): Promise<Prisma.ContactWhereInput[]> {
+  if (!filters || Object.keys(filters).length === 0) return [];
+  const hidesDetails = !(await seesResellerContactDetails(userId));
+  return (await customFilterWhere("CONTACT", userId, filters, {
+    guard: (def) => (hidesDetails && isContactDetailField(def.type) ? { company: { managedByResellerId: null } } : null),
+  })) as Prisma.ContactWhereInput[];
+}
+
+const contactListInclude = {
+  company: {
+    select: {
+      id: true,
+      companySeq: true,
+      name: true,
+      relationshipType: true,
+      managedByResellerId: true,
+      managedByReseller: { select: { id: true, name: true } },
+      industry: { select: { id: true, name: true } },
+    },
+  },
+} as const;
+
+type RawContact = Prisma.ContactGetPayload<{ include: typeof contactListInclude }>;
+
+/**
+ * A reseller's end customers are off limits, so their email/phone never leave the server for anyone
+ * without `contacts.viewRestricted` — searching by email can't reveal them either, since a match
+ * still comes back redacted.
+ */
+async function redactList(userId: string, contacts: RawContact[]) {
+  const hasRestricted = contacts.some((c) => isResellerManaged(c.company));
+  const canViewRestricted = hasRestricted ? await seesResellerContactDetails(userId) : true;
+  const redacted = contacts.map((c) => redactContactDetails(c, { restricted: isResellerManaged(c.company), canViewRestricted }));
+  // Then field access (owner, 3 Nov 2026 — src/lib/contacts/masking.ts): what this person sees of each in a list.
+  return maskContactRows(userId, "list", redacted);
+}
+
+export async function listAllContacts(params?: ContactListParams) {
+  const user = await requireUser();
+  const contacts = await db.contact.findMany({
+    where: await scopedContactWhere(user.id, params),
+    include: contactListInclude,
+    orderBy: await contactListOrder(user.id),
+    // Security audit, 13 Nov 2026 (SEC-29): the Contacts library reads listAllContactsPaged; this unpaged list stops
+    // at the ceiling rather than handing every contact in scope to one call.
+    take: UNPAGED_LIST_CEILING,
+  });
+  return redactList(user.id, contacts);
+}
+
+export async function listAllContactsPaged(params: ContactListParams & { page: number; pageSize: number }) {
+  const user = await requireUser();
+  const where = await scopedContactWhere(user.id, params);
+  const orderBy = await contactListOrder(user.id);
+  const [contacts, total] = await Promise.all([
+    db.contact.findMany({
+      where,
+      include: contactListInclude,
+      orderBy,
+      ...pageSlice(params.page, params.pageSize),
+    }),
+    db.contact.count({ where }),
+  ]);
+  // Contacts are the highest-value thing in here to collect — a name, an address and a phone
+  // number per row — so this is the list worth counting. Not awaited: the check is for the
+  // admins, and a slow write to the alert path should never be what makes the page slow.
+  void noteRecordsRead({
+    userId: user.id,
+    userName: user.name,
+    count: contacts.length,
+    what: "the contacts library",
+  });
+  // Read by name: both columns are in NOT_YET_EVERYWHERE until every workspace has them.
+  const ids = contacts.map((c) => c.id);
+  const [roles, left] = await Promise.all([designationNamesOf(ids), leftAmong(ids)]);
+  const rows = (await redactList(user.id, contacts)).map((c) => ({ ...c, designationName: roles[c.id] ?? null, leftAt: left.get(c.id) ?? null }));
+  return { rows, total };
+}
+
+/**
+ * Bulk edits from the Contacts library. Delete is a distinct action rather than another dropdown
+ * value, so a mis-click while changing designations can't remove records; contacts attached to a
+ * lead are reported back by name instead of failing the whole batch silently.
+ */
+export async function bulkUpdateContacts(input: unknown): Promise<ActionResult<{ count: number; skipped: number }>> {
+  const user = await requireUser();
+  const parsed = bulkUpdateContactsSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+  const { contactIds, designation, designationName, action } = parsed.data;
+
+  /**
+   * Every selected contact must be one this person may see. This deleted or re-designated any ids
+   * it was handed, whichever account they belonged to. All or nothing, like the other bulk bars.
+   */
+  const allowed = await contactIdsInScope(user.id, contactIds, action === "delete" ? "delete" : "edit");
+  if (allowed.length !== new Set(contactIds).size) {
+    return { ok: false, error: allowed.length === 0 ? NO_CONTACTS : "Some of the selected contacts are not yours to change." };
+  }
+
+  if (action === "delete") {
+    let deleted = 0;
+    let skipped = 0;
+    for (const id of contactIds) {
+      try {
+        await db.contact.delete({ where: { id } });
+        deleted += 1;
+      } catch (err) {
+        // A contact that owns a lead is a foreign-key anchor, not a deletable row.
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2003") {
+          skipped += 1;
+          continue;
+        }
+        throw err;
+      }
+    }
+    await recordAudit({
+      userId: user.id,
+      action: "UPDATE",
+      entityType: "Contact",
+      entityId: contactIds[0],
+      entityLabel: `Bulk deleted ${deleted} contact(s)`,
+    });
+    revalidatePath("/contacts");
+    return { ok: true, data: { count: deleted, skipped } };
+  }
+
+  const role = designationName?.trim() ? await designationData(db, { designationName }) : designation ? await designationData(db, { designation }) : null;
+  if (!role) return { ok: false, error: "Pick a designation to apply." };
+
+  const result = await db.contact.updateMany({ where: { id: { in: contactIds } }, data: role });
+  await recordAudit({
+    userId: user.id,
+    action: "UPDATE",
+    entityType: "Contact",
+    entityId: contactIds[0],
+    entityLabel: `Bulk set designation on ${result.count} contact(s)`,
+  });
+  revalidatePath("/contacts");
+  return { ok: true, data: { count: result.count, skipped: 0 } };
+}

@@ -1,0 +1,278 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { Prisma, type PrismaClient } from "@prisma/client";
+import { SETUP_MODEL_NAMES } from "@/lib/reset-classes";
+
+/**
+ * EVERYTHING: a fresh workspace — only the super admin, the built-in roles and the backup log are left.
+ * KEEP_SETUP (owner, 22 Oct 2026): the business's records go, its setup stays — every person, the
+ * organisation, the catalogue, templates, automations (src/lib/reset-classes.ts); numbering restarts.
+ */
+export type ResetMode = "EVERYTHING" | "KEEP_SETUP";
+
+/**
+ * The engine behind the workspace reset (owner, 22 Oct 2026 — src/lib/workspace-reset.ts, which decides who
+ * may, when, and takes the safety copy first): a workspace's database emptied back to a fresh one.
+ *
+ * ## What survives
+ *
+ *   · the super admin — their account, password and two-factor, so whoever pressed the button can
+ *     still sign in;
+ *   · the PIN directory and world places — not in this database at all: they are the shared reference
+ *     database's (prisma/reference), which no workspace's reset can reach;
+ *   · the backup log and schedule — they describe copies on disk, and the backup taken just before
+ *     the reset has to stay listed to be restorable;
+ *   · the unmasking log (owner, 5 Nov 2026 — audit H.4.8): archived where it is, its hash chain unbroken —
+ *     a reset is exactly when the record of who saw what must not go;
+ *   · the built-in roles, which every user row needs.
+ *
+ * Everything else is emptied — other users, every record, and the settings too — and then the rows
+ * a fresh install gets from its migrations are put back (the starter customer categories, the pipeline
+ * stages every workspace starts with). Numbering restarts: the next company is COM-000001 again.
+ *
+ * ## How it stays in order
+ *
+ * The list of tables and the links between them are read from Postgres itself, so a table added
+ * next week is wiped without anybody remembering to add it here. Most tables go in one TRUNCATE;
+ * the few the kept rows point at (a department, say) can't be truncated while a foreign key names
+ * them, so the kept rows let go of them first and they are deleted instead. All of it is one
+ * transaction: a failure part-way leaves the database exactly as it was.
+ */
+
+const tableOf = (model: string) => Prisma.dmmf.datamodel.models.find((m) => m.name === model)?.dbName ?? model;
+
+/** The tables left alone, and why — shown on the reset panel. */
+export function keptTables(mode: ResetMode = "EVERYTHING"): { table: string; what: string }[] {
+  const always = [
+    { table: tableOf("User"), what: "you — every other user is removed" },
+    { table: tableOf("Role"), what: "the built-in roles — ones added since are removed" },
+    { table: tableOf("Backup"), what: "the backup log, so a backup taken before the reset can be restored" },
+    { table: tableOf("BackupSchedule"), what: "when backups are taken" },
+    { table: tableOf("WorkspaceReset"), what: "the record of the reset — who asked, when, and the copy taken before" },
+    // Owner, 5 Nov 2026 — Phase 3 masking fixes, audit H.4.8: who unmasked what is kept through a reset, not emptied
+    // with the records it was about. It is hash-chained, holds names rather than links to people, and refuses TRUNCATE.
+    { table: tableOf("UnmaskEvent"), what: "the unmasking log — who revealed which masked fields, and when; it is never emptied" },
+  ];
+  if (mode === "EVERYTHING") return always;
+  const listed = new Set(always.map((k) => k.table));
+  return [...always, ...SETUP_MODEL_NAMES.map((model) => ({ table: tableOf(model), what: model })).filter((k) => !listed.has(k.table))];
+}
+
+/**
+ * Rows a fresh install gets from its migrations rather than from anybody using it. Wiped with
+ * everything else, then put back exactly as the migration wrote them. `check:data-reset` fails if a
+ * migration inserts fixed rows into a table that is neither kept nor listed here.
+ */
+export const INSTALL_ROWS = [
+  {
+    // Deskzo's eleven asset types every workspace starts with (Settings › Asset types, src/lib/assets/types.ts) — with their
+    // fixed ids, which the asset form and the import fall back on.
+    table: "asset_types",
+    migration: "20261218600000_asset_types",
+    from: 'INSERT INTO "asset_types"',
+    to: "'Other', 'OTHER', true, 110, CURRENT_TIMESTAMP);",
+  },
+  {
+    // The eight company types every workspace starts with (Settings › Lists) — the company form's dropdown.
+    table: "company_type_options",
+    migration: "20261127200000_company_types",
+    from: 'INSERT INTO "company_type_options"',
+    to: "'Other', 8, CURRENT_TIMESTAMP);",
+  },
+  {
+    table: "customer_categories",
+    migration: "20260924180000_customer_categories",
+    // The statement's own ending — its values contain semicolons, so it can't be split on one.
+    from: 'INSERT INTO "customer_categories"',
+    to: 'ON CONFLICT ("id") DO NOTHING;',
+  },
+  {
+    // The main pipeline (src/lib/pipeline) — before its stages, which belong to it.
+    table: "lead_pipelines",
+    migration: "20261102100000_team_pipelines",
+    from: 'INSERT INTO "lead_pipelines"',
+    to: 'ON CONFLICT ("id") DO NOTHING;',
+  },
+  {
+    // The stages every pipeline starts with (src/lib/pipeline) — a workspace with none could take no leads.
+    table: "lead_stages",
+    migration: "20261015100000_lead_pipeline",
+    from: 'INSERT INTO "lead_stages"',
+    // The last row's ending; the ones before it end in a comma.
+    to: "CURRENT_TIMESTAMP);",
+  },
+  {
+    // The contact designations every workspace starts with (src/lib/contacts/designations.ts).
+    table: "designations",
+    migration: "20261029110000_designations_vendor_fields_reminders",
+    from: 'INSERT INTO "designations"',
+    to: "ON CONFLICT DO NOTHING;",
+  },
+  {
+    // The categories Installed elsewhere starts with (Settings › Lists, src/actions/elsewhere-category.ts).
+    table: "elsewhere_category_options",
+    migration: "20261202110000_elsewhere_categories",
+    from: 'INSERT INTO "elsewhere_category_options"',
+    to: "ON CONFLICT DO NOTHING;",
+  },
+  {
+    // The standard industries every workspace starts with (src/lib/companies/standard-industries.ts).
+    table: "industries",
+    migration: "20261028100000_standard_industries",
+    from: 'INSERT INTO "industries"',
+    to: 'lower(v.name));',
+  },
+  {
+    // The GST unit quantity codes every workspace starts with (Finance → Accounts, src/lib/inventory).
+    table: "units_of_measure",
+    migration: "20261122110000_finance_accounts",
+    from: 'INSERT INTO "units_of_measure"',
+    to: 'ON CONFLICT ("code") DO NOTHING;',
+  },
+] as const;
+
+function installStatement(row: (typeof INSTALL_ROWS)[number]): string {
+  const sql = readFileSync(path.join(process.cwd(), "prisma", "migrations", row.migration, "migration.sql"), "utf8");
+  const start = sql.indexOf(row.from);
+  const end = sql.indexOf(row.to, start);
+  if (start < 0 || end < 0) throw new Error(`Couldn't find the rows ${row.migration} inserts into ${row.table}`);
+  return sql.slice(start, end + row.to.length);
+}
+
+type Edge = { child: string; parent: string; column: string; notnull: boolean };
+
+async function schemaFacts(client: PrismaClient | Prisma.TransactionClient) {
+  const [tables, edges] = await Promise.all([
+    client.$queryRaw<{ tablename: string }[]>`SELECT tablename::text AS tablename FROM pg_tables WHERE schemaname = current_schema()`,
+    client.$queryRaw<Edge[]>`
+      -- Catalog names are of type name, which the database driver does not read: cast to text.
+      SELECT ch.relname::text AS child, pa.relname::text AS parent, a.attname::text AS "column", a.attnotnull AS notnull
+      FROM pg_constraint c
+      JOIN pg_class ch ON ch.oid = c.conrelid
+      JOIN pg_class pa ON pa.oid = c.confrelid
+      JOIN pg_namespace n ON n.oid = c.connamespace
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+      WHERE c.contype = 'f' AND n.nspname = current_schema()`,
+  ]);
+  return { tables: tables.map((t) => t.tablename), edges };
+}
+
+const quote = (identifier: string) => `"${identifier.replace(/"/g, '""')}"`;
+
+export type ResetPlan = {
+  /** Emptied in one TRUNCATE. */
+  truncate: string[];
+  /** Emptied by DELETE, children first, because a kept row's foreign key names them. */
+  deleteInOrder: string[];
+  kept: string[];
+};
+
+/** Which tables go how. Throws when a kept row can't let go of something that is going — nothing has been touched then. */
+export function planReset(tables: string[], edges: Edge[], mode: ResetMode = "EVERYTHING"): ResetPlan {
+  const kept = new Set([...keptTables(mode).map((k) => k.table), "_prisma_migrations"]);
+  // A many-to-many with no model of its own ("_DocumentApprover": a policy's approvers) stays when both of
+  // the tables it joins do — emptying it would leave every kept approval policy with nobody to approve.
+  for (const join of tables.filter((t) => t.startsWith("_") && !kept.has(t))) {
+    const parents = edges.filter((e) => e.child === join).map((e) => e.parent);
+    if (parents.length > 0 && parents.every((p) => kept.has(p))) kept.add(join);
+  }
+  const wiped = tables.filter((t) => !kept.has(t));
+
+  for (const e of edges) {
+    if (kept.has(e.child) && !kept.has(e.parent) && e.notnull) {
+      throw new Error(`${e.child}.${e.column} must point at a row in ${e.parent}, which the reset empties — keep ${e.parent} or make the column optional`);
+    }
+  }
+
+  // Anything a kept table points at can't be truncated, and neither can anything those point at.
+  const blocked = new Set<string>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const e of edges) {
+      if ((kept.has(e.child) || blocked.has(e.child)) && !kept.has(e.parent) && !blocked.has(e.parent)) {
+        blocked.add(e.parent);
+        grew = true;
+      }
+    }
+  }
+
+  // Children before parents; a table pointing at itself is fine within one DELETE.
+  const deleteInOrder: string[] = [];
+  const pending = new Set(blocked);
+  while (pending.size) {
+    const ready = [...pending].filter((t) => !edges.some((e) => e.parent === t && e.child !== t && pending.has(e.child)));
+    if (!ready.length) throw new Error(`These tables point at each other and can't be emptied in order: ${[...pending].join(", ")}`);
+    for (const t of ready.sort()) {
+      deleteInOrder.push(t);
+      pending.delete(t);
+    }
+  }
+  return { truncate: wiped.filter((t) => !blocked.has(t)).sort(), deleteInOrder, kept: [...kept].sort() };
+}
+
+export type ResetOutcome = { tablesEmptied: number; usersRemoved: number };
+
+/**
+ * Empties the database down to the super admin. One transaction; the caller decides who may, and
+ * takes the backup first.
+ */
+export async function resetAllData(client: PrismaClient, superAdminId: string, mode: ResetMode = "EVERYTHING"): Promise<ResetOutcome> {
+  return client.$transaction(
+    async (tx) => {
+      const admin = await tx.user.findUnique({ where: { id: superAdminId }, select: { id: true, isSuperAdmin: true, role: true } });
+      if (!admin?.isSuperAdmin) throw new Error("Only the super admin's account is kept, and that isn't it.");
+      // Waiting behind a long query is fine; waiting forever behind a stuck one is not.
+      await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '30s'`);
+
+      const { tables, edges } = await schemaFacts(tx);
+      const plan = planReset(tables, edges, mode);
+      const kept = new Set(plan.kept);
+      const users = tableOf("User");
+      const keepPeople = mode === "KEEP_SETUP";
+
+      // 1. The kept rows let go of what is going: a department, a manager, whoever triggered a backup.
+      for (const e of edges) {
+        if (!kept.has(e.child)) continue;
+        const [child, column] = [quote(e.child), quote(e.column)];
+        if (e.parent === users) {
+          // Keeping the setup keeps everybody, so nothing lets go of a person.
+          if (!keepPeople) await tx.$executeRawUnsafe(`UPDATE ${child} SET ${column} = NULL WHERE ${column} IS NOT NULL AND ${column} <> $1`, superAdminId);
+        } else if (!kept.has(e.parent)) {
+          await tx.$executeRawUnsafe(`UPDATE ${child} SET ${column} = NULL WHERE ${column} IS NOT NULL`);
+        }
+      }
+
+      // 2. Everything else, at once.
+      if (plan.truncate.length) await tx.$executeRawUnsafe(`TRUNCATE TABLE ${plan.truncate.map(quote).join(", ")} RESTART IDENTITY`);
+      for (const t of plan.deleteInOrder) await tx.$executeRawUnsafe(`DELETE FROM ${quote(t)}`);
+
+      // 3. The people, then the roles only they had — unless the setup is kept, which keeps them all.
+      const usersRemoved = keepPeople ? { count: 0 } : await tx.user.deleteMany({ where: { id: { not: superAdminId } } });
+      if (!keepPeople) await tx.role.deleteMany({ where: { isSystem: false, key: { not: admin.role } } });
+
+      // 4. What a fresh install starts with, in the tables that were emptied — a kept one still has its own.
+      for (const row of INSTALL_ROWS) if (!kept.has(row.table)) await tx.$executeRawUnsafe(installStatement(row));
+
+      return { tablesEmptied: plan.truncate.length + plan.deleteInOrder.length, usersRemoved: usersRemoved.count };
+    },
+    { timeout: 300_000, maxWait: 20_000 },
+  );
+}
+
+/** How much is there — for the panel, so "reset" has a size before it is pressed. */
+export async function resetOverview(client: PrismaClient, mode: ResetMode = "EVERYTHING") {
+  const [users, companies, contacts, leads, orders, documents, payments, tickets] = await Promise.all([
+    client.user.count(),
+    client.company.count(),
+    client.contact.count(),
+    client.lead.count(),
+    client.companyProduct.count(),
+    client.tradeDocument.count(),
+    client.payment.count(),
+    client.ticket.count(),
+  ]);
+  const { tables, edges } = await schemaFacts(client);
+  const plan = planReset(tables, edges, mode);
+  return { counts: { users, companies, contacts, leads, orders, documents, payments, tickets }, tables: plan.truncate.length + plan.deleteInOrder.length };
+}

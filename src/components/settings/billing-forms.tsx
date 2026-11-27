@@ -1,0 +1,466 @@
+"use client";
+
+import { useEffect, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { Input, Label, Select, Textarea } from "@/components/ui/input";
+import { GST_STATE_OPTIONS } from "@/lib/gst-engine";
+import { OutboundLink } from "@/components/ui/outbound-link";
+import { askForProforma, cancelSubscription, changePlanAtRenewal, checkoutPlan, openBillingPortal, saveBillingDetails } from "@/actions/billing";
+import type { OfferPlan } from "@/lib/billing/checkout";
+import { formatMoney } from "@/lib/billing/money";
+import { SUITE_NAME, choiceRefusal, includedRefusal, needsRefusal } from "@/lib/billing/plan-choice";
+import { COMPANY_NAME } from "@/lib/brand-names";
+import { PRODUCTS, productByKey } from "@/lib/products";
+import { cn } from "@/lib/utils";
+import { confirmAction } from "@/components/ui/confirm";
+
+/** The billing page's forms (src/actions/billing.ts): choosing a plan, the gateways' own pages, details. */
+
+/** Off to a gateway's page: another site, so the browser goes itself. */
+function go(url: string) {
+  window.location.assign(new URL(url));
+}
+
+type Interval = "MONTH" | "YEAR";
+type EditionGroup = { key: string; title: string; tagline: string | null; plans: OfferPlan[] };
+
+/**
+ * The editions on sale, grouped as they are sold: Deskzo One first, then each product in
+ * src/lib/products.ts's order, then editions of no product. Empty groups are left out.
+ */
+function editionGroups(editions: OfferPlan[]): EditionGroup[] {
+  const groups: EditionGroup[] = PRODUCTS.map((p) => ({ key: p.key, title: p.name, tagline: p.tagline, plans: editions.filter((e) => e.productKey === p.key) }));
+  groups.push({ key: "own", title: "Editions", tagline: null, plans: editions.filter((e) => !productByKey(e.productKey)) });
+  return groups.filter((g) => g.plans.length > 0);
+}
+
+/** What the picker is for: buying, a change from the next renewal (Razorpay), or the next period by bank transfer. */
+export type PickerMode = "buy" | "change" | "transfer";
+
+/** Months or years a proforma can be for — what staff can record (src/lib/billing/offline.ts MAX_PERIODS). */
+const PERIOD_CHOICES: Record<Interval, number[]> = { MONTH: [1, 3, 6, 12], YEAR: [1, 2, 3] };
+
+/** "17 November 2026", from an ISO moment, on India's calendar — where proformas and Razorpay are. */
+const dayText = (iso: string) => new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Kolkata" });
+
+/**
+ * Deskzo One, or any number of products — one plan each — or an edition of its own; then extras.
+ * Ticking a plan unticks what cannot come with it (another plan of its product; everything, for
+ * Deskzo One or an edition of its own), so the ticks always make a choice that can be bought. The
+ * rules and their words are src/lib/billing/plan-choice.ts's — checkout says the same.
+ *
+ * Paid online (Stripe, or Razorpay's pages); in India, also by bank transfer against a proforma
+ * (`bankTransfer`). A workspace paying through Razorpay changes its plans from the next renewal
+ * (`mode: "change"`); one paying by transfer asks for the next period's proforma (`mode: "transfer"`).
+ */
+export function PlanPicker({
+  plans,
+  currency,
+  gateway,
+  mode = "buy",
+  bankTransfer = false,
+  renewsOn = null,
+  initial = null,
+}: {
+  plans: OfferPlan[];
+  currency: string;
+  gateway: "STRIPE" | "RAZORPAY";
+  mode?: PickerMode;
+  /** In India, with the bank account set up in the console: a proforma may be asked for instead. */
+  bankTransfer?: boolean;
+  /** For a change: the day the current plans renew, when the change would start. */
+  renewsOn?: string | null;
+  /** What it is on now — ticked to start with, so a change or a renewal starts from it. */
+  initial?: { interval: Interval; items: { planKey: string; quantity: number }[] } | null;
+}) {
+  const router = useRouter();
+  const intervals = [...new Set(plans.flatMap((p) => p.prices.map((x) => x.interval)))];
+  const [interval, setBilled] = useState<Interval>(initial && intervals.includes(initial.interval) ? initial.interval : intervals.includes("MONTH") ? "MONTH" : "YEAR");
+  const priceOf = (plan: OfferPlan) => plan.prices.find((x) => x.interval === interval);
+  const editions = plans.filter((p) => p.kind === "EDITION" && !!priceOf(p));
+  const extras = plans.filter((p) => p.kind !== "EDITION" && !!priceOf(p));
+  const groups = editionGroups(editions);
+  const [picked, setPicked] = useState<string[]>(() => {
+    const now = (initial?.items ?? []).map((i) => i.planKey).filter((k) => plans.some((p) => p.key === k && p.kind === "EDITION"));
+    if (now.length) return now;
+    const first = editionGroups(plans.filter((p) => p.kind === "EDITION" && p.prices.some((x) => x.interval === interval)))[0]?.plans[0];
+    return first ? [first.key] : [];
+  });
+  const [quantities, setQuantities] = useState<Record<string, string>>(() => Object.fromEntries((initial?.items ?? []).map((i) => [i.planKey, String(i.quantity)])));
+  const [how, setHow] = useState<"online" | "transfer">(mode === "transfer" ? "transfer" : "online");
+  const [periods, setPeriods] = useState("1");
+  const [pages, setPages] = useState<{ plan: string; url: string }[] | null>(null);
+  const [proforma, setProforma] = useState<{ number: string; url: string; total: number; validUntil: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+  const per = interval === "YEAR" ? "a year" : "a month";
+  const byTransfer = how === "transfer";
+  const periodCount = PERIOD_CHOICES[interval].includes(Number(periods)) ? Number(periods) : 1;
+
+  // What is chosen at this interval: the ticked editions on sale in it, and every extra with a number.
+  const chosenEditions = editions.filter((p) => picked.includes(p.key));
+  const countOf = (plan: OfferPlan, fallback: number) => {
+    const n = Number(quantities[plan.key] ?? fallback);
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  };
+  const lines = [
+    ...chosenEditions.map((plan) => ({ plan, quantity: priceOf(plan)!.perSeat ? Math.max(1, countOf(plan, 1)) : 1 })),
+    ...extras.map((plan) => ({ plan, quantity: countOf(plan, 0) })).filter((l) => l.quantity > 0),
+  ];
+  const total = lines.reduce((sum, l) => sum + priceOf(l.plan)!.amount * l.quantity, 0);
+  const suiteChosen = chosenEditions.some((p) => p.productKey === "one");
+
+  function pick(plan: OfferPlan, on: boolean) {
+    setError(null);
+    setPicked((prev) => {
+      if (!on) return prev.filter((k) => k !== plan.key);
+      const alone = !plan.productKey || plan.productKey === "one";
+      const kept = prev.filter((k) => {
+        const other = plans.find((p) => p.key === k);
+        if (!other || alone) return false;
+        return !!other.productKey && other.productKey !== "one" && other.productKey !== plan.productKey;
+      });
+      return [...kept, plan.key];
+    });
+  }
+
+  if (proforma) {
+    return (
+      <div className="space-y-2 text-sm">
+        <p className="text-text">
+          Proforma <span className="font-medium">{proforma.number}</span> for {formatMoney(proforma.total, "INR")}, GST included, is on its way to the billing email. It holds until {dayText(proforma.validUntil)}.
+        </p>
+        <p className="text-muted">Pay it by bank transfer, quoting its number as the reference. The plan switches on, and the GST tax invoice is emailed, once the payment reaches us.</p>
+        <OutboundLink href={proforma.url} className="inline-block font-medium text-brand hover:underline">
+          View the proforma
+        </OutboundLink>
+      </div>
+    );
+  }
+  if (pages) {
+    return (
+      <div className="space-y-2 text-sm">
+        <p className="text-text">
+          {mode === "change" && renewsOn
+            ? `Authorise each on Razorpay's page. Nothing is charged until ${dayText(renewsOn)}, when the new plans take over from the current ones.`
+            : "Authorise each payment on Razorpay's page. The workspace updates by itself once each is done."}
+        </p>
+        {pages.map((p) => (
+          <OutboundLink key={p.url} href={p.url} className="block font-medium text-brand hover:underline">
+            {mode === "change" ? `Authorise ${p.plan}` : `Pay for ${p.plan}`}
+          </OutboundLink>
+        ))}
+      </div>
+    );
+  }
+  if (!plans.some((p) => p.kind === "EDITION")) return <p className="text-sm text-muted">No plan is on sale here yet. Contact {COMPANY_NAME} to choose one.</p>;
+  return (
+    <form
+      className="space-y-5"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setError(null);
+        const refusal = choiceRefusal(lines.map((l) => l.plan));
+        if (refusal) return setError(refusal);
+        const items = lines.map((l) => ({ planKey: l.plan.key, quantity: l.quantity }));
+        startTransition(async () => {
+          if (byTransfer) {
+            const r = await askForProforma({ interval, items, periods: periodCount });
+            if (!r.ok) return setError(r.error);
+            setProforma(r.data);
+            router.refresh();
+            return;
+          }
+          if (mode === "change") {
+            const r = await changePlanAtRenewal({ interval, items });
+            if (!r.ok) return setError(r.error);
+            setPages(r.data.authorisations);
+            router.refresh();
+            return;
+          }
+          const r = await checkoutPlan({ interval, items });
+          if (!r.ok) return setError(r.error);
+          if (r.data.gateway === "STRIPE") go(r.data.url);
+          else setPages(r.data.authorisations);
+        });
+      }}
+    >
+      {mode === "buy" && bankTransfer && (
+        <div className="inline-flex rounded-base border border-line p-0.5 text-sm" role="radiogroup" aria-label="How to pay">
+          {(["online", "transfer"] as const).map((h) => (
+            <button key={h} type="button" role="radio" aria-checked={how === h} onClick={() => setHow(h)} className={how === h ? "rounded-base bg-brand-subtle px-3 py-1 font-medium text-brand" : "px-3 py-1 text-muted"}>
+              {h === "online" ? "Pay online" : "Pay by bank transfer"}
+            </button>
+          ))}
+        </div>
+      )}
+      {intervals.length > 1 && (
+        <div className="inline-flex rounded-base border border-line p-0.5 text-sm" role="radiogroup" aria-label="Billed">
+          {(["MONTH", "YEAR"] as const).map((i) => (
+            <button
+              key={i}
+              type="button"
+              role="radio"
+              aria-checked={interval === i}
+              onClick={() => {
+                setBilled(i);
+                setPeriods("1");
+              }}
+              className={interval === i ? "rounded-base bg-brand-subtle px-3 py-1 font-medium text-brand" : "px-3 py-1 text-muted"}
+            >
+              {i === "YEAR" ? "Yearly" : "Monthly"}
+            </button>
+          ))}
+        </div>
+      )}
+      <p className="text-xs text-muted">
+        Choose {SUITE_NAME}, or the products you want — one plan for each. {SUITE_NAME} already includes every product.
+      </p>
+      {!editions.length && <p className="text-sm text-muted">Nothing is sold {interval === "YEAR" ? "yearly" : "monthly"} here — try the other period.</p>}
+      {groups.map((group) => (
+        <fieldset key={group.key} className="space-y-2">
+          <legend className="text-sm font-semibold text-text">{group.title}</legend>
+          {group.tagline && <p className="-mt-1 text-xs text-muted">{group.tagline}</p>}
+          {suiteChosen && group.key !== "one" && group.key !== "own" && <p className="text-xs text-subtle">Included in {SUITE_NAME}.</p>}
+          {group.plans.map((p) => {
+            const price = priceOf(p)!;
+            const on = picked.includes(p.key);
+            return (
+              <label key={p.key} className={cn("flex items-start gap-3 rounded-base border px-3 py-2 text-sm", on ? "border-brand bg-brand-subtle/40" : "border-line")}>
+                <input type="checkbox" className="mt-1" checked={on} onChange={(e) => pick(p, e.target.checked)} />
+                <span className="flex-1">
+                  <span className="font-medium text-text">{p.name}</span>{" "}
+                  <span className="text-muted">
+                    {formatMoney(price.amount, currency)} {price.perSeat ? "per person " : ""}
+                    {per}
+                    {p.seats !== null && !price.perSeat ? `, ${p.seats} people included` : ""}
+                  </span>
+                  {p.description && p.description !== group.tagline && <span className="block text-xs text-muted">{p.description}</span>}
+                </span>
+                {price.perSeat && on && (
+                  <Input className="h-8 w-20" type="number" min={1} aria-label={`People on ${p.name}`} value={quantities[p.key] ?? "1"} onChange={(e) => setQuantities((q) => ({ ...q, [p.key]: e.target.value }))} />
+                )}
+              </label>
+            );
+          })}
+        </fieldset>
+      ))}
+      {extras.length > 0 && (
+        <fieldset className="space-y-2">
+          <legend className="mb-1 text-sm font-semibold text-text">Add-ons — how many of each (none is fine)</legend>
+          {extras.map((p) => {
+            const price = priceOf(p)!;
+            // Already in what's chosen (Revenue & Close with Deskzo One), or missing what it needs.
+            const needs = includedRefusal(p, chosenEditions) ?? needsRefusal(p, chosenEditions);
+            return (
+              <div key={p.key} className="text-sm">
+                <div className="flex items-center gap-3">
+                  <Input className="h-8 w-20" type="number" min={0} aria-label={`How many of ${p.name}`} value={quantities[p.key] ?? "0"} onChange={(e) => setQuantities((q) => ({ ...q, [p.key]: e.target.value }))} />
+                  <span className="text-text">{p.name}</span>
+                  <span className="text-muted">
+                    {formatMoney(price.amount, currency)} each, {per}
+                  </span>
+                </div>
+                {needs && <p className="mt-1 pl-[92px] text-xs text-warning">{needs}</p>}
+              </div>
+            );
+          })}
+        </fieldset>
+      )}
+      {byTransfer && (
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <Label htmlFor="proforma-periods">Pay for</Label>
+          <Select id="proforma-periods" className="h-8 w-40" value={String(periodCount)} onChange={(e) => setPeriods(e.target.value)}>
+            {PERIOD_CHOICES[interval].map((n) => (
+              <option key={n} value={n}>
+                {n} {interval === "YEAR" ? (n === 1 ? "year" : "years") : n === 1 ? "month" : "months"}
+              </option>
+            ))}
+          </Select>
+        </div>
+      )}
+      <p className="text-sm text-text" aria-live="polite">
+        {lines.length ? (
+          byTransfer ? (
+            <>
+              Total <span className="font-semibold tabular-nums">{formatMoney(total * periodCount, currency)}</span> for {periodCount} {interval === "YEAR" ? (periodCount === 1 ? "year" : "years") : periodCount === 1 ? "month" : "months"}, before GST —{" "}
+              {lines.map((l) => (l.quantity > 1 ? `${l.plan.name} ×${l.quantity}` : l.plan.name)).join(", ")}.
+            </>
+          ) : (
+            <>
+              Total <span className="font-semibold tabular-nums">{formatMoney(total, currency)}</span> {per}, before tax — {lines.map((l) => (l.quantity > 1 ? `${l.plan.name} ×${l.quantity}` : l.plan.name)).join(", ")}.
+            </>
+          )
+        ) : (
+          <span className="text-muted">Nothing chosen yet.</span>
+        )}
+      </p>
+      <p className="text-xs text-muted">
+        {byTransfer
+          ? "A proforma with our bank details is emailed to the billing email. The plan switches on once the transfer reaches us — your GST tax invoice follows."
+          : mode === "change" && renewsOn
+            ? `Starts on ${dayText(renewsOn)}, when the current plans renew: you authorise it on Razorpay now, and nothing is charged or changed until then.`
+            : gateway === "STRIPE"
+              ? "Paid by card through Stripe; tax is added as your country requires, and your tax number goes on every invoice."
+              : "Paid through Razorpay, in rupees, by card, UPI or netbanking mandate."}
+      </p>
+      {error && <p className="text-sm text-danger">{error}</p>}
+      <Button type="submit" disabled={pending || chosenEditions.length === 0}>
+        {pending ? "Working…" : byTransfer ? "Email me a proforma" : mode === "change" ? "Continue to authorise" : "Continue to payment"}
+      </Button>
+    </form>
+  );
+}
+
+/**
+ * Waiting for a gateway's word — back from Stripe's checkout, or a Razorpay page to authorise: the page
+ * asks again every few seconds, for three minutes at most, so the plan shows as soon as it is on.
+ */
+export function WaitForPayment() {
+  const router = useRouter();
+  useEffect(() => {
+    let asked = 0;
+    const timer = setInterval(() => {
+      asked += 1;
+      if (asked > 22) clearInterval(timer);
+      else router.refresh();
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [router]);
+  return null;
+}
+
+export function ManageAtStripe() {
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+  return (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      <Button
+        type="button"
+        variant="secondary"
+        size="sm"
+        disabled={pending}
+        onClick={() =>
+          startTransition(async () => {
+            const r = await openBillingPortal();
+            if (r.ok) go(r.data.url);
+            else setError(r.error);
+          })
+        }
+      >
+        {pending ? "Opening…" : "Manage billing"}
+      </Button>
+      {error && <span className="text-xs text-danger">{error}</span>}
+    </span>
+  );
+}
+
+export function CancelRazorpay({ subscriptionId, plan }: { subscriptionId: string; plan: string }) {
+  const router = useRouter();
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+  return (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        disabled={pending}
+        onClick={async () => {
+          if (!(await confirmAction(`Cancel ${plan}? It runs to the end of the period already paid for, and does not renew. Download anything you want to keep from Settings › Data first: once it ends, the workspace is held and nobody can open it.`))) return;
+          startTransition(async () => {
+            const r = await cancelSubscription(subscriptionId);
+            if (r.ok) router.refresh();
+            else setError(r.error);
+          });
+        }}
+      >
+        Cancel at period end
+      </Button>
+      {error && <span className="text-xs text-danger">{error}</span>}
+    </span>
+  );
+}
+
+export function BillingDetailsForm({
+  billingEmail,
+  taxId,
+  taxLabel,
+  billingName = null,
+  billingAddress = null,
+  billingState = null,
+  india = false,
+}: {
+  billingEmail: string | null;
+  taxId: string | null;
+  taxLabel: string;
+  billingName?: string | null;
+  billingAddress?: string | null;
+  billingState?: string | null;
+  /** In India: the registered name, address and state its GST tax invoices are made out to. */
+  india?: boolean;
+}) {
+  const router = useRouter();
+  const [email, setEmail] = useState(billingEmail ?? "");
+  const [tax, setTax] = useState(taxId ?? "");
+  const [name, setName] = useState(billingName ?? "");
+  const [address, setAddress] = useState(billingAddress ?? "");
+  const [state, setState] = useState(billingState ?? "");
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pending, startTransition] = useTransition();
+  return (
+    <form
+      className="space-y-3"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setMessage(null);
+        startTransition(async () => {
+          const r = await saveBillingDetails(india ? { billingEmail: email, taxId: tax, billingName: name, billingAddress: address, billingState: state } : { billingEmail: email, taxId: tax });
+          setMessage(r.ok ? { ok: true, text: "Saved." } : { ok: false, text: r.error });
+          if (r.ok) router.refresh();
+        });
+      }}
+    >
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div>
+          <Label htmlFor="billing-email">Billing email (reminders and receipts)</Label>
+          <Input id="billing-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="The owner's, when empty" />
+        </div>
+        <div>
+          <Label htmlFor="billing-tax">{taxLabel}</Label>
+          <Input id="billing-tax" value={tax} onChange={(e) => setTax(e.target.value)} />
+        </div>
+        {india && (
+          <>
+            <div className="sm:col-span-2">
+              <Label htmlFor="billing-name">Registered name, for your tax invoices</Label>
+              <Input id="billing-name" value={name} onChange={(e) => setName(e.target.value)} maxLength={200} placeholder="The workspace's name, when empty" />
+            </div>
+            <div className="sm:col-span-2">
+              <Label htmlFor="billing-address">Registered address</Label>
+              <Textarea id="billing-address" rows={2} value={address} onChange={(e) => setAddress(e.target.value)} maxLength={500} />
+            </div>
+            <div>
+              <Label htmlFor="billing-state">State</Label>
+              <Select id="billing-state" value={state} onChange={(e) => setState(e.target.value)}>
+                <option value="">Read from the GSTIN</option>
+                {GST_STATE_OPTIONS.map((s) => (
+                  <option key={s.code} value={s.code}>
+                    {s.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          </>
+        )}
+      </div>
+      <div className="flex items-center gap-3">
+        <Button type="submit" size="sm" variant="secondary" disabled={pending}>
+          {pending ? "Saving…" : "Save"}
+        </Button>
+        {message && <span className={message.ok ? "text-xs text-success" : "text-xs text-danger"}>{message.text}</span>}
+      </div>
+    </form>
+  );
+}

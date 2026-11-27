@@ -1,0 +1,227 @@
+"use client";
+
+import type { FieldErrors, FieldValues, UseFormRegister } from "react-hook-form";
+import type { CompanyRelationshipType } from "@prisma/client";
+import { companySourceValues, relationshipTypeValues, relationshipTypeLabels } from "@/lib/validation/company";
+import type { CompanyTypeOption } from "@/lib/companies/company-types";
+import { paymentTermsValues, paymentTermsLabels } from "@/lib/gst";
+import { Input, Label, Select } from "@/components/ui/input";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { EMPLOYEE_BANDS } from "@/lib/company-size";
+import { baseCurrency, CURRENCIES } from "@/lib/currency";
+import { CreditBadge } from "@/components/credit/credit-badge";
+import { termsExceed, type CreditRating, type TermsKey } from "@/lib/credit/engine";
+import type { CategoryTree, FlatCategory } from "@/lib/customers/categories";
+import { useWording } from "@/components/terms/wording-provider";
+import { slot } from "@/lib/terms/dictionary";
+
+/** What the credit engine says about a customer's terms — see src/lib/credit/engine.ts. */
+export type TermsAdvice = {
+  rating: CreditRating;
+  score: number | null;
+  recommendedTerms: TermsKey;
+  canOverride: boolean;
+  /** What they are on now — null for a customer being created. Unchanged terms are never a new decision. */
+  currentTerms: TermsKey | null;
+};
+
+type IndustryOption = { id: string; name: string };
+
+export function CompanyDetailFields({
+  register,
+  errors,
+  industries,
+  companyTypes,
+  categories,
+  relationshipTypeOptions = relationshipTypeValues,
+  nameAddon,
+  termsAdvice,
+  selectedTerms,
+  websiteMasked = false,
+}: {
+  register: UseFormRegister<FieldValues>;
+  errors: FieldErrors<FieldValues>;
+  industries: IndustryOption[];
+  /** The workspace's company types (Settings › Lists; src/lib/companies/company-types.ts). */
+  companyTypes: CompanyTypeOption[];
+  /** The customer categories to offer. Left out where a category means nothing — vendors, say. */
+  categories?: CategoryTree<FlatCategory>[];
+  relationshipTypeOptions?: readonly CompanyRelationshipType[];
+  /** Rendered under the name — the create form puts the existing-company search here. */
+  nameAddon?: React.ReactNode;
+  /** A customer's credit advice for the terms field. Left out for vendors: their terms are ours to pay. */
+  termsAdvice?: TermsAdvice | null;
+  /** The terms currently chosen in the form, so the advice can react to them. */
+  selectedTerms?: string;
+  /**
+   * Field access masks the website for this person (owner, 5 Nov 2026 — Phase 3 masking fixes, audit H.4.2): shown
+   * masked and not editable, and the save keeps what is stored (`updateCompany`).
+   */
+  websiteMasked?: boolean;
+}) {
+  // Rendered only inside the client forms (new-company-form, edit-company-form), so the hook is theirs.
+  const w = useWording();
+  const chosen = (selectedTerms || null) as TermsKey | null;
+  const changed = !!termsAdvice && !!chosen && chosen !== termsAdvice.currentTerms;
+  const overriding = changed && !!chosen && termsExceed(chosen, termsAdvice!.recommendedTerms);
+  const standingBeyond =
+    !!termsAdvice && !changed && !!termsAdvice.currentTerms && termsExceed(termsAdvice.currentTerms, termsAdvice.recommendedTerms);
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader className="text-sm font-medium text-text">{slot(w, "Company details", "company", "{one} details")}</CardHeader>
+        <CardContent className="grid grid-cols-2 gap-4">
+          <div className="col-span-2 space-y-1.5">
+            <Label htmlFor="name">{slot(w, "Company name *", "company", "{one} name *")}</Label>
+            <Input id="name" {...register("name")} />
+            {errors.name && <p className="text-xs text-danger">{String(errors.name.message)}</p>}
+            {nameAddon}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="industryId">Industry</Label>
+            <Select id="industryId" {...register("industryId")}>
+              <option value="">Not set</option>
+              {industries.map((i) => (
+                <option key={i.id} value={i.id}>
+                  {i.name}
+                </option>
+              ))}
+            </Select>
+            {industries.length === 0 && (
+              <p className="text-xs text-subtle">
+                No industries configured yet — add some from Settings.
+              </p>
+            )}
+          </div>
+          {categories && (
+            <div className="space-y-1.5">
+              <Label htmlFor="customerCategoryId">{slot(w, "Customer category", "customer", "{one} category")}</Label>
+              <Select id="customerCategoryId" {...register("customerCategoryId")}>
+                <option value="">None</option>
+                {categories.map((top) => (
+                  <optgroup key={top.id} label={top.name}>
+                    <option value={top.id}>{top.name}</option>
+                    {top.children.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {top.name} › {c.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </Select>
+              <p className="text-xs text-subtle">Shown beside their name everywhere, with how to treat them.</p>
+            </div>
+          )}
+          <div className="space-y-1.5">
+            <Label htmlFor="companyType">{slot(w, "Company type", "company", "{one} type")}</Label>
+            <Select id="companyType" {...register("companyType")}>
+              <option value="">Unknown</option>
+              {companyTypes.map((t) => (
+                <option key={t.key} value={t.key}>
+                  {t.name}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="relationshipType">Relationship</Label>
+            <Select id="relationshipType" {...register("relationshipType")}>
+              {relationshipTypeOptions.map((t) => (
+                <option key={t} value={t}>
+                  {relationshipTypeLabels[t]}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="employeeBand">Number of employees</Label>
+            {/* A band, not a number — nobody adding a customer knows it has 37 staff. See company-size.ts. */}
+            <Select id="employeeBand" {...register("employeeBand")}>
+              <option value="">Not known</option>
+              {EMPLOYEE_BANDS.map((b) => (
+                <option key={b.key} value={b.key}>
+                  {b.label}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="website">Website</Label>
+            <Input id="website" {...register("website")} disabled={websiteMasked} />
+            {websiteMasked && <p className="text-xs text-subtle">Masked for you — saving keeps it as it is.</p>}
+            {errors.website && <p className="text-xs text-danger">{String(errors.website.message)}</p>}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="linkedinUrl">{slot(w, "Company LinkedIn URL", "company", "{one} LinkedIn URL")}</Label>
+            <Input id="linkedinUrl" {...register("linkedinUrl")} />
+            {errors.linkedinUrl && <p className="text-xs text-danger">{String(errors.linkedinUrl.message)}</p>}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="paymentTerms">Payment terms</Label>
+            <Select id="paymentTerms" {...register("paymentTerms")}>
+              {paymentTermsValues.map((t) => (
+                <option key={t} value={t}>
+                  {paymentTermsLabels[t]}
+                </option>
+              ))}
+            </Select>
+            {termsAdvice && (
+              <div className="space-y-1.5 text-xs">
+                <p className="flex flex-wrap items-center gap-1.5 text-muted">
+                  <CreditBadge rating={termsAdvice.rating} score={termsAdvice.score} />
+                  their record supports up to {paymentTermsLabels[termsAdvice.recommendedTerms]}
+                </p>
+                {overriding &&
+                  (termsAdvice.canOverride ? (
+                    <Input
+                      aria-label="Why give longer terms"
+                      placeholder={`Why ${paymentTermsLabels[chosen!]}? Kept on their credit record.`}
+                      {...register("creditOverrideReason")}
+                    />
+                  ) : (
+                    <p className="text-danger">
+                      Longer than their record supports — saving needs someone who can override credit terms.
+                    </p>
+                  ))}
+                {standingBeyond && (
+                  <p className="text-warning">Their current terms are longer than their record now supports.</p>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="dunsNumber">D-U-N-S number</Label>
+            <Input id="dunsNumber" {...register("dunsNumber")} />
+          </div>
+          {/* What a new quote, invoice or purchase order for them starts in (owner, 30 Oct 2026). */}
+          <div className="space-y-1.5">
+            <Label htmlFor="defaultCurrency">Currency</Label>
+            <Select id="defaultCurrency" {...register("defaultCurrency")}>
+              <option value="">Base ({baseCurrency()})</option>
+              {CURRENCIES.filter((c) => c.code !== baseCurrency()).map((c) => (
+                <option key={c.code} value={c.code}>
+                  {c.code} — {c.label}
+                </option>
+              ))}
+            </Select>
+            <p className="text-xs text-subtle">New documents for them start in it, at the day&apos;s rate.</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="source">Source</Label>
+            <Select id="source" {...register("source")}>
+              {companySourceValues.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="col-span-2 space-y-1.5">
+            <Label htmlFor="tags">Tags</Label>
+            <Input id="tags" placeholder="comma separated, e.g. Hot lead, Education sector" {...register("tags")} />
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

@@ -1,0 +1,46 @@
+# HTTPS for Deskzo One. Caddy gets each certificate from Let's Encrypt the first time a name is
+# asked for, after asking the app whether the name is one of ours (src/lib/tenancy/certificates.ts):
+# the site, www., admin., cms., partners., every workspace, and workspaces' own verified domains.
+# A name the app doesn't serve gets no certificate, so nobody can spend the weekly limit.
+
+{
+	email {$ACME_EMAIL}
+	on_demand_tls {
+		ask http://app:3000/api/platform/tls-ask
+	}
+}
+
+# The website's address is www.; the bare domain sends people there.
+{$PLATFORM_DOMAIN} {
+	redir https://www.{$PLATFORM_DOMAIN}{uri} permanent
+}
+
+# Plain HTTP: biometric terminals only. eSSL / ZKTeco firmware mostly speaks plain HTTP, can't follow a
+# redirect, and set up with the server's IP number has no name to ask a certificate for — so /iclock is
+# answered here on port 80 as it is. Everything else is sent to HTTPS, as Caddy would on its own.
+# The iclock protocol has no authentication either way (src/app/api/biometric/iclock/[[...path]]/route.ts).
+http:// {
+	@iclock path /iclock /iclock/*
+	handle @iclock {
+		reverse_proxy app:3000
+	}
+	handle {
+		redir https://{host}{uri} 308
+	}
+}
+
+# Every other name.
+https:// {
+	tls {
+		on_demand
+	}
+
+	# The certificate question is for Caddy inside the server, never for the internet.
+	@tlsAsk path /api/platform/tls-ask
+	respond @tlsAsk 404
+
+	encode zstd gzip
+
+	# Caddy sets X-Forwarded-For, -Host and -Proto itself; the app believes them (TRUST_PROXY=1).
+	reverse_proxy app:3000
+}

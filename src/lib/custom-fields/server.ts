@@ -1,0 +1,532 @@
+import { cache } from "react";
+import { Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import { can } from "@/lib/authz/resolve";
+import { PEOPLE_ONLY } from "@/lib/people";
+import { encryptSecret } from "@/lib/crypto";
+import {
+  applyInput,
+  fileRef,
+  formValues,
+  formatValue,
+  secretTail,
+  storedSecret,
+  groupDefs,
+  readValues,
+  visibleDefs,
+  type CustomFieldDef,
+  type CustomFieldEntityKey,
+  type CustomFieldError,
+  type CustomFieldOption,
+  type CustomFieldTypeKey,
+  type CustomFieldValues,
+} from "@/lib/custom-fields/rules";
+
+/**
+ * The server side of custom fields: a workspace's definitions, who may see the restricted ones, and
+ * reading and preparing a record's values. src/lib/custom-fields/rules.ts holds the rules themselves.
+ *
+ * Values are read with a query of their own rather than by widening each record's query: the
+ * `customFields` column is left out of select-less reads until every workspace has it
+ * (NOT_YET_EVERYWHERE in src/lib/tenancy/clients.ts), and a workspace still waiting for the
+ * migration simply has no values — never a page that fails.
+ */
+
+export type StoredDefinition = CustomFieldDef & {
+  id: string;
+  entity: CustomFieldEntityKey;
+  showInList: boolean;
+  sortOrder: number;
+  archivedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+/** A table or column this workspace doesn't have yet — the migration hasn't reached it. */
+export function notMigratedYet(err: unknown): boolean {
+  if (err instanceof Prisma.PrismaClientKnownRequestError && (err.code === "P2021" || err.code === "P2022")) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /relation "custom_field_definitions" does not exist|column "?customFields"? does not exist|42P01|42703/.test(message);
+}
+
+function readOptions(raw: unknown): CustomFieldOption[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CustomFieldOption[] = [];
+  for (const o of raw) {
+    if (!o || typeof o !== "object") continue;
+    const { value, label, archived } = o as Record<string, unknown>;
+    if (typeof value !== "string" || typeof label !== "string") continue;
+    out.push({ value, label, ...(archived === true ? { archived: true } : {}) });
+  }
+  return out;
+}
+
+/** Every definition for one record type, retired ones included, in their order. Once per request. */
+export const definitionsFor = cache(async (entity: CustomFieldEntityKey): Promise<StoredDefinition[]> => {
+  try {
+    const rows = await db.customFieldDefinition.findMany({
+      where: { entity },
+      orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      entity: r.entity as CustomFieldEntityKey,
+      key: r.key,
+      label: r.label,
+      type: r.type as CustomFieldTypeKey,
+      options: readOptions(r.options),
+      required: r.required,
+      helpText: r.helpText,
+      group: r.group,
+      restricted: r.restricted,
+      archived: r.archivedAt !== null,
+      showInList: r.showInList,
+      sortOrder: r.sortOrder,
+      archivedAt: r.archivedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    }));
+  } catch (err) {
+    if (notMigratedYet(err)) return [];
+    throw err;
+  }
+});
+
+/** Whether this person sees the restricted fields. */
+export function canSeeRestricted(userId: string): Promise<boolean> {
+  return can(userId, "fields.seeRestricted");
+}
+
+/**
+ * The list masker of a record type field access covers — leads, contacts since 3 Nov 2026, and companies since 5 Nov
+ * 2026 (owner — Phase 3 masking fixes, audit H.4.2: the Companies set; a vendor's own set isn't covered yet) — or null
+ * for one it doesn't, or with nothing masked for this person. Imported when asked for: the resolver reads this module.
+ */
+async function policyMasker(entity: CustomFieldEntityKey, userId: string) {
+  const fieldEntity = entity === "LEAD" ? "leads" : entity === "CONTACT" ? "contacts" : entity === "COMPANY" ? "companies" : null;
+  if (!fieldEntity) return null;
+  const { fieldMasker } = await import("@/lib/authz/fields");
+  const masker = await fieldMasker(userId, fieldEntity, "list");
+  return masker.active ? masker : null;
+}
+
+/**
+ * A lead's, contact's or company's custom fields that this person's field access restricts
+ * (src/lib/authz/field-policy.ts): left out of everything they are shown, searched or filtered by, and
+ * kept as they are when they save. None for a record type field access doesn't cover (`policyMasker`).
+ *
+ * Imported when asked for, because the field-access resolver reads this module's definitions.
+ */
+async function restrictedByPolicy(entity: CustomFieldEntityKey, userId: string): Promise<Set<string>> {
+  const masker = await policyMasker(entity, userId);
+  if (!masker) return new Set();
+  const { customFieldKey } = await import("@/lib/authz/field-policy");
+  return new Set((await definitionsFor(entity)).filter((d) => masker.visibility(customFieldKey(d.key)) === "restricted").map((d) => d.key));
+}
+
+/**
+ * The fields one person may not search or filter on: those their field access doesn't show them in the
+ * clear in a list. A search that matched a masked value would say what it holds, so only what they
+ * see plainly can be matched. Nothing for a record type field access doesn't cover.
+ */
+export async function unsearchableByPolicy(entity: CustomFieldEntityKey, userId: string): Promise<Set<string>> {
+  const masker = await policyMasker(entity, userId);
+  if (!masker) return new Set();
+  const { customFieldKey } = await import("@/lib/authz/field-policy");
+  return new Set((await definitionsFor(entity)).filter((d) => masker.visibility(customFieldKey(d.key)) !== "clear").map((d) => d.key));
+}
+
+/**
+ * Masks the words of a lead's, contact's or company's custom field values for one person — a list's columns
+ * and an export's cells in the list answers. Nothing for a record type field access doesn't cover, or nothing masked.
+ */
+async function customTextMasker(entity: CustomFieldEntityKey, userId: string): Promise<((key: string, text: string) => string) | null> {
+  const masker = await policyMasker(entity, userId);
+  if (!masker) return null;
+  const { customFieldKey } = await import("@/lib/authz/field-policy");
+  return (key, text) => (text === "" ? text : (masker.present(customFieldKey(key), text) ?? ""));
+}
+
+export { customTextMasker };
+
+/** The fields one person works with on one record type: visible, active, in order. */
+export async function fieldsFor(entity: CustomFieldEntityKey, userId: string) {
+  const [all, restricted, byPolicy] = await Promise.all([definitionsFor(entity), canSeeRestricted(userId), restrictedByPolicy(entity, userId)]);
+  return { all, visible: visibleDefs(all, restricted).filter((d) => !byPolicy.has(d.key)), canSeeRestricted: restricted, restrictedByPolicy: byPolicy };
+}
+
+/** The model a record type's values live on. */
+function table(entity: CustomFieldEntityKey) {
+  type Rows = { findMany(args: unknown): Promise<{ id: string; customFields: unknown }[]> };
+  switch (entity) {
+    case "COMPANY":
+    case "VENDOR":
+      return db.company as unknown as Rows;
+    case "CONTACT":
+      return db.contact as unknown as Rows;
+    case "LEAD":
+      return db.lead as unknown as Rows;
+    case "ORDER":
+      return db.companyProduct as unknown as Rows;
+    case "ITEM":
+      return db.item as unknown as Rows;
+    case "VERIFIABLE":
+      return db.verifiableDocument as unknown as Rows;
+  }
+}
+
+/**
+ * The custom-field files records of this type still name, in any of these fields (security audit, 11 Nov 2026 —
+ * SEC-62: what the clean-up of never-saved uploads keeps). Only records that hold a file in one of them are read.
+ */
+export async function fileIdsInUse(entity: CustomFieldEntityKey, fieldKeys: string[]): Promise<Set<string>> {
+  const used = new Set<string>();
+  for (const key of [...new Set(fieldKeys)]) {
+    const rows = await table(entity).findMany({ where: { customFields: { path: [key], string_starts_with: "f1|" } }, select: { id: true, customFields: true } });
+    for (const row of rows) {
+      const ref = fileRef(readValues(row.customFields)[key]);
+      if (ref) used.add(ref.id);
+    }
+  }
+  return used;
+}
+
+/** Stored values for these records, every field included — callers trim to what the person may see. */
+export async function valuesOf(entity: CustomFieldEntityKey, ids: string[]): Promise<Map<string, CustomFieldValues>> {
+  const out = new Map<string, CustomFieldValues>();
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return out;
+  try {
+    const rows = await table(entity).findMany({ where: { id: { in: unique } }, select: { id: true, customFields: true } });
+    for (const row of rows) out.set(row.id, readValues(row.customFields));
+  } catch (err) {
+    if (notMigratedYet(err)) return out;
+    throw err;
+  }
+  return out;
+}
+
+/** One record's stored values. */
+export async function valuesFor(entity: CustomFieldEntityKey, id: string): Promise<CustomFieldValues> {
+  return (await valuesOf(entity, [id])).get(id) ?? {};
+}
+
+/** The workspace's people who can be named in a "person" field: active members, by name. */
+export const peopleForFields = cache(async () =>
+  db.user.findMany({ where: { active: true, ...PEOPLE_ONLY }, orderBy: { name: "asc" }, select: { id: true, name: true } }),
+);
+
+/** Names for the people a set of values names — removed people included, so old values still read. */
+async function namesOf(ids: string[]): Promise<Map<string, string>> {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return new Map();
+  const rows = await db.user.findMany({ where: { id: { in: unique } }, select: { id: true, name: true } });
+  return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+function personIds(defs: CustomFieldDef[], values: CustomFieldValues[]): string[] {
+  const keys = defs.filter((d) => d.type === "USER").map((d) => d.key);
+  const ids: string[] = [];
+  for (const v of values) for (const k of keys) if (typeof v[k] === "string") ids.push(v[k] as string);
+  return ids;
+}
+
+export type PreparedFields =
+  | { ok: true; values: CustomFieldValues; changed: string[] }
+  | { ok: false; error: string; errors: CustomFieldError[] };
+
+/**
+ * What a record is to be saved with, from what was entered: checked against this workspace's
+ * definitions and this person's access (src/lib/custom-fields/rules.ts `applyInput`), with every
+ * newly named person confirmed to be an active member. `changed` names the fields that moved, for
+ * the audit line. On refusal, `error` is one sentence a form can show as it is.
+ */
+export async function prepareCustomFields(params: {
+  entity: CustomFieldEntityKey;
+  userId: string;
+  input: unknown;
+  existing?: CustomFieldValues;
+  checkRequired?: boolean;
+  only?: Iterable<string>;
+  /** Keys hidden from this person where the record is — see `applyInput`. */
+  skip?: Iterable<string>;
+}): Promise<PreparedFields> {
+  const { all, canSeeRestricted: restricted, restrictedByPolicy: byPolicy } = await fieldsFor(params.entity, params.userId);
+  const existing = params.existing ?? {};
+  const applied = applyInput({
+    defs: all,
+    input: params.input,
+    existing,
+    canSeeRestricted: restricted,
+    checkRequired: params.checkRequired,
+    only: params.only,
+    // A field this person's field access restricts is one they can't see, so they can't change it either.
+    skip: [...(params.skip ?? []), ...byPolicy],
+  });
+  if (!applied.ok) return { ok: false, errors: applied.errors, error: applied.errors.map((e) => e.message).join(" ") };
+
+  const errors: CustomFieldError[] = [];
+  const named = all.filter((d) => d.type === "USER" && applied.values[d.key] !== existing[d.key] && typeof applied.values[d.key] === "string");
+  if (named.length) {
+    const ids = named.map((d) => applied.values[d.key] as string);
+    const people = await db.user.findMany({ where: { id: { in: ids }, active: true, ...PEOPLE_ONLY }, select: { id: true } });
+    const known = new Set(people.map((p) => p.id));
+    for (const d of named) {
+      if (!known.has(applied.values[d.key] as string)) errors.push({ key: d.key, label: d.label, message: `Choose a person for ${d.label} from the workspace.` });
+    }
+  }
+  if (errors.length) return { ok: false, errors, error: errors.map((e) => e.message).join(" ") };
+
+  // A secret typed in is encrypted here, before anything keeps it: the one path every save comes through.
+  for (const d of all.filter((x) => x.type === "SECRET")) {
+    const v = applied.values[d.key];
+    if (typeof v !== "string" || v === existing[d.key] || secretTail(v) !== null) continue;
+    applied.values[d.key] = storedSecret(v, await encryptSecret(v));
+  }
+  // A file newly named must be one this person uploaded for this field — not somebody else's, found by its id.
+  const filed = all.filter((d) => d.type === "FILE" && applied.values[d.key] !== existing[d.key] && fileRef(applied.values[d.key]));
+  if (filed.length) {
+    const ids = filed.map((d) => fileRef(applied.values[d.key])!.id);
+    const files = await db.customFieldFile.findMany({ where: { id: { in: ids } }, select: { id: true, entity: true, fieldKey: true, uploadedById: true } });
+    for (const d of filed) {
+      const f = files.find((x) => x.id === fileRef(applied.values[d.key])!.id);
+      if (!f || f.entity !== params.entity || f.fieldKey !== d.key || f.uploadedById !== params.userId) {
+        errors.push({ key: d.key, label: d.label, message: `Upload the file for ${d.label} again.` });
+      }
+    }
+  }
+  if (errors.length) return { ok: false, errors, error: errors.map((e) => e.message).join(" ") };
+
+  const changed = all
+    .filter((d) => JSON.stringify(applied.values[d.key] ?? null) !== JSON.stringify(existing[d.key] ?? null))
+    .map((d) => d.label);
+  return { ok: true, values: applied.values, changed };
+}
+
+/** A record's fields as one person sees them on its page: headings, labels, and the values in words. */
+export type DisplayedFields = {
+  group: string;
+  fields: { key: string; label: string; type: CustomFieldTypeKey; text: string; restricted: boolean; file?: { id: string; name: string } | null; secretSet?: boolean }[];
+}[];
+
+export async function displayFields(
+  entity: CustomFieldEntityKey,
+  userId: string,
+  values: CustomFieldValues,
+  /** How each value's words are shown — a lead's page masks them as its field access says. */
+  options: { present?: (key: string, text: string) => string } = {},
+): Promise<DisplayedFields> {
+  const { visible } = await fieldsFor(entity, userId);
+  if (visible.length === 0) return [];
+  const names = await namesOf(personIds(visible, [values]));
+  const present = options.present ?? ((_key: string, text: string) => text);
+  return groupDefs(visible).map((g) => ({
+    group: g.group,
+    fields: g.fields.map((d) => {
+      const text = formatValue(d, values[d.key], (id) => names.get(id));
+      return {
+        key: d.key,
+        label: d.label,
+        type: d.type,
+        text: text === "" ? text : present(d.key, text),
+        restricted: d.restricted,
+        ...(d.type === "FILE" ? { file: fileRef(values[d.key]) } : {}),
+        ...(d.type === "SECRET" ? { secretSet: secretTail(values[d.key]) !== null } : {}),
+      };
+    }),
+  }));
+}
+
+/**
+ * The same values, in words, for many records at once — a list's columns or an export's. Only the
+ * fields given (already trimmed to what the person may see).
+ */
+export async function formatMany(defs: CustomFieldDef[], rows: Map<string, CustomFieldValues>): Promise<Map<string, Record<string, string>>> {
+  const names = await namesOf(personIds(defs, [...rows.values()]));
+  const out = new Map<string, Record<string, string>>();
+  for (const [id, values] of rows) {
+    const texts: Record<string, string> = {};
+    for (const d of defs) texts[d.key] = formatValue(d, values[d.key], (pid) => names.get(pid));
+    out.set(id, texts);
+  }
+  return out;
+}
+
+/** The audit line's addition for changed custom fields: " — Tower, Floor changed", or "". */
+export function changedLabel(changed: string[]): string {
+  if (changed.length === 0) return "";
+  const shown = changed.slice(0, 5).join(", ");
+  return ` — ${shown}${changed.length > 5 ? ` and ${changed.length - 5} more` : ""} changed`;
+}
+
+/** A definition as a client component receives it — the shape the rules need, nothing else. */
+export function clientDef(d: StoredDefinition): CustomFieldDef {
+  return {
+    key: d.key,
+    label: d.label,
+    type: d.type,
+    options: d.options,
+    required: d.required,
+    helpText: d.helpText,
+    group: d.group,
+    restricted: d.restricted,
+    archived: d.archived,
+  };
+}
+
+/**
+ * What a form needs for one record type: the fields this person fills in, the values they start
+ * with (a new record's are empty) and, when a field names a person, the workspace's people.
+ */
+export async function formSetup(entity: CustomFieldEntityKey, userId: string, existing?: CustomFieldValues, options: { exclude?: Iterable<string> } = {}) {
+  const exclude = new Set(options.exclude ?? []);
+  // A field left out here — one masked on a lead not unmasked today — is neither shown nor sent back,
+  // and the save keeps what it holds (`updateLeadCustomFields`).
+  const visible = (await fieldsFor(entity, userId)).visible.filter((d) => !exclude.has(d.key));
+  const people = visible.some((d) => d.type === "USER") ? await peopleForFields() : [];
+  return { fields: visible.map(clientDef), values: formValues(visible, existing ?? {}), people };
+}
+
+/**
+ * A list's custom-field columns: every field this person may see, each saying whether it is a column
+ * by default — the ones marked "a column in the list" — and each row's values in words. Every field
+ * rather than the marked ones because each person may show or hide any of them for themselves, in the
+ * column picker (src/lib/tables/registry.ts); a choice made there shows at once, with nothing to fetch.
+ *
+ * `listedOnly` for a table without a picker: only the marked fields, which it always shows. No
+ * columns, or no rows, no query.
+ */
+export async function listColumns(entity: CustomFieldEntityKey, userId: string, ids: string[], options: { listedOnly?: boolean } = {}) {
+  const { visible } = await fieldsFor(entity, userId);
+  const defs = options.listedOnly ? visible.filter((d) => d.showInList) : visible;
+  const columns = defs.map((d) => ({ key: d.key, label: d.label, numeric: d.type === "NUMBER" || d.type === "MONEY", default: d.showInList }));
+  // A page with no rows still shows the columns' headings, so the table keeps its shape.
+  if (defs.length === 0 || ids.length === 0) return { columns, texts: {} as Record<string, Record<string, string>> };
+  const [texts, mask] = await Promise.all([formatMany(defs, await valuesOf(entity, ids)), customTextMasker(entity, userId)]);
+  const shown = (row: Record<string, string>) => (mask ? Object.fromEntries(Object.entries(row).map(([k, t]) => [k, mask(k, t)])) : row);
+  return { columns, texts: Object.fromEntries(ids.map((id) => [id, shown(texts.get(id) ?? {})])) };
+}
+
+/**
+ * Saves one record's fields from what was entered — after the record type's own action has decided
+ * this person may change the record. Returns the labels of the fields that changed (none: nothing
+ * was written), or the refusal in words.
+ */
+export async function saveCustomFields(
+  entity: CustomFieldEntityKey,
+  id: string,
+  userId: string,
+  input: unknown,
+  options: { skip?: Iterable<string>; only?: Iterable<string> } = {},
+): Promise<{ ok: true; changed: string[] } | { ok: false; error: string }> {
+  const existing = await valuesFor(entity, id);
+  const prepared = await prepareCustomFields({ entity, userId, input, existing, checkRequired: true, skip: options.skip, only: options.only });
+  if (!prepared.ok) return { ok: false, error: prepared.error };
+  if (prepared.changed.length === 0) return { ok: true, changed: [] };
+  const data = { customFields: prepared.values as Prisma.InputJsonValue };
+  switch (entity) {
+    case "COMPANY":
+    case "VENDOR":
+      await db.company.update({ where: { id }, data, select: { id: true } });
+      break;
+    case "CONTACT":
+      await db.contact.update({ where: { id }, data, select: { id: true } });
+      break;
+    case "LEAD":
+      await db.lead.update({ where: { id }, data, select: { id: true } });
+      break;
+    case "ORDER":
+      await db.companyProduct.update({ where: { id }, data, select: { id: true } });
+      break;
+    case "ITEM":
+      await db.item.update({ where: { id }, data, select: { id: true } });
+      break;
+    case "VERIFIABLE":
+      await db.verifiableDocument.update({ where: { id }, data, select: { id: true } });
+      break;
+  }
+  return { ok: true, changed: prepared.changed };
+}
+
+/**
+ * The `customFields` to create a record with, from what its form sent — or nothing to write when the
+ * workspace has no fields (so a workspace still waiting for the column is never asked to fill it).
+ */
+export async function customFieldsForCreate(
+  entity: CustomFieldEntityKey,
+  userId: string,
+  input: unknown,
+  options: { checkRequired?: boolean } = {},
+): Promise<{ ok: true; data: { customFields?: Prisma.InputJsonValue } } | { ok: false; error: string }> {
+  const prepared = await prepareCustomFields({ entity, userId, input, checkRequired: options.checkRequired ?? true });
+  if (!prepared.ok) return { ok: false, error: prepared.error };
+  return { ok: true, data: Object.keys(prepared.values).length > 0 ? { customFields: prepared.values as Prisma.InputJsonValue } : {} };
+}
+
+/**
+ * What a list's search box adds for the workspace's own fields: one `OR` branch per field this person
+ * may see that the words could be in — text that contains them, a dropdown option or person whose
+ * name does, the number they are. Restricted fields are left out for anybody who can't see them, so
+ * a search can't be used to find out what one holds. Nothing for a workspace without fields.
+ */
+export async function customSearchWhere(entity: CustomFieldEntityKey, userId: string, query: string | undefined): Promise<Record<string, unknown>[]> {
+  const q = query?.trim() ?? "";
+  if (q.length < 2) return [];
+  const [{ visible: shown }, unsearchable] = await Promise.all([fieldsFor(entity, userId), unsearchableByPolicy(entity, userId)]);
+  const visible = shown.filter((d) => !unsearchable.has(d.key));
+  if (visible.length === 0) return [];
+  const lower = q.toLowerCase();
+  const number = /^-?[\d,]*\.?\d+$/.test(q.replace(/[\s₹]/g, "")) ? Number(q.replace(/[\s,₹]/g, "")) : null;
+  const people = visible.some((d) => d.type === "USER")
+    ? (await peopleForFields()).filter((p) => p.name.toLowerCase().includes(lower)).map((p) => p.id)
+    : [];
+  const branches: Record<string, unknown>[] = [];
+  for (const d of visible) {
+    const path = [d.key];
+    switch (d.type) {
+      case "TEXT":
+      case "LONG_TEXT":
+      case "EMAIL":
+      case "PHONE":
+      case "URL":
+      case "DATE":
+        branches.push({ customFields: { path, string_contains: q, mode: "insensitive" } });
+        break;
+      case "NUMBER":
+      case "MONEY":
+        if (number !== null && Number.isFinite(number)) branches.push({ customFields: { path, equals: number } });
+        break;
+      case "SELECT":
+        for (const o of d.options) if (o.label.toLowerCase().includes(lower)) branches.push({ customFields: { path, equals: o.value } });
+        break;
+      case "MULTI_SELECT":
+        for (const o of d.options) if (o.label.toLowerCase().includes(lower)) branches.push({ customFields: { path, array_contains: [o.value] } });
+        break;
+      case "USER":
+        for (const id of people) branches.push({ customFields: { path, equals: id } });
+        break;
+      case "CHECKBOX":
+      // Never searched: a match would say what a secret holds.
+      case "SECRET":
+      case "FILE":
+        break;
+    }
+  }
+  return branches;
+}
+
+/**
+ * The fields a record type shows the customer in their portal (owner, 29 Oct 2026 — orders only), or on a certificate's public
+ * page (owner, 7 Nov 2026), which is the same mark: marked so, active and never restricted. Read by name on its own, so a
+ * workspace not migrated yet shows none.
+ */
+export async function portalKeys(entity: CustomFieldEntityKey): Promise<Set<string>> {
+  if (entity !== "ORDER" && entity !== "VERIFIABLE") return new Set();
+  try {
+    const rows = await db.customFieldDefinition.findMany({ where: { entity, showInPortal: true, archivedAt: null, restricted: false }, select: { key: true } });
+    return new Set(rows.map((r) => r.key));
+  } catch (err) {
+    if (notMigratedYet(err)) return new Set();
+    throw err;
+  }
+}

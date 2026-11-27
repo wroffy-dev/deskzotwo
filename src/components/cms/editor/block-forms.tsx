@@ -1,0 +1,1340 @@
+"use client";
+
+import type { ReactNode } from "react";
+import type {
+  BlockPropsMap,
+  BlockType,
+  ComparisonTableProps,
+  ContactFormProps,
+  CtaProps,
+  FaqProps,
+  FeatureGridProps,
+  HelpGuideProps,
+  HelpIndexProps,
+  HeroProps,
+  ImageTextProps,
+  LogoCloudProps,
+  ModuleGridProps,
+  ModuleHighlightsProps,
+  PageHeaderProps,
+  PricingTableProps,
+  ProductPreviewsProps,
+  ProductStripProps,
+  TrustStripProps,
+  ContactOptionsProps,
+  WorkflowProps,
+  AiShowcaseProps,
+  RelatedLinksProps,
+  RichTextProps,
+  SecurityHighlightsProps,
+  SignatureGeneratorProps,
+  ProductVsSuiteProps,
+  SignupFormProps,
+  SiteBlock,
+  StackSavingsProps,
+  StatsProps,
+  TestimonialProps,
+  WorkspaceSigninProps,
+} from "@/components/site/blocks/types";
+import { PREVIEW_KINDS } from "@/components/site/blocks/types";
+import {
+  ActionField,
+  AnchorField,
+  CheckField,
+  ChoiceField,
+  DateField,
+  HrefField,
+  IconField,
+  ImageField,
+  LinesField,
+  LinkField,
+  ListField,
+  MarkField,
+  MediaField,
+  PREVIEW_LABELS,
+  SelectField,
+  TextField,
+} from "@/components/cms/editor/fields";
+import { RichTextField } from "@/components/cms/editor/rich-text-field";
+import { GUIDE_SECTIONS } from "@/lib/help/guides";
+import { MODULE_REGISTRY } from "@/lib/modules";
+import { PERMISSIONS } from "@/lib/permissions";
+import { PRODUCTS, type ProductKey } from "@/lib/products";
+
+/**
+ * One hand-written form per block type, producing exactly the props in
+ * src/components/site/blocks/types.ts, with the same limits the server checks (src/lib/cms/validate.ts:
+ * headings 200, labels 80, short titles 120, bodies 1,000, long text 2,000).
+ */
+
+const HEADING = 200;
+const LABEL = 80;
+const SHORT = 120;
+const BODY = 1000;
+const LONG = 2000;
+
+type FormProps<K extends BlockType> = { props: BlockPropsMap[K]; onChange: (next: BlockPropsMap[K]) => void };
+
+function Row({ children }: { children: ReactNode }) {
+  return <div className="grid gap-4 sm:grid-cols-2">{children}</div>;
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="space-y-4 border-t border-line pt-4 first:border-t-0 first:pt-0">
+      <h4 className="text-xs font-semibold tracking-wide text-subtle uppercase">{title}</h4>
+      {children}
+    </section>
+  );
+}
+
+type Head = { anchor?: string; eyebrow?: string; heading: string; intro?: string };
+
+/** The eyebrow, heading, introduction and anchor most sections share. */
+function SectionHeadFields<P extends Head>({ props, onChange }: { props: P; onChange: (next: P) => void }) {
+  return (
+    <>
+      <Row>
+        <TextField label="Eyebrow" name="eyebrow" value={props.eyebrow} onChange={(eyebrow) => onChange({ ...props, eyebrow })} max={LABEL} hint="A short line above the heading." />
+        <AnchorField value={props.anchor} onChange={(anchor) => onChange({ ...props, anchor })} />
+      </Row>
+      <TextField label="Heading" name="heading" value={props.heading} onChange={(heading) => onChange({ ...props, heading })} max={HEADING} required />
+      <TextField label="Introduction" name="intro" value={props.intro} onChange={(intro) => onChange({ ...props, intro })} max={BODY} multiline rows={2} />
+    </>
+  );
+}
+
+// ─── Top of page ─────────────────────────────────────────────────────────────────────────────────
+
+function HeroForm({ props, onChange }: FormProps<"hero">) {
+  const set = <K extends keyof HeroProps>(key: K, value: HeroProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <Section title="Words">
+        <TextField label="Eyebrow" name="eyebrow" value={props.eyebrow} onChange={(v) => set("eyebrow", v)} max={LABEL} hint="The small pill above the headline." />
+        <TextField label="Headline" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required hint="The page's main title (its h1)." />
+        <LinesField
+          label="Words that take turns after the headline"
+          name="rotatingWords"
+          value={props.rotatingWords}
+          onChange={(v) => set("rotatingWords", v.length ? v : undefined)}
+          max={30}
+          maxItems={8}
+          itemNoun="word"
+          hint="Two or more, and they take turns at the end of the headline — “One workspace for your” then sales, invoices, books…"
+        />
+        <TextField label="Subheading" name="subheading" value={props.subheading} onChange={(v) => set("subheading", v)} max={600} multiline rows={3} />
+      </Section>
+      <Section title="Buttons">
+        <ActionField label="First button" name="primary" value={props.primary} onChange={(v) => set("primary", v)} />
+        <ActionField label="Second button" name="secondary" value={props.secondary} onChange={(v) => set("secondary", v)} />
+        <ActionField label="Third button (quieter)" name="tertiary" value={props.tertiary} onChange={(v) => set("tertiary", v)} />
+        <TextField label="Note under the buttons (signup open)" name="note" value={props.note} onChange={(v) => set("note", v)} max={300} hint="Shown while anyone can sign up, e.g. “Free for {trialDays} days”." />
+        <TextField label="Note under the buttons (invitation only)" name="noteInviteOnly" value={props.noteInviteOnly} onChange={(v) => set("noteInviteOnly", v)} max={300} hint="Shown while signup is by invitation." />
+      </Section>
+      <Section title="Picture">
+        <MediaField label="Under the headline" name="media" value={props.media} onChange={(v) => set("media", v)} />
+        <ListField<HeroTab>
+          label="Product tabs instead of the picture"
+          name="previewTabs"
+          items={props.previewTabs ?? []}
+          onChange={(tabs) => set("previewTabs", tabs.length ? tabs : undefined)}
+          newItem={() => ({ label: "", preview: "pipeline" })}
+          itemNoun="tab"
+          itemTitle={(tab) => tab.label}
+          maxItems={5}
+          hint="Two or more, and the visitor clicks between these screens instead of seeing the picture above."
+          render={(item, setItem) => (
+            <Row>
+              <TextField label="Tab" name="label" value={item.label} onChange={(label) => setItem({ ...item, label })} max={40} required placeholder="Sales" />
+              <SelectField label="Screen" name="preview" value={item.preview} onChange={(preview) => setItem({ ...item, preview: preview ?? "pipeline" })} options={PREVIEW_KINDS.map((k) => ({ value: k, label: PREVIEW_LABELS[k] }))} />
+            </Row>
+          )}
+        />
+      </Section>
+    </>
+  );
+}
+
+function PageHeaderForm({ props, onChange }: FormProps<"pageHeader">) {
+  const set = <K extends keyof PageHeaderProps>(key: K, value: PageHeaderProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <TextField label="Eyebrow" name="eyebrow" value={props.eyebrow} onChange={(v) => set("eyebrow", v)} max={LABEL} />
+      <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required hint="The page's main title (its h1)." />
+      <TextField label="Introduction" name="intro" value={props.intro} onChange={(v) => set("intro", v)} max={BODY} multiline rows={3} />
+      {props.notice ? (
+        <fieldset className="space-y-3 rounded-lg border border-line p-3">
+          <legend className="-ml-1 px-1 text-[13px] font-medium text-muted">Notice</legend>
+          <ChoiceField
+            label="Tone"
+            name="notice.tone"
+            value={props.notice.tone}
+            onChange={(tone) => set("notice", { ...props.notice!, tone })}
+            options={[
+              { value: "info", label: "Information" },
+              { value: "warning", label: "Warning" },
+            ]}
+          />
+          <TextField label="Notice" name="notice.text" value={props.notice.text} onChange={(text) => set("notice", { ...props.notice!, text })} max={600} multiline rows={2} required />
+          <button type="button" className="text-xs font-medium text-danger hover:underline" onClick={() => set("notice", undefined)}>
+            Remove the notice
+          </button>
+        </fieldset>
+      ) : (
+        <button type="button" className="text-sm font-medium text-brand hover:underline" onClick={() => set("notice", { tone: "info", text: "" })}>
+          + Add a notice (a draft warning, a caveat)
+        </button>
+      )}
+    </>
+  );
+}
+
+// ─── Sections ────────────────────────────────────────────────────────────────────────────────────
+
+type Feature = FeatureGridProps["items"][number];
+
+function FeatureGridForm({ props, onChange }: FormProps<"featureGrid">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ChoiceField
+        label="Columns on a wide screen"
+        name="columns"
+        value={props.columns ?? 3}
+        onChange={(columns) => onChange({ ...props, columns })}
+        options={[
+          { value: 2, label: "2" },
+          { value: 3, label: "3" },
+          { value: 4, label: "4" },
+        ]}
+      />
+      <ListField<Feature>
+        label="Cards"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ icon: "sparkles", title: "", body: "" })}
+        itemNoun="card"
+        itemTitle={(item) => item.title}
+        maxItems={24}
+        render={(item, set) => (
+          <>
+            <Row>
+              <TextField label="Title" name="title" value={item.title} onChange={(title) => set({ ...item, title })} max={SHORT} required />
+              <IconField name="icon" value={item.icon} onChange={(icon) => set({ ...item, icon })} />
+            </Row>
+            <TextField label="Words" name="body" value={item.body} onChange={(body) => set({ ...item, body })} max={BODY} multiline rows={3} required />
+            <LinesField label="Bullet points" name="bullets" value={item.bullets} onChange={(bullets) => set({ ...item, bullets: bullets.length ? bullets : undefined })} max={200} maxItems={12} itemNoun="point" />
+            <LinkField label="Link" name="link" value={item.link} onChange={(link) => set({ ...item, link })} />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+type ModuleGroup = ModuleGridProps["groups"][number];
+type ModuleItem = ModuleGroup["modules"][number];
+const MODULE_OPTIONS = MODULE_REGISTRY.map((m) => ({ value: m.key, label: m.label }));
+
+function ModuleGridForm({ props, onChange }: FormProps<"moduleGrid">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<ModuleGroup>
+        label="Groups"
+        name="groups"
+        items={props.groups}
+        onChange={(groups) => onChange({ ...props, groups })}
+        newItem={() => ({ icon: "layers", title: "", modules: [{ label: "", blurb: "" }] })}
+        itemNoun="group"
+        itemTitle={(g) => g.title}
+        maxItems={16}
+        render={(group, setGroup) => (
+          <>
+            <Row>
+              <TextField label="Group title" name="title" value={group.title} onChange={(title) => setGroup({ ...group, title })} max={SHORT} required />
+              <IconField name="icon" value={group.icon} onChange={(icon) => setGroup({ ...group, icon: icon ?? "layers" })} required />
+            </Row>
+            <TextField label="Summary" name="summary" value={group.summary} onChange={(summary) => setGroup({ ...group, summary })} max={600} />
+            <ListField<ModuleItem>
+              label="Modules"
+              name="modules"
+              items={group.modules}
+              onChange={(modules) => setGroup({ ...group, modules })}
+              newItem={() => ({ label: "", blurb: "" })}
+              itemNoun="module"
+              itemTitle={(m) => m.label}
+              maxItems={30}
+              render={(m, setModule) => (
+                <>
+                  <Row>
+                    <TextField label="Name" name="label" value={m.label} onChange={(label) => setModule({ ...m, label })} max={LABEL} required />
+                    <SelectField
+                      label="Product module"
+                      name="key"
+                      value={m.key}
+                      onChange={(key) => setModule({ ...m, key })}
+                      options={MODULE_OPTIONS}
+                      required={false}
+                      emptyLabel="Not linked"
+                      hint="Linked modules get the “sold in one country” badge automatically."
+                    />
+                  </Row>
+                  <TextField label="What it does" name="blurb" value={m.blurb} onChange={(blurb) => setModule({ ...m, blurb })} max={300} multiline rows={2} required />
+                </>
+              )}
+            />
+          </>
+        )}
+      />
+      <TextField label="Footnote" name="footnote" value={props.footnote} onChange={(footnote) => onChange({ ...props, footnote })} max={600} multiline rows={2} />
+    </>
+  );
+}
+
+function RichTextForm({ props, onChange }: FormProps<"richText">) {
+  const set = <K extends keyof RichTextProps>(key: K, value: RichTextProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <Row>
+        <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <RichTextField label="Text" name="content" value={props.content} onChange={(content) => set("content", content)} />
+    </>
+  );
+}
+
+function ImageTextForm({ props, onChange }: FormProps<"imageText">) {
+  const set = <K extends keyof ImageTextProps>(key: K, value: ImageTextProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <LinesField label="Paragraphs" name="body" value={props.body} onChange={(v) => set("body", v.length ? v : undefined)} max={LONG} maxItems={10} multiline itemNoun="paragraph" />
+      <LinesField label="Bullet points" name="bullets" value={props.bullets} onChange={(v) => set("bullets", v.length ? v : undefined)} max={200} maxItems={12} itemNoun="point" />
+      <ActionField label="Button" name="action" value={props.action} onChange={(v) => set("action", v)} />
+      <MediaField label="Picture" name="media" value={props.media} onChange={(v) => set("media", v ?? { kind: "preview", preview: "pipeline" })} required />
+      <ChoiceField
+        label="Picture on a wide screen"
+        name="mediaSide"
+        value={props.mediaSide ?? "right"}
+        onChange={(v) => set("mediaSide", v)}
+        options={[
+          { value: "left", label: "Left" },
+          { value: "right", label: "Right" },
+        ]}
+      />
+    </>
+  );
+}
+
+type Stat = StatsProps["items"][number];
+
+function StatsForm({ props, onChange }: FormProps<"stats">) {
+  return (
+    <>
+      <Row>
+        <TextField label="Heading" name="heading" value={props.heading} onChange={(heading) => onChange({ ...props, heading })} max={HEADING} />
+        <AnchorField value={props.anchor} onChange={(anchor) => onChange({ ...props, anchor })} />
+      </Row>
+      <ListField<Stat>
+        label="Figures"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ value: "", label: "" })}
+        itemNoun="figure"
+        itemTitle={(s) => [s.value, s.label].filter(Boolean).join(" ")}
+        maxItems={8}
+        hint="Only figures you can stand behind — they are read as claims."
+        render={(item, set) => (
+          <Row>
+            <TextField label="Figure" name="value" value={item.value} onChange={(value) => set({ ...item, value })} max={40} required placeholder="99.9%" />
+            <TextField label="What it counts" name="label" value={item.label} onChange={(label) => set({ ...item, label })} max={SHORT} required />
+          </Row>
+        )}
+      />
+    </>
+  );
+}
+
+type Question = FaqProps["items"][number];
+
+function FaqForm({ props, onChange }: FormProps<"faq">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<Question>
+        label="Questions"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ question: "", answer: [""] })}
+        itemNoun="question"
+        itemTitle={(q) => q.question}
+        maxItems={40}
+        render={(item, set) => (
+          <>
+            <TextField label="Question" name="question" value={item.question} onChange={(question) => set({ ...item, question })} max={300} required />
+            <LinesField label="Answer" name="answer" value={item.answer} onChange={(answer) => set({ ...item, answer })} max={LONG} maxItems={10} multiline required itemNoun="paragraph" />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+function CtaForm({ props, onChange }: FormProps<"cta">) {
+  const set = <K extends keyof CtaProps>(key: K, value: CtaProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <Row>
+        <ChoiceField
+          label="Look"
+          name="variant"
+          value={props.variant ?? "band"}
+          onChange={(v) => set("variant", v)}
+          options={[
+            { value: "band", label: "Brand band" },
+            { value: "panel", label: "Quiet panel" },
+          ]}
+        />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required />
+      <TextField label="Words" name="body" value={props.body} onChange={(v) => set("body", v)} max={BODY} multiline rows={2} />
+      <ActionField label="First button" name="primary" value={props.primary} onChange={(v) => set("primary", v)} />
+      <ActionField label="Second button" name="secondary" value={props.secondary} onChange={(v) => set("secondary", v)} />
+    </>
+  );
+}
+
+function ProductVsSuiteForm({ props, onChange }: FormProps<"productVsSuite">) {
+  const set = <K extends keyof ProductVsSuiteProps>(key: K, value: ProductVsSuiteProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        The two cards, their prices and the module comparison are built from the product list and the plans on sale, for the visitor&apos;s country. These are the words around them.
+      </p>
+      <SelectField<ProductKey>
+        label="Product"
+        name="product"
+        value={props.product}
+        options={PRODUCTS.filter((p) => p.key !== "one").map((p) => ({ value: p.key, label: p.name }))}
+        onChange={(v) => v && set("product", v)}
+        hint="Set beside Deskzo One. Its trial button starts this product alone; Deskzo One's, every product."
+      />
+      <Row>
+        <TextField label="Eyebrow" name="eyebrow" value={props.eyebrow} onChange={(v) => set("eyebrow", v)} max={80} />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required />
+      <TextField label="Introduction" name="intro" value={props.intro} onChange={(v) => set("intro", v)} max={BODY} multiline rows={2} />
+      <TextField label="Before the demo link" name="demoNote" value={props.demoNote} onChange={(v) => set("demoNote", v)} max={300} hint={'Followed by "Book a demo of …", which opens the contact form with this product chosen.'} />
+    </>
+  );
+}
+
+function SignatureGeneratorForm({ props, onChange }: FormProps<"signatureGenerator">) {
+  const set = <K extends keyof SignatureGeneratorProps>(key: K, value: SignatureGeneratorProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        The generator itself is built in: the visitor&apos;s browser makes the signature, and nothing they type is sent anywhere. These are the words around it.
+      </p>
+      <Row>
+        <TextField label="Heading (optional)" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Introduction" name="intro" value={props.intro} onChange={(v) => set("intro", v)} max={BODY} multiline rows={2} />
+      <Section title="Under the generator — for a whole team">
+        <TextField label="Heading" name="upsellHeading" value={props.upsellHeading} onChange={(v) => set("upsellHeading", v)} max={HEADING} required />
+        <TextField label="Words" name="upsellBody" value={props.upsellBody} onChange={(v) => set("upsellBody", v)} max={BODY} multiline rows={2} />
+        <ActionField label="Button" name="upsellAction" value={props.upsellAction} onChange={(v) => set("upsellAction", v)} />
+      </Section>
+      <TextField label="Privacy note" name="privacyNote" value={props.privacyNote} onChange={(v) => set("privacyNote", v)} max={300} hint="Under the preview — say that nothing typed leaves the visitor's browser." />
+    </>
+  );
+}
+
+function PricingTableForm({ props, onChange }: FormProps<"pricingTable">) {
+  const set = <K extends keyof PricingTableProps>(key: K, value: PricingTableProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">The plans and prices come live from the platform for the visitor&apos;s country. These are the words around them.</p>
+      <Row>
+        <TextField label="Beside the country picker" name="countryLabel" value={props.countryLabel} onChange={(v) => set("countryLabel", v)} max={LABEL} required />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Plans heading" name="editionsHeading" value={props.editionsHeading} onChange={(v) => set("editionsHeading", v)} max={HEADING} required />
+      <TextField label="Add-ons heading" name="extrasHeading" value={props.extrasHeading} onChange={(v) => set("extrasHeading", v)} max={HEADING} required />
+      <TextField label="Add-ons introduction" name="extrasIntro" value={props.extrasIntro} onChange={(v) => set("extrasIntro", v)} max={BODY} multiline rows={2} />
+      <TextField label="Trial note" name="trialNote" value={props.trialNote} onChange={(v) => set("trialNote", v)} max={300} hint="E.g. “Every plan starts with a {trialDays}-day free trial.”" />
+      <TextField label="Footnote (what every plan includes)" name="footnote" value={props.footnote} onChange={(v) => set("footnote", v)} max={600} multiline rows={2} />
+      <Section title="When nothing is on sale in a country">
+        <TextField label="Heading" name="emptyHeading" value={props.emptyHeading} onChange={(v) => set("emptyHeading", v)} max={HEADING} required />
+        <TextField label="Words" name="emptyBody" value={props.emptyBody} onChange={(v) => set("emptyBody", v)} max={BODY} multiline rows={2} required />
+        <ActionField label="Button" name="emptyAction" value={props.emptyAction} onChange={(v) => set("emptyAction", v)} />
+      </Section>
+    </>
+  );
+}
+
+type Highlight = SecurityHighlightsProps["items"][number];
+
+function SecurityHighlightsForm({ props, onChange }: FormProps<"securityHighlights">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<Highlight>
+        label="Highlights"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ icon: "shield", title: "", body: "" })}
+        itemNoun="highlight"
+        itemTitle={(h) => h.title}
+        maxItems={24}
+        render={(item, set) => (
+          <>
+            <Row>
+              <TextField label="Title" name="title" value={item.title} onChange={(title) => set({ ...item, title })} max={SHORT} required />
+              <IconField name="icon" value={item.icon} onChange={(icon) => set({ ...item, icon: icon ?? "shield" })} required />
+            </Row>
+            <TextField label="Words" name="body" value={item.body} onChange={(body) => set({ ...item, body })} max={BODY} multiline rows={2} required />
+          </>
+        )}
+      />
+      <LinkField label="Link" name="link" value={props.link} onChange={(link) => onChange({ ...props, link })} />
+    </>
+  );
+}
+
+type Aside = NonNullable<ContactFormProps["aside"]>[number];
+
+function ContactFormForm({ props, onChange }: FormProps<"contactForm">) {
+  const set = <K extends keyof ContactFormProps>(key: K, value: ContactFormProps[K]) => onChange({ ...props, [key]: value });
+  const topic = (key: keyof ContactFormProps["topics"], value: string) => set("topics", { ...props.topics, [key]: value });
+  return (
+    <>
+      <Row>
+        <TextField label="Form heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Introduction" name="intro" value={props.intro} onChange={(v) => set("intro", v)} max={BODY} multiline rows={2} />
+      <Section title="Topics people choose from">
+        <Row>
+          <TextField label="Demo" name="topics.demo" value={props.topics.demo} onChange={(v) => topic("demo", v)} max={60} required />
+          <TextField label="Sales" name="topics.sales" value={props.topics.sales} onChange={(v) => topic("sales", v)} max={60} required />
+          <TextField label="Support" name="topics.support" value={props.topics.support} onChange={(v) => topic("support", v)} max={60} required />
+          <TextField label="Anything else" name="topics.other" value={props.topics.other} onChange={(v) => topic("other", v)} max={60} required />
+        </Row>
+      </Section>
+      <Section title="Sending">
+        <TextField label="Send button" name="submitLabel" value={props.submitLabel} onChange={(v) => set("submitLabel", v)} max={60} required />
+        <TextField label="After sending: heading" name="successHeading" value={props.successHeading} onChange={(v) => set("successHeading", v)} max={HEADING} required />
+        <TextField label="After sending: words" name="successBody" value={props.successBody} onChange={(v) => set("successBody", v)} max={BODY} multiline rows={2} required />
+      </Section>
+      <Section title="Beside the form">
+        <TextField label="Heading" name="asideHeading" value={props.asideHeading} onChange={(v) => set("asideHeading", v)} max={HEADING} />
+        <ListField<Aside>
+          label="Other ways in"
+          name="aside"
+          items={props.aside}
+          onChange={(aside) => set("aside", aside.length ? aside : undefined)}
+          newItem={() => ({ title: "", body: "" })}
+          itemNoun="entry"
+          itemTitle={(a) => a.title}
+          maxItems={6}
+          required={false}
+          hint="An entry whose words are just an email address becomes a mail link."
+          render={(item, setItem) => (
+            <>
+              <TextField label="Title" name="title" value={item.title} onChange={(title) => setItem({ ...item, title })} max={SHORT} required />
+              <TextField label="Words" name="body" value={item.body} onChange={(body) => setItem({ ...item, body })} max={BODY} multiline rows={2} required />
+              <LinkField label="Link" name="link" value={item.link} onChange={(link) => setItem({ ...item, link })} />
+            </>
+          )}
+        />
+      </Section>
+    </>
+  );
+}
+
+type Logo = LogoCloudProps["items"][number];
+
+function LogoCloudForm({ props, onChange }: FormProps<"logoCloud">) {
+  return (
+    <>
+      <Row>
+        <TextField label="Heading" name="heading" value={props.heading} onChange={(heading) => onChange({ ...props, heading })} max={HEADING} />
+        <AnchorField value={props.anchor} onChange={(anchor) => onChange({ ...props, anchor })} />
+      </Row>
+      <ListField<Logo>
+        label="Logos"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ name: "" })}
+        itemNoun="logo"
+        itemTitle={(l) => l.name}
+        maxItems={24}
+        hint="Real customers only, with their permission. Without an image the name is shown."
+        render={(item, set) => (
+          <>
+            <TextField label="Customer name" name="name" value={item.name} onChange={(name) => set({ ...item, name })} max={SHORT} required />
+            <ImageField label="Logo" name="imageUrl" value={item.imageUrl} onChange={(imageUrl) => set({ ...item, imageUrl })} />
+            <HrefField label="Their website" name="href" value={item.href} onChange={(href) => set({ ...item, href: href || undefined })} />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+function TestimonialForm({ props, onChange }: FormProps<"testimonial">) {
+  const set = <K extends keyof TestimonialProps>(key: K, value: TestimonialProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <TextField label="Their words" name="quote" value={props.quote} onChange={(v) => set("quote", v)} max={BODY} multiline rows={4} required hint="Exactly as they said it, with their permission." />
+      <Row>
+        <TextField label="Name" name="name" value={props.name} onChange={(v) => set("name", v)} max={SHORT} required />
+        <TextField label="Role" name="role" value={props.role} onChange={(v) => set("role", v)} max={SHORT} />
+        <TextField label="Company" name="company" value={props.company} onChange={(v) => set("company", v)} max={SHORT} />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <ImageField label="Photo" name="imageUrl" value={props.imageUrl} onChange={(v) => set("imageUrl", v)} />
+    </>
+  );
+}
+
+type Preview = ProductPreviewsProps["items"][number];
+
+function ProductPreviewsForm({ props, onChange }: FormProps<"productPreviews">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<Preview>
+        label="Screens"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ preview: "pipeline", title: "", body: "" })}
+        itemNoun="screen"
+        itemTitle={(p) => p.title || PREVIEW_LABELS[p.preview]}
+        maxItems={6}
+        render={(item, set) => (
+          <>
+            <Row>
+              <SelectField label="Screen" name="preview" value={item.preview} onChange={(preview) => set({ ...item, preview: preview ?? "pipeline" })} options={PREVIEW_KINDS.map((k) => ({ value: k, label: PREVIEW_LABELS[k] }))} />
+              <TextField label="Title" name="title" value={item.title} onChange={(title) => set({ ...item, title })} max={SHORT} required />
+            </Row>
+            <TextField label="Words" name="body" value={item.body} onChange={(body) => set({ ...item, body })} max={BODY} multiline rows={2} required />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+function WorkspaceSigninForm({ props, onChange }: FormProps<"workspaceSignin">) {
+  const set = <K extends keyof WorkspaceSigninProps>(key: K, value: WorkspaceSigninProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <Section title="Go to a workspace by name">
+        <TextField label="Heading" name="goHeading" value={props.goHeading} onChange={(v) => set("goHeading", v)} max={HEADING} required />
+        <TextField label="Words" name="goBody" value={props.goBody} onChange={(v) => set("goBody", v)} max={BODY} multiline rows={2} />
+      </Section>
+      <Section title="Find my workspaces by email">
+        <TextField label="Heading" name="findHeading" value={props.findHeading} onChange={(v) => set("findHeading", v)} max={HEADING} required />
+        <TextField label="Words" name="findBody" value={props.findBody} onChange={(v) => set("findBody", v)} max={BODY} multiline rows={2} />
+        <TextField label="After asking: heading" name="confirmationHeading" value={props.confirmationHeading} onChange={(v) => set("confirmationHeading", v)} max={HEADING} required />
+        <TextField
+          label="After asking: words"
+          name="confirmationBody"
+          value={props.confirmationBody}
+          onChange={(v) => set("confirmationBody", v)}
+          max={BODY}
+          multiline
+          rows={2}
+          required
+          hint="Shown whatever address was typed — never say whether it has workspaces."
+        />
+      </Section>
+      <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+    </>
+  );
+}
+
+function SignupFormForm({ props, onChange }: FormProps<"signupForm">) {
+  const set = <K extends keyof SignupFormProps>(key: K, value: SignupFormProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required hint="The page's main title (its h1)." />
+      <TextField label="Words (signup open)" name="body" value={props.body} onChange={(v) => set("body", v)} max={BODY} multiline rows={3} />
+      <TextField label="Words (invitation only)" name="bodyInviteOnly" value={props.bodyInviteOnly} onChange={(v) => set("bodyInviteOnly", v)} max={BODY} multiline rows={3} />
+      <TextField label="Beside the form: heading" name="asideHeading" value={props.asideHeading} onChange={(v) => set("asideHeading", v)} max={HEADING} />
+      <LinesField label="Beside the form: points" name="asideItems" value={props.asideItems} onChange={(v) => set("asideItems", v.length ? v : undefined)} max={300} maxItems={12} itemNoun="point" />
+    </>
+  );
+}
+
+// ─── Comparisons and internal links ──────────────────────────────────────────────────────────────
+
+type ComparisonRow = ComparisonTableProps["rows"][number];
+
+function ComparisonTableForm({ props, onChange }: FormProps<"comparisonTable">) {
+  const set = <K extends keyof ComparisonTableProps>(key: K, value: ComparisonTableProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <Section title="The other product">
+        <Row>
+          <TextField label="Its name" name="competitor" value={props.competitor} onChange={(v) => set("competitor", v)} max={LABEL} required hint="As this page names it, e.g. Zoho One." />
+          <DateField
+            label="Its website read on"
+            name="asOf"
+            value={props.asOf}
+            onChange={(v) => set("asOf", v)}
+            required
+            hint="Under the table: “Information about … from its public website as of” this day."
+          />
+        </Row>
+      </Section>
+      <ListField<ComparisonRow>
+        label="Rows"
+        name="rows"
+        items={props.rows}
+        onChange={(rows) => onChange({ ...props, rows })}
+        newItem={() => ({ feature: "", us: "yes", them: "yes" })}
+        itemNoun="row"
+        itemTitle={(row) => row.feature}
+        maxItems={40}
+        hint="One feature a row. Say what each product does, from the other product's own website — and link the page you read it on."
+        render={(row, setRow) => (
+          <>
+            <TextField label="Feature" name="feature" value={row.feature} onChange={(feature) => setRow({ ...row, feature })} max={SHORT} required />
+            <Row>
+              <MarkField label="This product" name="us" value={row.us} onChange={(us) => setRow({ ...row, us })} />
+              <MarkField label="The other product" name="them" value={row.them} onChange={(them) => setRow({ ...row, them })} />
+            </Row>
+            <TextField label="Note" name="note" value={row.note} onChange={(note) => setRow({ ...row, note: note || undefined })} max={300} multiline rows={2} hint="Under the feature: what differs, in a line." />
+            <HrefField label="Source: the other product's own page" name="source" value={row.source} onChange={(source) => setRow({ ...row, source: source || undefined })} webOnly />
+          </>
+        )}
+      />
+      <TextField
+        label="Disclaimer"
+        name="disclaimer"
+        value={props.disclaimer}
+        onChange={(v) => set("disclaimer", v)}
+        max={400}
+        multiline
+        rows={3}
+        required
+        hint="Under the table: that what it says about other products is from their public websites as of the date above, and that trademarks belong to their owners."
+      />
+    </>
+  );
+}
+
+type StackTool = StackSavingsProps["tools"][number];
+
+/** A number typed as text: digits (and a point for prices) kept, the rest dropped; empty is nought. */
+const asNumber = (v: string, whole = false) => {
+  const n = Number(v.replace(whole ? /[^\d]/g : /[^\d.]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+};
+
+function StackSavingsForm({ props, onChange }: FormProps<"stackSavings">) {
+  const set = <K extends keyof StackSavingsProps>(key: K, value: StackSavingsProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <Section title="To start with">
+        <Row>
+          <TextField
+            label="People"
+            name="people"
+            value={String(props.people ?? "")}
+            onChange={(v) => set("people", asNumber(v, true))}
+            max={6}
+            required
+            hint="What the totals are for until the visitor changes it."
+          />
+          <DateField label="Prices read on" name="asOf" value={props.asOf} onChange={(v) => set("asOf", v)} required hint="Under the calculator: “from each vendor's own website as of” this day." />
+        </Row>
+      </Section>
+      <ListField<StackTool>
+        label="Tools"
+        name="tools"
+        items={props.tools}
+        onChange={(tools) => onChange({ ...props, tools })}
+        newItem={() => ({ name: "", replaces: "", price: 0, per: "user", source: "", selected: true })}
+        itemNoun="tool"
+        itemTitle={(tool) => tool.name}
+        maxItems={20}
+        hint="One tool a row: its list price in rupees a month before GST, from the vendor's own pricing page — and that page linked. Deskzo One's price is read live; don't add it here."
+        render={(tool, setTool) => (
+          <>
+            <Row>
+              <TextField label="Tool" name="name" value={tool.name} onChange={(name) => setTool({ ...tool, name })} max={LABEL} required hint="e.g. Zoho CRM Professional" />
+              <TextField label="What it does" name="replaces" value={tool.replaces} onChange={(replaces) => setTool({ ...tool, replaces })} max={LABEL} required hint="e.g. CRM, Accounting & GST" />
+            </Row>
+            <Row>
+              <TextField label="₹ a month, billed monthly" name="price" value={String(tool.price ?? "")} onChange={(v) => setTool({ ...tool, price: asNumber(v) })} max={10} required hint="Before GST. 0 where it isn't listed in rupees — the visitor types theirs." />
+              <TextField
+                label="₹ a month, billed yearly"
+                name="priceYearly"
+                value={tool.priceYearly === undefined ? "" : String(tool.priceYearly)}
+                onChange={(v) => setTool({ ...tool, priceYearly: v.trim() ? asNumber(v) : undefined })}
+                max={10}
+                hint="Where the vendor lists one. Empty: the monthly price."
+              />
+            </Row>
+            <Row>
+              <SelectField<"user" | "org">
+                label="For"
+                name="per"
+                value={tool.per}
+                options={[
+                  { value: "user", label: "Each person" },
+                  { value: "org", label: "The whole company" },
+                ]}
+                onChange={(per) => setTool({ ...tool, per: per ?? "user" })}
+              />
+              {tool.per === "org" && (
+                <TextField
+                  label="People it includes"
+                  name="included"
+                  value={tool.included === undefined ? "" : String(tool.included)}
+                  onChange={(v) => setTool({ ...tool, included: v.trim() ? asNumber(v, true) : undefined })}
+                  max={6}
+                  hint="Empty: any number."
+                />
+              )}
+            </Row>
+            {tool.per === "org" && tool.included !== undefined && (
+              <Row>
+                <TextField label="₹ each person past them, billed monthly" name="extra" value={tool.extra === undefined ? "" : String(tool.extra)} onChange={(v) => setTool({ ...tool, extra: v.trim() ? asNumber(v) : undefined })} max={10} />
+                <TextField label="…billed yearly" name="extraYearly" value={tool.extraYearly === undefined ? "" : String(tool.extraYearly)} onChange={(v) => setTool({ ...tool, extraYearly: v.trim() ? asNumber(v) : undefined })} max={10} />
+              </Row>
+            )}
+            <TextField label="Plan and billing" name="basis" value={tool.basis} onChange={(basis) => setTool({ ...tool, basis: basis || undefined })} max={SHORT} hint="e.g. Professional, billed yearly" />
+            <HrefField label="Source: the vendor's own pricing page" name="source" value={tool.source} onChange={(source) => setTool({ ...tool, source })} webOnly required />
+            <ImageField label="Logo (optional)" name="logoUrl" value={tool.logoUrl} onChange={(logoUrl) => setTool({ ...tool, logoUrl })} hint="From the media library. Without one, the tool's initials are shown." />
+            <CheckField label="Ticked to start" checked={!!tool.selected} onChange={(selected) => setTool({ ...tool, selected: selected || undefined })} />
+          </>
+        )}
+      />
+      <TextField
+        label="Disclaimer"
+        name="disclaimer"
+        value={props.disclaimer}
+        onChange={(v) => set("disclaimer", v)}
+        max={600}
+        multiline
+        rows={3}
+        required
+        hint="Under the calculator, after the line saying where the prices are from: that prices change, and trademarks belong to their owners."
+      />
+    </>
+  );
+}
+
+type RelatedLink = RelatedLinksProps["links"][number];
+
+function RelatedLinksForm({ props, onChange }: FormProps<"relatedLinks">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<RelatedLink>
+        label="Links"
+        name="links"
+        items={props.links}
+        onChange={(links) => onChange({ ...props, links })}
+        newItem={() => ({ label: "", href: "" })}
+        itemNoun="link"
+        itemTitle={(l) => l.label}
+        maxItems={12}
+        hint="Pages on this site only. Words that name the page read best: “GST invoicing”, not “Read more”."
+        render={(item, set) => (
+          <>
+            <Row>
+              <TextField label="Words on the link" name="label" value={item.label} onChange={(label) => set({ ...item, label })} max={LABEL} required />
+              <HrefField label="Page" name="href" value={item.href} onChange={(href) => set({ ...item, href })} required internalOnly />
+            </Row>
+            <TextField label="What is there" name="description" value={item.description} onChange={(description) => set({ ...item, description: description || undefined })} max={200} multiline rows={2} />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+type HighlightGroup = ModuleHighlightsProps["groups"][number];
+type HighlightItem = HighlightGroup["items"][number];
+
+function ModuleHighlightsForm({ props, onChange }: FormProps<"moduleHighlights">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<HighlightGroup>
+        label="Groups"
+        name="groups"
+        items={props.groups}
+        onChange={(groups) => onChange({ ...props, groups })}
+        newItem={() => ({ title: "", items: [{ label: "", href: "", description: "" }] })}
+        itemNoun="group"
+        itemTitle={(g) => g.title}
+        maxItems={6}
+        render={(group, setGroup) => (
+          <>
+            <TextField label="Group title" name="title" value={group.title} onChange={(title) => setGroup({ ...group, title })} max={SHORT} required />
+            <ListField<HighlightItem>
+              label="Links"
+              name="items"
+              items={group.items}
+              onChange={(items) => setGroup({ ...group, items })}
+              newItem={() => ({ label: "", href: "", description: "" })}
+              itemNoun="link"
+              itemTitle={(i) => i.label}
+              maxItems={12}
+              render={(item, setItem) => (
+                <>
+                  <Row>
+                    <TextField label="Words on the link" name="label" value={item.label} onChange={(label) => setItem({ ...item, label })} max={LABEL} required />
+                    <HrefField label="Page" name="href" value={item.href} onChange={(href) => setItem({ ...item, href })} required internalOnly />
+                  </Row>
+                  <TextField label="What it covers" name="description" value={item.description} onChange={(description) => setItem({ ...item, description })} max={200} multiline rows={2} required />
+                </>
+              )}
+            />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+// ─── The Help Center ─────────────────────────────────────────────────────────────────────────────
+
+type GuidePermission = HelpGuideProps["permissions"][number];
+type GuideTask = HelpGuideProps["tasks"][number];
+type GuideSetting = HelpGuideProps["settings"][number];
+type GuideQuestion = HelpGuideProps["faq"][number];
+type GuideRelated = { key: string };
+
+const PERMISSION_OPTIONS = [...PERMISSIONS].sort((a, b) => a.label.localeCompare(b.label)).map((p) => ({ value: p.key, label: `${p.label} — ${p.key}` }));
+const GUIDE_HEADING = (key: (typeof GUIDE_SECTIONS)[number]["key"]) => GUIDE_SECTIONS.find((s) => s.key === key)!.heading;
+
+/**
+ * A module's guide: the outline every guide follows, one field per section, under the headings the
+ * page shows (src/lib/help/guides.ts GUIDE_SECTIONS). Which products include the module isn't a field —
+ * the page reads it from the product list. Publishing checks that the module, every permission and
+ * every related guide exist, and that no product is named that isn't one.
+ */
+function HelpGuideForm({ props, onChange }: FormProps<"helpGuide">) {
+  const set = <K extends keyof HelpGuideProps>(key: K, value: HelpGuideProps[K]) => onChange({ ...props, [key]: value });
+  const related: GuideRelated[] = (props.related ?? []).map((key) => ({ key }));
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        Every guide has the same sections, in this order, under these headings. Write the brand as {"{siteName}"}; the products that include the module are added at the end from the product list.
+      </p>
+      <Section title="The guide">
+        <Row>
+          <SelectField label="Module" name="module" value={props.module || undefined} options={MODULE_OPTIONS} onChange={(v) => set("module", v ?? "")} hint="One guide per module. The app's Help panel opens this guide from the module's pages." />
+          <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required hint="The page's main title." />
+        </Row>
+        <TextField label="Summary" name="summary" value={props.summary} onChange={(v) => set("summary", v)} max={300} multiline rows={2} required hint="Under the heading, in the Help Center's list and in the app's Help panel." />
+      </Section>
+      <Section title={GUIDE_HEADING("purpose")}>
+        <RichTextField label="What the module is for" name="purpose" value={props.purpose} onChange={(v) => set("purpose", v)} maxItems={60} />
+      </Section>
+      <Section title={GUIDE_HEADING("access")}>
+        <RichTextField label="Who can use it, in plain words" name="access" value={props.access} onChange={(v) => set("access", v)} maxItems={40} />
+        <ListField<GuidePermission>
+          label="Permissions"
+          name="permissions"
+          items={props.permissions}
+          onChange={(v) => set("permissions", v)}
+          newItem={() => ({ key: "", text: "" })}
+          itemNoun="permission"
+          itemTitle={(p) => PERMISSION_OPTIONS.find((o) => o.value === p.key)?.label ?? p.key}
+          maxItems={40}
+          required={false}
+          hint="Each one shows under its name on the permission screen, with what holding it lets somebody do."
+          render={(item, setItem) => (
+            <>
+              <SelectField label="Permission" name="key" value={item.key || undefined} options={PERMISSION_OPTIONS} onChange={(key) => setItem({ ...item, key: key ?? "" })} />
+              <TextField label="What it lets somebody do" name="text" value={item.text} onChange={(text) => setItem({ ...item, text })} max={400} multiline rows={2} required />
+            </>
+          )}
+        />
+      </Section>
+      <Section title={GUIDE_HEADING("setup")}>
+        <RichTextField label="What is done once, and by whom" name="setup" value={props.setup} onChange={(v) => set("setup", v)} maxItems={80} />
+      </Section>
+      <Section title={GUIDE_HEADING("tasks")}>
+        <ListField<GuideTask>
+          label="Tasks"
+          name="tasks"
+          items={props.tasks}
+          onChange={(v) => set("tasks", v)}
+          newItem={() => ({ title: "", body: [{ type: "list", ordered: true, items: [""] }] })}
+          itemNoun="task"
+          itemTitle={(task) => task.title}
+          maxItems={30}
+          hint="Each a heading of its own, with numbered steps. The words on the screen in bold."
+          render={(item, setItem) => (
+            <>
+              <Row>
+                <TextField label="Task" name="title" value={item.title} onChange={(title) => setItem({ ...item, title })} max={SHORT} required />
+                <AnchorField value={item.anchor} onChange={(anchor) => setItem({ ...item, anchor })} />
+              </Row>
+              <RichTextField label="Steps" name="body" value={item.body} onChange={(body) => setItem({ ...item, body })} maxItems={60} />
+            </>
+          )}
+        />
+      </Section>
+      <Section title={GUIDE_HEADING("settings")}>
+        <ListField<GuideSetting>
+          label="Settings"
+          name="settings"
+          items={props.settings}
+          onChange={(v) => set("settings", v)}
+          newItem={() => ({ name: "", body: [{ type: "paragraph", text: "" }] })}
+          itemNoun="setting"
+          itemTitle={(s) => s.name}
+          maxItems={40}
+          required={false}
+          hint="Left empty, the page says the module has no settings of its own."
+          render={(item, setItem) => (
+            <>
+              <Row>
+                <TextField label="Setting" name="name" value={item.name} onChange={(name) => setItem({ ...item, name })} max={SHORT} required />
+                <TextField label="Where it is" name="where" value={item.where} onChange={(where) => setItem({ ...item, where: where || undefined })} max={SHORT} hint="“Settings › Pipeline”." />
+              </Row>
+              <RichTextField label="What it changes" name="body" value={item.body} onChange={(body) => setItem({ ...item, body })} maxItems={40} />
+            </>
+          )}
+        />
+      </Section>
+      <Section title={GUIDE_HEADING("faq")}>
+        <ListField<GuideQuestion>
+          label="Questions"
+          name="faq"
+          items={props.faq}
+          onChange={(v) => set("faq", v)}
+          newItem={() => ({ question: "", answer: [{ type: "paragraph", text: "" }] })}
+          itemNoun="question"
+          itemTitle={(q) => q.question}
+          maxItems={40}
+          render={(item, setItem) => (
+            <>
+              <TextField label="Question" name="question" value={item.question} onChange={(question) => setItem({ ...item, question })} max={300} required />
+              <RichTextField label="Answer" name="answer" value={item.answer} onChange={(answer) => setItem({ ...item, answer })} maxItems={30} />
+            </>
+          )}
+        />
+      </Section>
+      <Section title="Read next">
+        <ListField<GuideRelated>
+          label="Other guides"
+          name="related"
+          items={related}
+          onChange={(v) => set("related", v.map((r) => r.key).filter(Boolean))}
+          newItem={() => ({ key: "" })}
+          itemNoun="guide"
+          itemTitle={(r) => MODULE_OPTIONS.find((o) => o.value === r.key)?.label ?? r.key}
+          maxItems={12}
+          required={false}
+          hint="By module. Each shows once its guide is published."
+          render={(item, setItem) => <SelectField label="Module" name="key" value={item.key || undefined} options={MODULE_OPTIONS} onChange={(key) => setItem({ key: key ?? "" })} />}
+        />
+      </Section>
+    </>
+  );
+}
+
+function HelpIndexForm({ props, onChange }: FormProps<"helpIndex">) {
+  const set = <K extends keyof HelpIndexProps>(key: K, value: HelpIndexProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        The guides are listed by themselves once each is published, grouped by the products that include their modules. These are the words around them.
+      </p>
+      <Row>
+        <TextField label="Search box" name="searchLabel" value={props.searchLabel} onChange={(v) => set("searchLabel", v)} max={LABEL} required />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Above the modules every product has" name="everyProductHeading" value={props.everyProductHeading} onChange={(v) => set("everyProductHeading", v)} max={SHORT} required />
+      <TextField label="While no guide is published" name="emptyText" value={props.emptyText} onChange={(v) => set("emptyText", v)} max={BODY} multiline rows={2} required />
+    </>
+  );
+}
+
+type HeroTab = NonNullable<HeroProps["previewTabs"]>[number];
+type TrustItem = TrustStripProps["items"][number];
+type ContactItem = ContactOptionsProps["items"][number];
+
+function TrustStripForm({ props, onChange }: FormProps<"trustStrip">) {
+  return (
+    <ListField<TrustItem>
+      label="Reasons"
+      name="items"
+      items={props.items}
+      onChange={(items) => onChange({ ...props, items })}
+      newItem={() => ({ icon: "check", text: "" })}
+      itemNoun="reason"
+      itemTitle={(item) => item.text}
+      maxItems={8}
+      hint="Short — four to six words each. Only facts you can stand behind: they are read as claims."
+      render={(item, set) => (
+        <Row>
+          <TextField label="Words" name="text" value={item.text} onChange={(text) => set({ ...item, text })} max={80} required />
+          <IconField name="icon" value={item.icon} onChange={(icon) => set({ ...item, icon })} />
+        </Row>
+      )}
+    />
+  );
+}
+
+type FlowStep = WorkflowProps["steps"][number];
+type FlowLine = FlowStep["lines"][number];
+
+function WorkflowForm({ props, onChange }: FormProps<"workflow">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<FlowStep>
+        label="Steps"
+        name="steps"
+        items={props.steps}
+        onChange={(steps) => onChange({ ...props, steps })}
+        newItem={() => ({ icon: "check", title: "", heading: "", body: "", lines: [] })}
+        itemNoun="step"
+        itemTitle={(item) => item.title}
+        maxItems={8}
+        hint="Two to eight, in order. They take turns along a line; a visitor can pick one."
+        render={(item, set) => (
+          <>
+            <Row>
+              <TextField label="Step" name="title" value={item.title} onChange={(title) => set({ ...item, title })} max={40} required placeholder="Invoice" />
+              <TextField label="Under it" name="caption" value={item.caption} onChange={(caption) => set({ ...item, caption })} max={40} placeholder="IRN ✓" />
+              <IconField name="icon" value={item.icon} onChange={(icon) => set({ ...item, icon })} />
+            </Row>
+            <TextField label="Heading" name="heading" value={item.heading} onChange={(heading) => set({ ...item, heading })} max={SHORT} required />
+            <TextField label="Sentence" name="body" value={item.body} onChange={(body) => set({ ...item, body })} max={400} multiline rows={2} required />
+            <ListField<FlowLine>
+              label="Sample lines"
+              name="lines"
+              items={item.lines ?? []}
+              onChange={(lines) => set({ ...item, lines })}
+              newItem={() => ({ label: "", value: "" })}
+              itemNoun="line"
+              itemTitle={(line) => line.label}
+              maxItems={5}
+              hint="What the step makes, a line each — the last one is shown bold. Sample figures."
+              render={(line, setLine) => (
+                <Row>
+                  <TextField label="Label" name="label" value={line.label} onChange={(label) => setLine({ ...line, label })} max={60} required />
+                  <TextField label="Value" name="value" value={line.value} onChange={(value) => setLine({ ...line, value })} max={40} required />
+                </Row>
+              )}
+            />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+type AiQuestion = AiShowcaseProps["questions"][number];
+
+function AiShowcaseForm({ props, onChange }: FormProps<"aiShowcase">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<AiQuestion>
+        label="Questions"
+        name="questions"
+        items={props.questions}
+        onChange={(questions) => onChange({ ...props, questions })}
+        newItem={() => ({ question: "", answer: "" })}
+        itemNoun="question"
+        itemTitle={(item) => item.question}
+        maxItems={6}
+        hint="Each answer's first sentence is the figure, shown brighter. Sample answers — write ones the product really gives."
+        render={(item, set) => (
+          <>
+            <TextField label="Question" name="question" value={item.question} onChange={(question) => set({ ...item, question })} max={SHORT} required />
+            <TextField label="Answer" name="answer" value={item.answer} onChange={(answer) => set({ ...item, answer })} max={600} multiline rows={3} required />
+          </>
+        )}
+      />
+      <TextField label="Small print under the questions" name="note" value={props.note} onChange={(note) => onChange({ ...props, note })} max={SHORT} placeholder="Processed in India · credits in every plan" />
+    </>
+  );
+}
+
+function AiTeamForm({ props, onChange }: FormProps<"aiTeam">) {
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        The teammates themselves — each face, name, role and job — come from the product, so one added there is on the page by itself. These are the words around them; the link sits in the Deskzo AI band at the end.
+      </p>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <TextField label="Small print in the Deskzo AI band" name="note" value={props.note} onChange={(note) => onChange({ ...props, note })} max={SHORT} placeholder="In every plan, on the workspace's AI credits." />
+      <ActionField label="Link in the band" name="action" value={props.action} onChange={(action) => onChange({ ...props, action })} />
+    </>
+  );
+}
+
+function LiveDemoForm({ props, onChange }: FormProps<"liveDemo">) {
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        The demo itself — reading the visitor&apos;s website, their pipeline, three prospects from the news, an email and a quote — is the product&apos;s. These are the words around it; the button at the end is the site&apos;s sign-up link.
+      </p>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <TextField label="Example in the box" name="placeholder" value={props.placeholder} onChange={(placeholder) => onChange({ ...props, placeholder })} max={SHORT} placeholder="acmepumps.in" />
+      <TextField label="Small print under the box" name="note" value={props.note} onChange={(note) => onChange({ ...props, note })} max={SHORT} placeholder="No sign-up to see it." />
+    </>
+  );
+}
+
+function AiTeamDemoForm({ props, onChange }: FormProps<"aiTeamDemo">) {
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        Deskzo AI and the six teammates at work on Deskzo&apos;s own screens with a sample company — the screens and the steps — are the product&apos;s, and run no AI. These are the words around them.
+      </p>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <TextField label="Small print under it" name="note" value={props.note} onChange={(note) => onChange({ ...props, note })} max={SHORT} placeholder="A replay on Deskzo's own screens with a sample company — nothing here runs AI." />
+    </>
+  );
+}
+
+function ContactOptionsForm({ props, onChange }: FormProps<"contactOptions">) {
+  return (
+    <>
+      <SectionHeadFields props={props} onChange={onChange} />
+      <ListField<ContactItem>
+        label="Ways to reach you"
+        name="items"
+        items={props.items}
+        onChange={(items) => onChange({ ...props, items })}
+        newItem={() => ({ icon: "mail", title: "", body: "", action: { kind: "link", label: "", href: "/contact" } })}
+        itemNoun="card"
+        itemTitle={(item) => item.title}
+        maxItems={4}
+        render={(item, set) => (
+          <>
+            <Row>
+              <TextField label="Title" name="title" value={item.title} onChange={(title) => set({ ...item, title })} max={SHORT} required />
+              <IconField name="icon" value={item.icon} onChange={(icon) => set({ ...item, icon })} />
+            </Row>
+            <TextField label="Words" name="body" value={item.body} onChange={(body) => set({ ...item, body })} max={BODY} multiline rows={2} />
+            <ActionField label="Link" name="action" value={item.action} onChange={(action) => action && set({ ...item, action })} />
+          </>
+        )}
+      />
+    </>
+  );
+}
+
+function ProductStripForm({ props, onChange }: FormProps<"productStrip">) {
+  const set = <K extends keyof ProductStripProps>(key: K, value: ProductStripProps[K]) => onChange({ ...props, [key]: value });
+  return (
+    <>
+      <p className="rounded-md border border-info/30 bg-info-bg px-3 py-2 text-xs text-info">
+        Every product is in the strip by itself — its icon, name and line, linking to its page — in the order of the Product menu. These are the words around it.
+      </p>
+      <Row>
+        <TextField label="Eyebrow" name="eyebrow" value={props.eyebrow} onChange={(v) => set("eyebrow", v)} max={80} />
+        <AnchorField value={props.anchor} onChange={(v) => set("anchor", v)} />
+      </Row>
+      <TextField label="Heading" name="heading" value={props.heading} onChange={(v) => set("heading", v)} max={HEADING} required />
+      <TextField label="Introduction" name="intro" value={props.intro} onChange={(v) => set("intro", v)} max={BODY} multiline rows={2} />
+      <ActionField label="Link under the strip" name="action" value={props.action} onChange={(v) => set("action", v)} />
+    </>
+  );
+}
+
+/** The form for one block, by its type. */
+export function BlockForm({ block, onChange }: { block: SiteBlock; onChange: (next: SiteBlock) => void }) {
+  switch (block.type) {
+    case "hero":
+      return <HeroForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "pageHeader":
+      return <PageHeaderForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "featureGrid":
+      return <FeatureGridForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "moduleGrid":
+      return <ModuleGridForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "richText":
+      return <RichTextForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "imageText":
+      return <ImageTextForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "stats":
+      return <StatsForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "faq":
+      return <FaqForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "cta":
+      return <CtaForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "pricingTable":
+      return <PricingTableForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "securityHighlights":
+      return <SecurityHighlightsForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "contactForm":
+      return <ContactFormForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "logoCloud":
+      return <LogoCloudForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "testimonial":
+      return <TestimonialForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "productPreviews":
+      return <ProductPreviewsForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "workspaceSignin":
+      return <WorkspaceSigninForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "signupForm":
+      return <SignupFormForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "comparisonTable":
+      return <ComparisonTableForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "stackSavings":
+      return <StackSavingsForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "relatedLinks":
+      return <RelatedLinksForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "moduleHighlights":
+      return <ModuleHighlightsForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "signatureGenerator":
+      return <SignatureGeneratorForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "productVsSuite":
+      return <ProductVsSuiteForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "helpGuide":
+      return <HelpGuideForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "helpIndex":
+      return <HelpIndexForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "productStrip":
+      return <ProductStripForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "trustStrip":
+      return <TrustStripForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "contactOptions":
+      return <ContactOptionsForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "workflow":
+      return <WorkflowForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "aiShowcase":
+      return <AiShowcaseForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "aiTeam":
+      return <AiTeamForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "liveDemo":
+      return <LiveDemoForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    case "aiTeamDemo":
+      return <AiTeamDemoForm props={block.props} onChange={(props) => onChange({ ...block, props })} />;
+    default:
+      return <p className="text-sm text-muted">This block&apos;s type is not known to this editor. It is kept as it is.</p>;
+  }
+}

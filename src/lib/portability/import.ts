@@ -1,0 +1,328 @@
+import Papa from "papaparse";
+import ExcelJS from "exceljs";
+import { desanitizeCsvCell } from "@/lib/csv";
+import { plainError } from "@/lib/plain-error";
+import { FileTooLarge, loadWorkbook, SHEET_LIMITS, type SheetLimits } from "./workbook";
+import { customSheetFor } from "@/lib/custom-fields/sheets";
+import { getImporter, IMPLEMENTED_IMPORTS } from "./importers";
+import type { Importer, PlannedRow } from "./importers/types";
+
+/**
+ * Bringing data in.
+ *
+ * ## Why a dry run is not optional
+ *
+ * Export and import fail in opposite ways. A bad export wastes a download. A bad import writes over
+ * records that were correct, creates duplicates of ones that already existed, and does it silently
+ * across thousands of rows in a second — and the person who notices is usually a customer, weeks
+ * later, when their address is wrong on an invoice.
+ *
+ * So there are two phases and they cannot be collapsed. `plan()` reads the file and works out
+ * exactly what would happen, row by row, writing nothing. `apply()` carries out a plan somebody has
+ * looked at. Anything you would want to know afterwards — what will be created, what will be
+ * overwritten and with what, which rows are unusable and why — is on the screen before a single row
+ * is written.
+ *
+ * ## Matching
+ *
+ * Every importable entity matches on the natural key from entities.ts. A row whose key matches an
+ * existing record is an **update**; one that does not is a **create**. This is what makes an import
+ * re-runnable: running the same file twice produces the same result rather than twice the rows,
+ * which matters because the second run is usually somebody fixing a mistake from the first.
+ *
+ * ## What import deliberately cannot do
+ *
+ * It cannot create an order, a payment or a journal entry. Those are records of processes that also
+ * wrote ledger entries, stock movements and audit rows — see areas.ts. An imported one would exist
+ * without any of that.
+ *
+ * This file parses and orchestrates; what each area means lives in `importers/`, one module per
+ * area, against the contract in `importers/types.ts`.
+ */
+
+export type { RowAction, PlannedRow, FieldChange } from "./importers/types";
+export { IMPLEMENTED_IMPORTS };
+
+export type ImportPlan = {
+  area: string;
+  totalRows: number;
+  creates: number;
+  updates: number;
+  skips: number;
+  errors: number;
+  rows: PlannedRow[];
+  /** Columns in the file that no field matched. Usually a wrong template or a renamed heading. */
+  unknownColumns: string[];
+  /**
+   * The rows' notices (`PlannedRow.notice`), one per wording, with the lines each applies to. `danger`
+   * for one somebody must not miss — the difference an opening balance sends to equity.
+   */
+  notices: { text: string; lines: number[]; tone?: "danger" }[];
+  /** Headings read as a template column by the importer's `headerAliases` — "Basic Salary" as "Basic". */
+  readAs: { from: string; to: string }[];
+};
+
+/** A heading as compared with the aliases: "A/c No." and "a c no" are the same. */
+const headingKey = (h: string) => h.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/**
+ * The rows with their headings renamed to the template's, through the importer's `headerAliases`, and
+ * what was read as what. Two headings that would land in one column refuse the file: which of them to
+ * believe is the uploader's call, not ours.
+ */
+export function readHeadings(
+  importer: Pick<Importer, "templateColumns" | "headerAliases" | "extraColumns">,
+  rows: Record<string, string>[],
+): { rows: Record<string, string>[]; readAs: { from: string; to: string }[] } {
+  if (!importer.headerAliases) return { rows, readAs: [] };
+  const byKey = new Map<string, string>();
+  for (const column of [...importer.templateColumns, ...(importer.extraColumns ?? [])]) byKey.set(headingKey(column), column);
+  for (const [column, aliases] of Object.entries(importer.headerAliases)) for (const a of aliases) byKey.set(headingKey(a), column);
+
+  const headings = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+  const rename = new Map<string, string>();
+  const claimed = new Map<string, string>();
+  for (const h of headings) {
+    const column = byKey.get(headingKey(h));
+    if (!column) continue;
+    const earlier = claimed.get(column);
+    if (earlier) throw new Error(`"${earlier}" and "${h}" would both be read as ${column} — keep one of them.`);
+    claimed.set(column, h);
+    rename.set(h, column);
+  }
+  const readAs = [...rename].filter(([from, to]) => from !== to).map(([from, to]) => ({ from, to }));
+  if (readAs.length === 0 && [...rename].every(([from, to]) => from === to)) return { rows, readAs };
+  return {
+    rows: rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [rename.get(k) ?? k, v]))),
+    readAs,
+  };
+}
+
+/**
+ * Parses CSV or XLSX into plain rows keyed by header.
+ *
+ * Security audit round two, 13 Nov 2026 (R2-19): an .xlsx is opened only once its parts are known to unpack within
+ * the caps (./workbook.ts), and either kind is refused past `SHEET_LIMITS.rows` rows or `.columns` columns
+ * (`limits` widens them for a caller that needs more — the switch's whole-history files). Refusals throw FileTooLarge.
+ */
+export async function parseFile(base64: string, filename: string, limits: SheetLimits = {}): Promise<Record<string, string>[]> {
+  const caps = { ...SHEET_LIMITS, ...limits };
+  const buffer = Buffer.from(base64, "base64");
+
+  if (/\.csv$/i.test(filename)) {
+    const data: Record<string, string>[] = [];
+    const stop: { refused?: FileTooLarge } = {};
+    Papa.parse<Record<string, string>>(buffer.toString("utf8"), {
+      header: true,
+      skipEmptyLines: true,
+      transformHeader: (h) => h.trim(),
+      // Our own CSV export prefixes an apostrophe to anything Excel would read as a formula. Taking
+      // it off here is what keeps that protection from corrupting the value it protects.
+      transform: (v) => desanitizeCsvCell(v),
+      // Row by row, so the parse stops at the cap rather than after building every row.
+      step: (result, parser) => {
+        const columns = Object.keys(result.data).length;
+        if (columns > caps.columns) stop.refused = new FileTooLarge(`That file has ${columns} columns — at most ${caps.columns}.`);
+        else if (data.length >= caps.rows) stop.refused = new FileTooLarge(`That file has more than ${caps.rows.toLocaleString("en-IN")} rows. Split it and import in batches.`);
+        if (stop.refused) return parser.abort();
+        data.push(result.data);
+      },
+    });
+    if (stop.refused) throw stop.refused;
+    return data;
+  }
+
+  const wb = await loadWorkbook(buffer, filename.split(/[\\/]/).pop() || "The file", caps);
+  // The first sheet that is not our own cover page — so a file we exported can be edited and handed
+  // straight back without anybody having to delete a sheet first.
+  const sheet = wb.worksheets.find((w) => w.name !== "About this export") ?? wb.worksheets[0];
+  if (!sheet) return [];
+
+  const headers: string[] = [];
+  sheet.getRow(1).eachCell((cell, col) => {
+    headers[col] = String(cell.value ?? "").trim();
+  });
+
+  const rows: Record<string, string>[] = [];
+  sheet.eachRow((row, index) => {
+    if (index === 1) return;
+    const out: Record<string, string> = {};
+    let any = false;
+    row.eachCell({ includeEmpty: true }, (cell, col) => {
+      const header = headers[col];
+      if (!header) return;
+      const v = cell.value;
+      // ExcelJS returns a union: a primitive, a Date, or an object for rich text, a hyperlink or
+      // a formula. A cell holding a formula result is read for its value, not its expression.
+      out[header] = cellText(v).trim();
+      if (out[header]) any = true;
+    });
+    if (any) rows.push(out);
+  });
+  return rows;
+}
+
+/** ExcelJS cell values are a union; this flattens every shape to the text a person would see. */
+export function cellText(v: ExcelJS.CellValue): string {
+  if (v === null || v === undefined) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === "object") {
+    const o = v as { text?: unknown; result?: unknown; richText?: { text: string }[] };
+    if (Array.isArray(o.richText)) return o.richText.map((r) => r.text).join("");
+    if (o.text !== undefined) return String(o.text);
+    if (o.result !== undefined) return String(o.result);
+    return "";
+  }
+  return String(v);
+}
+
+/** Columns each importer understands, for the template and the unknown-column warning. */
+export const TEMPLATE_COLUMNS: Record<string, string[]> = Object.fromEntries(
+  IMPLEMENTED_IMPORTS.map((area) => [area, getImporter(area)!.templateColumns]),
+);
+
+/** The custom-field columns an importer carries for this person (src/lib/custom-fields/sheets.ts), or null. */
+async function customFor(importer: NonNullable<ReturnType<typeof getImporter>>, actorUserId: string) {
+  return importer.customEntity ? customSheetFor(importer.customEntity, actorUserId, importer.templateColumns) : null;
+}
+
+/** An area's template for this person: the built-in columns, then the workspace's own fields they may import. */
+export async function templateColumnsFor(area: string, actorUserId: string): Promise<string[]> {
+  const importer = getImporter(area);
+  if (!importer) return [];
+  const custom = await customFor(importer, actorUserId);
+  return [...importer.templateColumns, ...(custom?.headers ?? [])];
+}
+
+/**
+ * The actor is required rather than optional, because some rows can only be judged against who is
+ * asking. A role a person may not grant is not an unusable row in general — it is unusable *by
+ * them*, and the preview has to say so before they commit rather than after.
+ */
+/**
+ * Part of a file: rows `from` (0 = the first under the headings) for `count`. A large file is previewed and imported a
+ * window at a time, each its own request, so none outlives Cloudflare's 100 seconds (owner, 30 Oct 2026: 13,979 leads
+ * went in with nothing on screen to say how many). Row numbers stay the file's own.
+ */
+export type RowWindow = { from: number; count: number };
+
+export type FailedRow = { line: number; error: string; row?: Record<string, string> };
+
+export async function plan(
+  area: string,
+  rows: Record<string, string>[],
+  actorUserId: string,
+  window?: RowWindow,
+): Promise<ImportPlan> {
+  const importer = getImporter(area);
+  if (!importer) throw new Error(`No importer for ${area}`);
+  return planWith(importer, area, rows, actorUserId, window);
+}
+
+/**
+ * `plan` for an importer that isn't an export area — the payroll migration import, which only
+ * payroll may run and which has nothing to export (src/actions/payroll-import.ts).
+ */
+export async function planWith(
+  importer: Importer,
+  area: string,
+  fileRows: Record<string, string>[],
+  actorUserId: string,
+  window?: RowWindow,
+): Promise<ImportPlan> {
+  const { rows, readAs } = readHeadings(importer, fileRows);
+  const from = window ? Math.max(0, window.from) : 0;
+  const until = window ? Math.min(rows.length, from + Math.max(1, window.count)) : rows.length;
+
+  // Grown as the file is read, so a row may reference a key an earlier row will create. See the
+  // note on ImportContext — without it an exported chart of accounts cannot be loaded back in one
+  // pass, because every child is refused for a parent that is two rows above it in the same file.
+  const custom = await customFor(importer, actorUserId);
+  const ctx = { actorUserId, area, pendingKeys: new Set<string>(), custom };
+  const planned: PlannedRow[] = [];
+  for (let i = from; i < until; i++) {
+    const result = await importer.plan(rows[i]!, i + 2, ctx);
+    if (result.action === "create" && result.key) ctx.pendingKeys.add(result.key);
+    planned.push(result);
+  }
+
+  const known = new Set([...importer.templateColumns, ...(importer.extraColumns ?? []), ...(custom?.headers ?? [])]);
+  const present = new Set(rows.flatMap((r) => Object.keys(r)));
+  const unknownColumns = [...present].filter((c) => c && !known.has(c));
+  const notices = new Map<string, number[]>();
+  for (const r of planned) if (r.notice) notices.set(r.notice, [...(notices.get(r.notice) ?? []), r.line]);
+
+  return {
+    area,
+    totalRows: rows.length,
+    creates: planned.filter((r) => r.action === "create").length,
+    updates: planned.filter((r) => r.action === "update").length,
+    skips: planned.filter((r) => r.action === "skip").length,
+    errors: planned.filter((r) => r.action === "error").length,
+    rows: planned,
+    unknownColumns,
+    notices: [...notices].map(([text, lines]) => ({ text, lines })),
+    readAs,
+  };
+}
+
+/**
+ * Carries out a plan.
+ *
+ * Row by row rather than one transaction, deliberately. A single transaction means one unusable row
+ * in a thousand rolls back the other nine hundred and ninety-nine, and the person then has to find
+ * that row with no information beyond "it failed". Per-row means the good rows land and the report
+ * names the ones that did not.
+ */
+export async function apply(
+  area: string,
+  rows: Record<string, string>[],
+  actorUserId: string,
+  window?: RowWindow,
+): Promise<{ created: number; updated: number; skipped: number; failed: FailedRow[] }> {
+  const importer = getImporter(area);
+  if (!importer) throw new Error(`No importer for ${area}`);
+  return applyWith(importer, area, rows, actorUserId, window);
+}
+
+/** `apply` for an importer that isn't an export area — see `planWith`. */
+export async function applyWith(
+  importer: Importer,
+  area: string,
+  fileRows: Record<string, string>[],
+  actorUserId: string,
+  window?: RowWindow,
+): Promise<{ created: number; updated: number; skipped: number; failed: FailedRow[] }> {
+  const { rows } = readHeadings(importer, fileRows);
+  const ctx = { actorUserId, area, pendingKeys: new Set<string>(), custom: await customFor(importer, actorUserId) };
+  const planned = await planWith(importer, area, rows, actorUserId, window);
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+  // With the row as read, so the ones that failed can be downloaded, put right and imported again.
+  const failed: FailedRow[] = [];
+
+  for (const row of planned.rows) {
+    if (row.action === "error") {
+      failed.push({ line: row.line, error: row.error ?? "Unusable row.", row: rows[row.line - 2] });
+      continue;
+    }
+    if (row.action === "skip") {
+      skipped += 1;
+      continue;
+    }
+
+    const source = rows[row.line - 2]!;
+    try {
+      await importer.apply(source, ctx);
+      if (row.action === "create") created += 1;
+      else updated += 1;
+    } catch (err) {
+      // Security audit round two, 13 Nov 2026 (low): an importer's own refusal is shown as written; a database error
+      // names tables and columns, so it is logged and the row says only that it failed.
+      failed.push({ line: row.line, error: plainError(err, "Failed to write."), row: source });
+    }
+  }
+
+  return { created, updated, skipped, failed };
+}

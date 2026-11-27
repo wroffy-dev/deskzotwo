@@ -1,0 +1,454 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import { requireModuleAccess, requireModuleUser } from "@/lib/modules-access";
+import { recordAudit } from "@/lib/audit";
+import { toPlain } from "@/lib/serialize";
+import { postExchangeDifferenceToLedger, postPaymentToLedger } from "@/lib/ledger/journal";
+import { bookingRate, settlementRateError } from "@/lib/ledger/posting";
+import { formatMoney, formatRate, isBaseCurrency } from "@/lib/currency";
+import { hasEffectivePermission } from "@/actions/permission";
+import { documentAccess, mayAccess, mayAddTo } from "@/lib/authz/access";
+import { ensureHeadOffice } from "@/lib/branches/identity";
+import { balanceSummaryFor } from "@/lib/receivables/balance-summary";
+import { partyStatement } from "@/lib/receivables/statement";
+import { agingReportFor, type AgingParams } from "@/lib/receivables/aging";
+import { exportAging } from "@/lib/receivables/aging-export";
+import type { ExportPayload } from "@/actions/data-export";
+import {
+  agingBucket,
+  daysOverdue,
+  emptyAging,
+  settleInvoice,
+  type AgingBucket,
+} from "@/lib/receivables";
+import type { ActionResult } from "@/actions/company";
+import { claimRequest } from "@/lib/request-once";
+import { bankAccountOptions, bankCurrencyRefusal } from "@/lib/finance/bank-currency";
+import { lockSettlement, SettlementRefused } from "@/lib/finance/settlement-lock";
+import { clipOrNull, TEXT_MAX } from "@/lib/text/bounded";
+import { msmeOpenBills } from "@/lib/payables/msme";
+import { workspaceClock } from "@/lib/time/workspace";
+import { workspacePack } from "@/lib/country-pack";
+
+/**
+ * Payables — the mirror of receivables.
+ *
+ * A bill is settled exactly the way an invoice is, by payments allocated against it, so the same
+ * `settleInvoice` and aging maths apply. What differs is direction: these payments are money out,
+ * and the balance is what we owe rather than what we're owed. A distributor's or an OEM's credit
+ * note set against a bill (src/actions/vendor-credit.ts) takes it down as a credit note does an
+ * invoice.
+ */
+const billSettlementInclude = {
+  paidBefore: true,
+  payments: { select: { amount: true } },
+  creditsReceived: { select: { amount: true } },
+  vendorCredits: { select: { amount: true } },
+} as const;
+
+function settlementOf(bill: {
+  total: Prisma.Decimal | number;
+  /** What it had settled in the old system, when it was brought from there (src/lib/receivables.ts). */
+  paidBefore: Prisma.Decimal | number;
+  payments: { amount: Prisma.Decimal | number }[];
+  creditsReceived: { amount: Prisma.Decimal | number }[];
+  vendorCredits: { amount: Prisma.Decimal | number }[];
+}) {
+  return settleInvoice(
+    Number(bill.total),
+    bill.payments.reduce((t, p) => t + Number(p.amount), 0),
+    bill.creditsReceived.reduce((t, c) => t + Number(c.amount), 0) + bill.vendorCredits.reduce((t, c) => t + Number(c.amount), 0),
+    Number(bill.paidBefore),
+  );
+}
+
+/**
+ * Records money paid to a vendor against one of their bills.
+ *
+ * A bill in another currency is paid in that currency at the rate the money actually went out at
+ * ("Rate on the day"), defaulting to the bill's own. The payment posts Dr AP / Cr Bank at that rate, and
+ * the exchange difference against the bill's rate is a realised gain or loss — the payable's mirror of
+ * `recordInvoicePayment`: $1,180 of a bill booked at ₹83 (₹97,940) paid at ₹82.50 is ₹97,350 out of
+ * the bank and a gain of ₹590. A rupee bill is paid at 1.
+ */
+export async function recordBillPayment(input: {
+  billId: string;
+  amount: string;
+  paidOn: string;
+  method: "BANK_TRANSFER" | "UPI" | "CHEQUE" | "CASH" | "CARD" | "OTHER";
+  reference?: string;
+  notes?: string;
+  /** ₹ per unit of the bill's currency, for a foreign bill. Left out, the bill's own rate. */
+  exchangeRate?: string | number;
+  /** The bank account it went out of (owner, 30 Oct 2026); left out, the default. A foreign one pays only in its own currency. */
+  bankAccountId?: string;
+  /** One for all of a form's tries: the same request again is the payment it made (src/lib/request-once.ts). */
+  requestId?: string;
+}): Promise<ActionResult<{ id: string }>> {
+  const user = await requireModuleUser("payables");
+  // The same permission its receivables twin asks for. Payables checked only that the module was in the
+  // plan, so anybody who could open a bill could pay it — and posting money out of the bank is the one
+  // thing in this module that most needs asking.
+  if (!(await hasEffectivePermission(user.id, "payments.record"))) {
+    return { ok: false, error: "You don't have permission to record payments." };
+  }
+  const amount = Number(input.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: "Enter an amount greater than zero." };
+  if (!input.paidOn) return { ok: false, error: "Pick the date it was paid." };
+
+  const bill = await db.tradeDocument.findUnique({
+    where: { id: input.billId },
+    select: {
+      id: true, companyId: true, docType: true, status: true, docNumber: true, total: true, branchId: true,
+      currency: true, exchangeRate: true, ...billSettlementInclude,
+      company: { select: { ownerUserId: true, relationshipType: true } },
+    },
+  });
+  // A bill this person can open, on a vendor they may record payments for — the permission says they
+  // may pay bills, not whose.
+  if (!bill || !(await mayAccess(user.id, "documents", "view", bill.id)) || !(await mayAddTo(user.id, "payments", bill.company))) {
+    return { ok: false, error: "That bill no longer exists." };
+  }
+  if (bill.docType !== "BILL") return { ok: false, error: "Payments out are recorded against a vendor bill." };
+  if (bill.status === "DRAFT") return { ok: false, error: "Record the bill before paying it." };
+  if (bill.status === "CANCELLED") return { ok: false, error: "This bill has been cancelled." };
+
+  const settlement = settlementOf(bill);
+  // Overpaying a vendor isn't impossible, but it's almost always a typo — and left uncapped it
+  // quietly turns the payables total negative, which hides what's still owed elsewhere.
+  if (amount > settlement.balance + 0.01) {
+    return {
+      ok: false,
+      error:
+        settlement.balance < 0.01
+          ? "This bill is already settled in full."
+          : `Only ${formatMoney(settlement.balance, bill.currency)} is outstanding on this bill. Record the excess as a separate payment.`,
+    };
+  }
+
+  const given = input.exchangeRate === undefined || input.exchangeRate === "" ? null : Number(input.exchangeRate);
+  const rate = isBaseCurrency(bill.currency) ? 1 : (given ?? bookingRate(bill));
+  const rateError = settlementRateError(rate);
+  if (rateError) return { ok: false, error: rateError };
+  const bankAccountId = input.bankAccountId || null;
+  const bankRefusal = await bankCurrencyRefusal(bankAccountId, bill.currency);
+  if (bankRefusal) return { ok: false, error: bankRefusal };
+
+  // Paid by the branch the bill was raised on (a bill from before branches: the head office). Resolved
+  // before the transaction — the head office lookup uses its own connection.
+  const branchId = bill.branchId ?? (await ensureHeadOffice()).id;
+
+  // The same request again — a double click, a retry — is the payment it already made (src/lib/request-once.ts).
+  const claim = await claimRequest(input, "bill-payment", user.id);
+  if (claim.kind === "repeat") return { ok: true, data: { id: claim.recordId } };
+  if (claim.kind === "busy") return { ok: false, error: claim.error };
+
+  const payment = await db.$transaction(async (tx) => {
+    // Security audit, 11 Nov 2026 (SEC-12): the bill is locked and its balance read again here, so two payments
+    // recorded at once can't each pay the whole of it — and the status below is worked out from what is really
+    // on it now, not from the read before the transaction.
+    await lockSettlement(tx, { documents: [bill.id] });
+    const now = await tx.tradeDocument.findUnique({ where: { id: bill.id }, select: { total: true, status: true, ...billSettlementInclude } });
+    if (!now || now.status === "CANCELLED") throw new SettlementRefused("This bill has been cancelled.");
+    const balanceNow = settlementOf(now).balance;
+    if (amount > balanceNow + 0.01) {
+      throw new SettlementRefused(
+        balanceNow < 0.01
+          ? "This bill was settled in full a moment ago."
+          : `Only ${formatMoney(balanceNow, bill.currency)} is outstanding on this bill now. Record the excess as a separate payment.`,
+      );
+    }
+    const created = await tx.payment.create({
+      data: {
+        companyId: bill.companyId,
+        branchId,
+        direction: "PAID",
+        amount: new Prisma.Decimal(amount),
+        // In the bill's currency, at the rate it went out at, as a receipt against an invoice is
+        // (receivable.ts). The exchange difference below makes the payable clear by exactly the rupees
+        // the bill booked; the rest is a realised gain or loss.
+        currency: bill.currency,
+        exchangeRate: new Prisma.Decimal(rate),
+        paidOn: new Date(input.paidOn),
+        method: input.method,
+        // Typed text capped before it is stored (owner, 15 Nov 2026 — input bounds).
+        reference: clipOrNull(input.reference, TEXT_MAX.name),
+        notes: clipOrNull(input.notes, TEXT_MAX.notes),
+        bankAccountId,
+        recordedByUserId: user.id,
+      },
+      select: { id: true },
+    });
+    await tx.paymentAllocation.create({
+      data: { paymentId: created.id, documentId: bill.id, amount: new Prisma.Decimal(amount), allocatedByUserId: user.id },
+    });
+    await postPaymentToLedger(tx, created.id, user.id);
+    // The exchange difference on a foreign bill, if the rate moved between raising and paying it.
+    await postExchangeDifferenceToLedger(tx, {
+      paymentId: created.id,
+      documentId: bill.id,
+      allocatedAmount: amount,
+      userId: user.id,
+    });
+
+    const after = settleInvoice(
+      Number(now.total),
+      now.payments.reduce((t, p) => t + Number(p.amount), 0) + amount,
+      now.creditsReceived.reduce((t, c) => t + Number(c.amount), 0) + now.vendorCredits.reduce((t, c) => t + Number(c.amount), 0),
+      Number(now.paidBefore),
+    );
+    await tx.tradeDocument.update({
+      where: { id: bill.id },
+      data: { status: after.balance < 0.01 ? "PAID" : "PARTIALLY_PAID" },
+    });
+    return created;
+  })
+  .catch(async (err: unknown) => {
+    await claim.release();
+    if (err instanceof SettlementRefused) return err;
+    throw err;
+  });
+  if (payment instanceof SettlementRefused) return { ok: false, error: payment.message };
+  await claim.done(payment.id);
+
+  await recordAudit({
+    userId: user.id,
+    action: "CREATE",
+    entityType: "Payment",
+    entityId: payment.id,
+    entityLabel: `${formatMoney(amount, bill.currency)}${isBaseCurrency(bill.currency) ? "" : ` at ${formatRate(rate)}`} paid against ${bill.docNumber}`,
+  });
+
+  revalidatePath(`/documents/${bill.id}`);
+  revalidatePath(`/companies/${bill.companyId}`);
+  revalidatePath("/purchase/bills");
+  revalidatePath("/payables");
+  return { ok: true, data: { id: payment.id } };
+}
+
+/**
+ * The reads below are what we owe, so they take "View payments" as Receivables' do — checked before
+ * the database is asked. They were the plan alone, which put every vendor's balance in reach of
+ * anybody signed in, whatever their role.
+ */
+async function payablesViewer() {
+  const user = await requireModuleUser("payables");
+  return (await hasEffectivePermission(user.id, "payments.view")) ? user : null;
+}
+
+/**
+ * `payablesViewer` for the actions only Payables's own pages use: Payables open to the person as well. The actions other
+ * screens use keep `payablesViewer` alone (owner, 3 Nov 2026 — Phase 2 permission fixes, audit L-6).
+ */
+async function payablesViewerIfOpen(...args: Parameters<typeof payablesViewer>) {
+  await requireModuleAccess("payables");
+  return payablesViewer(...args);
+}
+
+/**
+ * Micro and small vendors' open bills against the MSMED Act's limit, soonest first (owner, 17 Nov 2026 — "build it with the
+ * 45 day warning"; src/lib/payables/msme.ts). The bills this person reaches; none outside India's pack.
+ */
+export async function msmePayablesWatch() {
+  const user = await payablesViewerIfOpen();
+  if (!user || !workspacePack().india) return [];
+  const [access, clock] = await Promise.all([documentAccess(user.id, "view"), workspaceClock()]);
+  return toPlain(await msmeOpenBills({ access, clock }));
+}
+
+export async function getBillSettlement(billId: string) {
+  const user = await payablesViewer();
+  if (!user || !(await mayAccess(user.id, "documents", "view", billId))) return null;
+  const bill = await db.tradeDocument.findUnique({
+    where: { id: billId },
+    select: {
+      id: true,
+      total: true,
+      paidBefore: true,
+      currency: true,
+      exchangeRate: true,
+      payments: {
+        orderBy: { createdAt: "desc" },
+        select: {
+          id: true,
+          amount: true,
+          createdAt: true,
+          payment: { select: { id: true, paidOn: true, method: true, reference: true } },
+        },
+      },
+      creditsReceived: { select: { amount: true } },
+      vendorCredits: {
+        orderBy: { createdAt: "desc" },
+        select: { id: true, amount: true, createdAt: true, vendorCredit: { select: { id: true, reference: true, date: true } } },
+      },
+    },
+  });
+  if (!bill) return null;
+  return toPlain({
+    ...settlementOf(bill),
+    // Paid in the old system, before it came to Deskzo — part of "paid" above, shown on its own.
+    paidBefore: Number(bill.paidBefore),
+    currency: bill.currency,
+    exchangeRate: bookingRate(bill),
+    payments: bill.payments,
+    vendorCredits: bill.vendorCredits,
+    // The accounts it can be paid from (owner, 30 Oct 2026): a foreign one only for a bill in its currency.
+    bankAccounts: (await bankAccountOptions()).filter((a) => !a.currency || a.currency === bill.currency),
+  });
+}
+
+/**
+ * What we owe each vendor, aged from the bill's due date.
+ *
+ * Deliberately the same buckets as receivables — a business talks about "over 90 days" the same way
+ * whichever direction the money is going, and two different scales would make the two reports
+ * impossible to read side by side.
+ */
+export async function payablesAging(params?: { search?: string }) {
+  const asOf = new Date();
+  const user = await payablesViewerIfOpen();
+  if (!user) return toPlain({ rows: [], totals: { buckets: emptyAging(), total: 0 }, asOf });
+
+  // The bills this person reaches, as the document lists have them (`documentAccess`) — inside an AND,
+  // because the engine's fragment may itself name `company`, and the search does too.
+  const bills = await db.tradeDocument.findMany({
+    where: {
+      AND: [
+        { docType: "BILL", status: { notIn: ["DRAFT", "CANCELLED", "PAID"] } },
+        ...(params?.search ? [{ company: { name: { contains: params.search, mode: "insensitive" as const } } }] : []),
+        await documentAccess(user.id, "view"),
+      ],
+    },
+    select: {
+      id: true,
+      docNumber: true,
+      issueDate: true,
+      dueDate: true,
+      total: true,
+      currency: true,
+      exchangeRate: true,
+      company: { select: { id: true, companySeq: true, name: true } },
+      ...billSettlementInclude,
+    },
+  });
+
+  const byVendor = new Map<
+    string,
+    {
+      id: string;
+      companySeq: number;
+      name: string;
+      buckets: Record<AgingBucket, number>;
+      total: number;
+      oldest: number;
+      billCount: number;
+      /** What of it is owed in other currencies, as the bills are written. */
+      foreign: Record<string, number>;
+    }
+  >();
+
+  for (const bill of bills) {
+    const settlement = settlementOf(bill);
+    if (settlement.balance < 0.01) continue;
+    // In rupees, at the rate the bill was booked at — what Accounts Payable holds for it (it was added as
+    // written, a $500 bill as ₹500, until 21 Oct 2026).
+    const rupees = Math.round(settlement.balance * bookingRate(bill) * 100) / 100;
+    const row =
+      byVendor.get(bill.company.id) ??
+      { id: bill.company.id, companySeq: bill.company.companySeq, name: bill.company.name, buckets: emptyAging(), total: 0, oldest: 0, billCount: 0, foreign: {} };
+    row.buckets[agingBucket(bill.dueDate, bill.issueDate, asOf)] += rupees;
+    row.total += rupees;
+    if (!isBaseCurrency(bill.currency)) row.foreign[bill.currency] = (row.foreign[bill.currency] ?? 0) + settlement.balance;
+    row.oldest = Math.max(row.oldest, daysOverdue(bill.dueDate, bill.issueDate, asOf));
+    row.billCount += 1;
+    byVendor.set(bill.company.id, row);
+  }
+
+  const rows = [...byVendor.values()].sort((a, b) => b.total - a.total);
+  const totals = rows.reduce(
+    (acc, row) => {
+      for (const key of Object.keys(acc.buckets) as AgingBucket[]) acc.buckets[key] += row.buckets[key];
+      acc.total += row.total;
+      return acc;
+    },
+    { buckets: emptyAging(), total: 0 },
+  );
+
+  return toPlain({ rows, totals, asOf });
+}
+
+/**
+ * The Vendor Balance Summary (owner, 21 Oct 2026; src/lib/receivables/balance-summary.ts): what we owe each
+ * vendor as of a day — open bills, unused credits (payments not set against a bill, vendor credit notes),
+ * journals and the balance, in rupees and in their own currency. Null for somebody who can't see payments.
+ */
+export async function vendorBalanceSummary(params?: { asOf?: string; search?: string }) {
+  const user = await payablesViewerIfOpen();
+  if (!user) return null;
+  return toPlain(await balanceSummaryFor(user.id, "AP", params));
+}
+
+/**
+ * The AP aging report (owner, 21 Oct 2026 — src/lib/receivables/aging.ts; Zoho's "AP Aging Summary By Bill
+ * Due Date"): what was open on each bill at the end of a day, in columns by how far past due (or how old)
+ * it was, in chosen intervals.
+ */
+export async function payablesAgingReport(params?: AgingParams) {
+  const user = await payablesViewerIfOpen();
+  if (!user) return null;
+  return toPlain(await agingReportFor(user.id, "AP", params));
+}
+
+/** The same report as a workbook, with every bill behind it (src/lib/receivables/aging-export.ts). */
+export async function exportPayablesAging(params?: AgingParams): Promise<ActionResult<ExportPayload>> {
+  const user = await payablesViewer();
+  if (!user) return { ok: false, error: "You can't see what we owe vendors." };
+  return exportAging(user, "AP", params);
+}
+
+/**
+ * A vendor's account, in rupees with each foreign line at its own rate (src/lib/receivables/statement.ts):
+ * bills credit what we owe, payments out and vendor credit notes debit it back down, and any exchange
+ * difference and journal naming them. `outstanding` is the net — what Accounts Payable holds for them, and
+ * their row in the Vendor Balance Summary; `currencies`, what is open in each other currency.
+ *
+ * A vendor out of reach answers as one that doesn't exist; reached, their whole account, as the summary
+ * counts it.
+ */
+export async function vendorStatement(companyId: string, opts?: { from?: string; to?: string }) {
+  const user = await payablesViewer();
+  if (!user || !(await mayAccess(user.id, "vendors", "view", companyId))) return null;
+  if (!(await hasEffectivePermission(user.id, "statements.view"))) return null;
+  const company = await db.company.findUnique({ where: { id: companyId }, select: { id: true, name: true } });
+  if (!company) return null;
+  const statement = await partyStatement("AP", companyId, opts);
+  return toPlain({
+    company,
+    entries: statement.lines,
+    billed: statement.invoiced,
+    paid: statement.received,
+    credited: statement.credited,
+    // Net of payments and credit notes not yet set against a bill: negative is an advance to the vendor.
+    outstanding: statement.balance,
+    currencies: statement.currencies,
+  });
+}
+
+/** Bills a payment can still be put against, for the record-payment picker. */
+export async function listOpenBills(companyId: string) {
+  const user = await payablesViewerIfOpen();
+  if (!user || !(await mayAccess(user.id, "vendors", "view", companyId))) return [];
+  const bills = await db.tradeDocument.findMany({
+    where: { AND: [{ companyId, docType: "BILL", status: { notIn: ["DRAFT", "CANCELLED", "PAID"] } }, await documentAccess(user.id, "view")] },
+    orderBy: { issueDate: "asc" },
+    select: { id: true, docNumber: true, issueDate: true, dueDate: true, total: true, ...billSettlementInclude },
+  });
+  return toPlain(
+    bills
+      .map((b) => ({ id: b.id, docNumber: b.docNumber, issueDate: b.issueDate, dueDate: b.dueDate, balance: settlementOf(b).balance }))
+      .filter((b) => b.balance > 0.01),
+  );
+}

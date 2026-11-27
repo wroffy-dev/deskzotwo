@@ -1,0 +1,359 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { db } from "@/lib/db";
+import { requireUser } from "@/lib/session";
+import { can } from "@/lib/authz/resolve";
+import { recordPermissionChange } from "@/lib/authz/audit";
+import { SYSTEM_ROLE_KEYS, type Role } from "@/lib/roles";
+import { ofThemSwitchedOff } from "@/lib/people-count";
+import { inactiveRoleKeys, listRoles, roleHeadcount, type RoleSummary } from "@/lib/authz/role-registry";
+import { notMigratedYet } from "@/lib/not-migrated";
+import { tradeDocumentLabels } from "@/lib/trade-documents";
+import type { ActionResult } from "@/actions/company";
+import { clipOrNull, TEXT_MAX } from "@/lib/text/bounded";
+
+/**
+ * Creating, renaming and removing roles.
+ *
+ * Roles used to be a Postgres enum, so adding one meant a schema change, a migration and a deploy —
+ * which in practice meant nobody added one. People were given the nearest existing role plus three
+ * personal exceptions each, and the exception list, which exists for the genuinely individual case,
+ * quietly became the place roles were defined. These three actions are what that was standing in
+ * for.
+ *
+ * All of them are gated on `permissions.manage`, the same key that guards the matrix itself: a role
+ * is a named bundle of permissions, so being able to define one and being able to fill one in are
+ * the same power at different granularity. Every one is audited through `recordPermissionChange`,
+ * because "who created the role that granted this" is a question an access review will ask.
+ */
+
+/** The shape the roles screen renders, which is a role plus the one fact that decides its buttons. */
+export type RoleRow = RoleSummary & {
+  /** How many people hold it, switched off or not. A role with holders cannot be deleted, and the screen should say why. */
+  headcount: number;
+  /** How many of those are switched off. */
+  switchedOff: number;
+  /** Switched on — offered to people (`setRoleActive`). */
+  active: boolean;
+};
+
+export async function listRolesForScreen(): Promise<ActionResult<RoleRow[]>> {
+  const user = await requireUser();
+  if (!(await can(user.id, "permissions.view"))) return { ok: false, error: "You can't see the access settings." };
+
+  const [roles, counts, off] = await Promise.all([listRoles(), roleHeadcount(), inactiveRoleKeys()]);
+  return { ok: true, data: roles.map((r) => ({ ...r, headcount: counts[r.key]?.all ?? 0, switchedOff: counts[r.key]?.switchedOff ?? 0, active: !off.has(r.key) })) };
+}
+
+/**
+ * Turns a name into a key: "Regional Manager" → "REGIONAL_MANAGER".
+ *
+ * Done once, at creation, and never again. The key is a foreign key in three tables and is what the
+ * built-in presets and the permission resolver compare against, so it has to be stable — which is
+ * precisely why the *name* is a separate column that can be changed as often as anybody likes.
+ */
+function keyFromName(name: string): string {
+  return name
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}]+/gu, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase()
+    .slice(0, 40);
+}
+
+function nameProblem(name: string): string | null {
+  const trimmed = name.trim();
+  if (trimmed.length < 2) return "Give the role a name.";
+  if (trimmed.length > 60) return "That name is too long — 60 characters at most.";
+  return null;
+}
+
+export async function createRole(input: { name: string; description?: string }): Promise<ActionResult<{ key: Role }>> {
+  const user = await requireUser();
+  if (!(await can(user.id, "permissions.manage"))) return { ok: false, error: "You can't change roles." };
+
+  const name = input.name.trim();
+  const problem = nameProblem(name);
+  if (problem) return { ok: false, error: problem };
+
+  const key = keyFromName(name);
+  if (!key) return { ok: false, error: "That name has no letters or numbers in it to build a key from." };
+
+  const clash = await db.role.findUnique({ where: { key }, select: { name: true } });
+  if (clash) {
+    // Named rather than generic: two different names can reduce to the same key ("Regional Manager"
+    // and "regional-manager"), and "that already exists" without saying what would be a puzzle.
+    return { ok: false, error: `That name produces the same key as the existing role "${clash.name}". Pick a different one.` };
+  }
+
+  const last = await db.role.findFirst({ orderBy: { sortOrder: "desc" }, select: { sortOrder: true } });
+
+  await db.role.create({
+    data: {
+      key,
+      name,
+      // Typed text is capped before it is stored (owner, 15 Nov 2026 — input bounds).
+      description: clipOrNull(input.description, TEXT_MAX.paragraph),
+      // Custom roles sort after the built-ins by default, in creation order.
+      sortOrder: (last?.sortOrder ?? 100) + 10,
+      isSystem: false,
+    },
+  });
+
+  /**
+   * A new role holds nothing.
+   *
+   * No permission rows are written, so it falls through to the registry defaults — and since
+   * `defaultRoles` lists only the eight built-in keys, a new role's defaults are empty. That is the
+   * right starting point: a role that arrives holding a guess at what somebody meant is worse than
+   * one that arrives holding nothing and has to be filled in deliberately.
+   */
+  await recordPermissionChange({
+    actorUserId: user.id,
+    subjectType: "ROLE",
+    subjectRole: key,
+    changeKind: "ROLE_CREATED",
+    detail: `${user.name} created the role "${name}" (${key}), holding no permissions yet`,
+  });
+
+  revalidatePath("/settings", "layout");
+  return { ok: true, data: { key } };
+}
+
+/**
+ * Renames a role, or changes its description.
+ *
+ * Free and safe by construction: nothing in the code or the database is keyed on `name`. A system
+ * role can be renamed like any other — calling ACCOUNTS "Finance" changes what people read on every
+ * screen and changes nothing about what it can do.
+ */
+export async function updateRole(input: {
+  key: string;
+  name: string;
+  description?: string;
+}): Promise<ActionResult<null>> {
+  const user = await requireUser();
+  if (!(await can(user.id, "permissions.manage"))) return { ok: false, error: "You can't change roles." };
+
+  const name = input.name.trim();
+  const problem = nameProblem(name);
+  if (problem) return { ok: false, error: problem };
+
+  const role = await db.role.findUnique({ where: { key: input.key }, select: { key: true, name: true } });
+  if (!role) return { ok: false, error: "That role no longer exists." };
+
+  const description = clipOrNull(input.description, TEXT_MAX.paragraph);
+  await db.role.update({ where: { key: role.key }, data: { name, description } });
+
+  if (name !== role.name) {
+    await recordPermissionChange({
+      actorUserId: user.id,
+      subjectType: "ROLE",
+      subjectRole: role.key,
+      changeKind: "ROLE_RENAMED",
+      detail: `${user.name} renamed "${role.name}" to "${name}"`,
+    });
+  }
+
+  revalidatePath("/settings", "layout");
+  revalidatePath("/", "layout");
+  return { ok: true, data: null };
+}
+
+export async function deleteRole(key: string): Promise<ActionResult<null>> {
+  const user = await requireUser();
+  if (!(await can(user.id, "permissions.manage"))) return { ok: false, error: "You can't change roles." };
+
+  const role = await db.role.findUnique({ where: { key }, select: { key: true, name: true, isSystem: true } });
+  if (!role) return { ok: false, error: "That role no longer exists." };
+
+  /**
+   * The eight the application shipped with stay.
+   *
+   * ADMIN because the permission resolver and the super-admin CHECK constraint both name it by
+   * string, and the rest because the sixteen built-in presets are written against them and would
+   * silently stop applying to anything. Checked here as well as by `isSystem` so the refusal can
+   * say which of those two reasons it is.
+   */
+  if (role.isSystem || (SYSTEM_ROLE_KEYS as readonly string[]).includes(role.key)) {
+    return {
+      ok: false,
+      error: `"${role.name}" is one of the roles this application was built around, so it cannot be deleted. You can rename it and change everything it grants.`,
+    };
+  }
+
+  /**
+   * Somebody holding it is a refusal, not a cascade.
+   *
+   * The foreign key is ON DELETE RESTRICT, so the database would refuse anyway — but it would refuse
+   * with a constraint name. Counting first means the answer is "seven people still have this role",
+   * which is the sentence somebody can act on.
+   */
+  const [holders, switchedOff, candidates] = await Promise.all([
+    db.user.count({ where: { role: role.key } }),
+    db.user.count({ where: { role: role.key, active: false } }),
+    db.candidate.count({ where: { role: role.key } }),
+  ]);
+  if (holders > 0 || candidates > 0) {
+    const parts = [
+      holders > 0 ? `${holders} ${holders === 1 ? "person" : "people"}${ofThemSwitchedOff(holders, switchedOff)} ${holders === 1 ? "holds" : "hold"} it` : null,
+      candidates > 0 ? `${candidates} ${candidates === 1 ? "candidate is" : "candidates are"} slated for it` : null,
+    ].filter(Boolean);
+    return { ok: false, error: `Cannot delete "${role.name}": ${parts.join(" and ")}. Move them to another role first.` };
+  }
+
+  /**
+   * A role named as an approver is refused, not quietly dropped.
+   *
+   * `DocumentApprovalPolicy.approverRoles` is a scalar list and so carries no foreign key — nothing
+   * in the database would stop this. Deleting the role would silently change who may sign off an
+   * invoice, and could leave a type switched on with nobody able to approve it at all. That is not a
+   * change anybody expects as a side effect of tidying up roles.
+   */
+  const approvalPolicies = await db.documentApprovalPolicy.findMany({
+    where: { approverRoles: { has: role.key } },
+    select: { docType: true },
+  });
+  if (approvalPolicies.length > 0) {
+    const types = approvalPolicies.map((p) => tradeDocumentLabels[p.docType].toLowerCase());
+    return {
+      ok: false,
+      error: `Cannot delete "${role.name}": it approves ${types.join(" and ")}. Take it off those approval policies first.`,
+    };
+  }
+
+  // Its permission rows go with it — ON DELETE CASCADE. They describe the role and mean nothing
+  // without it, unlike the audit trail, which deliberately holds no foreign key at all.
+  await db.role.delete({ where: { key: role.key } });
+
+  await recordPermissionChange({
+    actorUserId: user.id,
+    subjectType: "ROLE",
+    subjectRole: role.key,
+    changeKind: "ROLE_DELETED",
+    detail: `${user.name} deleted the role "${role.name}" (${role.key}), which nobody held`,
+  });
+
+  revalidatePath("/settings", "layout");
+  return { ok: true, data: null };
+}
+
+/**
+ * Switches a role off or back on (`Role.active`).
+ *
+ * A role switched off is kept — its settings, its history, its name on old records — and offered to
+ * nobody: no new account, no role change, no import may give it (src/lib/authz/guards.ts
+ * `assertRoleAssignable`). It can only be switched off once nobody who can sign in holds it, so turning
+ * it off never quietly takes anybody's access away; the resolver refuses it anything regardless, as a
+ * backstop (src/lib/authz/resolve.ts rule 2b). The roles the application was built around stay on.
+ */
+export async function setRoleActive(key: string, active: boolean): Promise<ActionResult<null>> {
+  const user = await requireUser();
+  if (!(await can(user.id, "permissions.manage"))) return { ok: false, error: "You can't change roles." };
+  const role = await db.role.findUnique({ where: { key: String(key ?? "") }, select: { key: true, name: true, isSystem: true } });
+  if (!role) return { ok: false, error: "That role no longer exists." };
+  if (!active && (role.isSystem || (SYSTEM_ROLE_KEYS as readonly string[]).includes(role.key))) {
+    return { ok: false, error: `"${role.name}" is one of the roles this application was built around, so it stays on.` };
+  }
+  if (!active) {
+    const [holders, candidates] = await Promise.all([
+      db.user.count({ where: { role: role.key, active: true } }),
+      db.candidate.count({ where: { role: role.key } }),
+    ]);
+    if (holders > 0 || candidates > 0) {
+      const parts = [
+        holders > 0 ? `${holders} ${holders === 1 ? "person who can sign in holds" : "people who can sign in hold"} it` : null,
+        candidates > 0 ? `${candidates} ${candidates === 1 ? "candidate is" : "candidates are"} slated for it` : null,
+      ].filter(Boolean);
+      return { ok: false, error: `Can't switch off "${role.name}": ${parts.join(" and ")}. Move them to another role first.` };
+    }
+  }
+  let current: boolean;
+  try {
+    current = (await db.role.findUnique({ where: { key: role.key }, select: { active: true } }))?.active ?? true;
+  } catch (err) {
+    if (notMigratedYet(err)) return { ok: false, error: "This workspace is still being updated. Try again in a few minutes." };
+    throw err;
+  }
+  if (current === active) return { ok: true, data: null };
+  await db.role.update({ where: { key: role.key }, data: { active }, select: { key: true } });
+  await recordPermissionChange({
+    actorUserId: user.id,
+    subjectType: "ROLE",
+    subjectRole: role.key,
+    changeKind: active ? "ROLE_ACTIVATED" : "ROLE_DEACTIVATED",
+    detail: `${user.name} switched the role "${role.name}" ${active ? "back on" : "off"}`,
+  });
+  revalidatePath("/settings", "layout");
+  return { ok: true, data: null };
+}
+
+/**
+ * A new role that starts as a copy of another: what it grants, how far it reaches, its field access
+ * and its daily unmask limit. Copied through the same actions an admin would use to set each by hand,
+ * so the same rules hold — nobody copies a role holding more than they do, nor one reaching further.
+ * If any of it is refused, the new role is removed again: a half-copied role is worse than none.
+ */
+export async function duplicateRole(input: { from: string; name: string; description?: string }): Promise<ActionResult<{ key: Role }>> {
+  const user = await requireUser();
+  if (!(await can(user.id, "permissions.manage"))) return { ok: false, error: "You can't change roles." };
+  const source = await db.role.findUnique({ where: { key: String(input?.from ?? "") }, select: { key: true, name: true } });
+  if (!source) return { ok: false, error: "That role no longer exists." };
+
+  const created = await createRole({ name: input.name, description: input.description });
+  if (!created.ok) return created;
+  const key = created.data.key;
+
+  const undo = async (error: string): Promise<ActionResult<never>> => {
+    await db.role.delete({ where: { key } }).catch(() => {});
+    return { ok: false, error: `Nothing was copied: ${error}` };
+  };
+
+  const { PERMISSIONS } = await import("@/lib/permissions");
+  const { roleGrants } = await import("@/lib/authz/role-permission");
+  const { setRolePermissions } = await import("@/actions/permission");
+  const { setRoleAccessLevels } = await import("@/actions/access-levels");
+  const { roleFieldAccess, setRoleFieldAccess, setRoleUnmaskLimit } = await import("@/actions/field-access");
+
+  const grants = await roleGrants(source.key);
+  const permissions = await setRolePermissions(key, PERMISSIONS.map((def) => ({ key: def.key, allowed: grants(def.key) })));
+  if (!permissions.ok) return undo(permissions.error);
+
+  const levels = await db.roleAccessLevel.findMany({ where: { role: source.key }, select: { record: true, action: true, level: true } }).catch(() => []);
+  if (levels.length) {
+    const copied = await setRoleAccessLevels(key, levels);
+    if (!copied.ok) return undo(copied.error);
+  }
+  // And Leads "as the account" reaching what its people own and made (src/lib/authz/lead-reach.ts).
+  const { setRoleLeadReach } = await import("@/actions/access-levels");
+  const { roleLeadReachView } = await import("@/lib/authz/lead-reach");
+  const reach = (await roleLeadReachView(source.key)).role;
+  if (!reach.owned || !reach.made) {
+    const copied = await setRoleLeadReach(key, reach);
+    if (!copied.ok) return undo(copied.error);
+  }
+
+  const fields = await roleFieldAccess(source.key);
+  if (fields) {
+    const stored = fields.rows.filter((r) => r.stored).map((r) => ({ field: r.key, policy: r.stored }));
+    if (stored.length) {
+      const copied = await setRoleFieldAccess(key, stored);
+      if (!copied.ok) return undo(copied.error);
+    }
+    if (fields.limitStored) {
+      const copied = await setRoleUnmaskLimit(key, fields.dailyLimit);
+      if (!copied.ok) return undo(copied.error);
+    }
+  }
+
+  await recordPermissionChange({
+    actorUserId: user.id,
+    subjectType: "ROLE",
+    subjectRole: key,
+    changeKind: "ROLE_CREATED",
+    detail: `${user.name} made "${input.name.trim()}" (${key}) as a copy of "${source.name}"`,
+  });
+  revalidatePath("/settings", "layout");
+  return { ok: true, data: { key } };
+}

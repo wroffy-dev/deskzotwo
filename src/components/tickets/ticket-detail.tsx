@@ -1,0 +1,213 @@
+import { CompanyLink } from "@/components/companies/company-link";
+import { notFound } from "next/navigation";
+import { CallButton } from "@/components/calls/call-button";
+import { ScheduleMeetingButton } from "@/components/calendar/schedule-meeting-button";
+import { DomainIntelButton } from "@/components/tickets/domain-intel-button";
+import { RecordMeetings } from "@/components/calendar/record-meetings";
+import { getTicket, listSupportAgents } from "@/actions/ticket";
+import { listTasks } from "@/actions/task";
+import { listAssignableUsers } from "@/actions/company";
+import { isModuleEnabled } from "@/actions/module";
+import { actingAsSuperAdmin } from "@/lib/authz/super-admin";
+import { hasEffectivePermission } from "@/actions/permission";
+import { accessLevel } from "@/lib/authz/access";
+import { currentUser } from "@/lib/session";
+import { Badge, Card, CardContent, CardHeader } from "@/components/ui/card";
+import { workspaceClock } from "@/lib/time/workspace";
+import { formatOrderId } from "@/lib/order-id";
+import { companyPath } from "@/lib/record-links";
+import {
+  formatTicketId,
+  getTicketSlaStatus,
+  ticketPriorityTones,
+  ticketStatusTones,
+  ticketTypeLabels,
+} from "@/lib/tickets";
+import { TicketStatusControl } from "@/components/tickets/ticket-status-control";
+import { TicketPriorityControl } from "@/components/tickets/ticket-priority-control";
+import { AssignTicketButton } from "@/components/tickets/assign-ticket-button";
+import { CommentThread } from "@/components/tickets/comment-thread";
+import { TicketEmails } from "@/components/tickets/ticket-emails";
+import { DeleteTicketButton } from "@/components/tickets/delete-ticket-button";
+import { TaskList } from "@/components/tasks/task-list";
+import { CategoryChip } from "@/components/customers/category-chip";
+import { companiesOutOfReach } from "@/lib/companies/out-of-reach";
+import { getWording } from "@/lib/terms/server";
+import { slot } from "@/lib/terms/dictionary";
+
+/**
+ * A ticket's full detail — SLA state, assignment, and the comment thread. Rendered on its own
+ * page and again inside the Tickets split view.
+ */
+export async function TicketDetail({ id }: { id: string }) {
+  const sessionUser = await currentUser();
+  const userId = sessionUser!.id;
+  const calendarEnabled = await isModuleEnabled("calendar");
+  const canScheduleMeetings = calendarEnabled && (await hasEffectivePermission(userId, "meetings.schedule"));
+  const [ticket, users, canDelete, tasksEnabled, canDeleteAnyTask, clock, w] = await Promise.all([
+    getTicket(id),
+    listSupportAgents(),
+    // The super admin's alone (src/actions/ticket.ts deleteTicket).
+    actingAsSuperAdmin(userId),
+    isModuleEnabled("tasks"),
+    accessLevel(userId, "tasks", "delete").then((level) => level === "ALL"),
+    workspaceClock(),
+    getWording(),
+  ]);
+  if (!ticket) notFound();
+
+  const [tasks, assignableUsers, outOfReach] = await Promise.all([
+    tasksEnabled ? listTasks({ ticketId: id }) : Promise.resolve([]),
+    tasksEnabled ? listAssignableUsers() : Promise.resolve([]),
+    companiesOutOfReach(userId, [ticket.company.id]),
+  ]);
+  const companyShut = outOfReach.length > 0;
+
+  const sla = getTicketSlaStatus(ticket.priority, ticket.status, ticket.createdAt, clock);
+
+  return (
+    <div className="@container space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <h1 className="text-xl font-semibold text-text">{formatTicketId(ticket.ticketSeq)}</h1>
+            <Badge tone={ticketStatusTones[ticket.status]}>{ticket.status.replaceAll("_", " ")}</Badge>
+            <Badge tone={ticketPriorityTones[ticket.priority]}>{ticket.priority}</Badge>
+            <Badge tone={sla.tone}>{sla.label}</Badge>
+          </div>
+          <p className="mt-1 text-base font-medium text-text">{ticket.title}</p>
+          <p className="mt-1 text-sm text-muted">
+            <CompanyLink shut={companyShut} href={companyPath(ticket.company.companySeq)} className="hover:underline">
+              {ticket.company.name}
+            </CompanyLink>
+            <CategoryChip category={ticket.company.customerCategory} className="ml-1.5 align-middle" />
+            {ticket.contact && ` · ${ticket.contact.name}`}
+            {" · "}
+            {ticketTypeLabels[ticket.ticketType]}
+            {" · "}
+            {ticket.companyProduct ? formatOrderId(ticket.companyProduct.orderSeq) : "Free Support"}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <CallButton
+            companyId={ticket.company.id}
+            companyName={ticket.company.name}
+            ticketId={ticket.id}
+            contact={ticket.contact ? { id: ticket.contact.id, name: ticket.contact.name, phone: ticket.contact.phone } : undefined}
+          />
+          {/* The customer's domain looked up live — website, registrar, mail, DNS (owner, 2 Nov 2026). */}
+          <DomainIntelButton ticketId={ticket.id} />
+          {canScheduleMeetings && <ScheduleMeetingButton record={{ kind: "ticket", id: ticket.id }} />}
+          {canDelete && <DeleteTicketButton ticketId={ticket.id} ticketSeq={ticket.ticketSeq} redirectTo="/tickets" />}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <div>
+          <div className="mb-1 text-xs uppercase tracking-wide text-subtle">Status</div>
+          <TicketStatusControl ticketId={ticket.id} status={ticket.status} />
+        </div>
+        <div>
+          <div className="mb-1 text-xs uppercase tracking-wide text-subtle">Priority</div>
+          <TicketPriorityControl ticketId={ticket.id} priority={ticket.priority} />
+        </div>
+        <div>
+          <div className="mb-1 text-xs uppercase tracking-wide text-subtle">Agent</div>
+          <AssignTicketButton ticketId={ticket.id} assignedTo={ticket.assignedTo} users={users} />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 @3xl:grid-cols-3">
+        <div className="space-y-6 @3xl:col-span-2">
+          <Card>
+            <CardHeader className="text-sm font-medium text-text">Description</CardHeader>
+            <CardContent>
+              <p className="whitespace-pre-wrap text-sm text-text">
+                {ticket.description || <span className="text-subtle">No description provided.</span>}
+              </p>
+            </CardContent>
+          </Card>
+
+          {/* With the customer, by email (src/lib/support-mail) — before Comments, which are the team's own. */}
+          <TicketEmails ticketId={ticket.id} />
+
+          <Card>
+            <CardHeader className="text-sm font-medium text-text">Comments</CardHeader>
+            <CardContent>
+              <CommentThread ticketId={ticket.id} comments={ticket.comments} />
+            </CardContent>
+          </Card>
+
+          {tasksEnabled && (
+            <Card>
+              <CardHeader className="text-sm font-medium text-text">Tasks</CardHeader>
+              <CardContent>
+                <TaskList
+                  tasks={tasks}
+                  users={assignableUsers}
+                  currentUserId={userId}
+                  canDeleteAny={canDeleteAnyTask}
+                  context={{ companyId: ticket.company.id, ticketId: ticket.id }}
+                />
+              </CardContent>
+            </Card>
+          )}
+        </div>
+
+        <div className="space-y-6">
+          {calendarEnabled && <RecordMeetings record={{ kind: "ticket", id: ticket.id }} viewerId={userId} />}
+
+          <Card>
+            <CardHeader className="text-sm font-medium text-text">Details</CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                <span className="text-muted">{slot(w, "Company", "company", "{one}")}</span>
+                <CompanyLink shut={companyShut} href={companyPath(ticket.company.companySeq)} className="text-text hover:underline">
+                  {ticket.company.name}
+                </CompanyLink>
+              </div>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                <span className="text-muted">{slot(w, "Contact", "contact", "{one}")}</span>
+                <span className="text-text">{ticket.contact?.name ?? "—"}</span>
+              </div>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                <span className="text-muted">Support type</span>
+                <span className="text-text">{ticketTypeLabels[ticket.ticketType]}</span>
+              </div>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                <span className="text-muted">{slot(w, "Order", "order", "{one}")}</span>
+                {ticket.companyProduct ? (
+                  <CompanyLink shut={companyShut} href={`${companyPath(ticket.company.companySeq)}?tab=products`} className="text-text hover:underline">
+                    {formatOrderId(ticket.companyProduct.orderSeq)} · {ticket.companyProduct.item.name}
+                  </CompanyLink>
+                ) : (
+                  <span className="text-text">Free Support</span>
+                )}
+              </div>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                <span className="text-muted">Created by</span>
+                <span className="text-text">{ticket.createdBy.name}</span>
+              </div>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                <span className="text-muted">Created on</span>
+                <span className="text-text">{clock.date(ticket.createdAt)}</span>
+              </div>
+              {ticket.resolvedAt && (
+                <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                  <span className="text-muted">Resolved on</span>
+                  <span className="text-text">{clock.date(ticket.resolvedAt)}</span>
+                </div>
+              )}
+              {ticket.closedAt && (
+                <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+                  <span className="text-muted">Closed on</span>
+                  <span className="text-text">{clock.date(ticket.closedAt)}</span>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}

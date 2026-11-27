@@ -1,0 +1,21 @@
+{
+  // The check scripts' own type check: `npm run typecheck:scripts`. They're development tools, left out of the root
+  // tsconfig so `next build` never checks them; some read the phone app's code (../mobile), which the server image doesn't have.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "incremental": false
+  },
+  "include": [
+    "../next-env.d.ts",
+    "./**/*.ts",
+    "./**/*.tsx",
+    "../.next/types/**/*.ts",
+    "../.next/dev/types/**/*.ts",
+    "../.next-build/types/**/*.ts",
+    "../.next-build/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "../mobile",
+    "../node_modules"
+  ]
+}

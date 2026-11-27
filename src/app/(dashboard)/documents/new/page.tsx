@@ -1,0 +1,228 @@
+import { currentUser } from "@/lib/session";
+import { workspacePack } from "@/lib/country-pack";
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import type { TradeDocumentType } from "@prisma/client";
+import { listDocumentParties } from "@/actions/trade-document";
+import { listAssignableUsers } from "@/actions/company";
+import { leadDocumentDraft } from "@/actions/lead";
+import { isModuleEnabled } from "@/actions/module";
+import { getNumberSetting, previewNextNumber } from "@/actions/document-number";
+import { getOrganisation } from "@/lib/organisation";
+import { defaultBranchIdFor, listBranchChoices } from "@/lib/branches/identity";
+import { documentBankChoices } from "@/lib/banking/organisation-accounts";
+import { DocumentForm } from "@/components/documents/document-form";
+import { blankLine, emptyDefaults } from "@/lib/document-draft";
+import { applyPartyCurrency } from "@/lib/companies/default-currency";
+import { workspaceClock } from "@/lib/time/workspace";
+import { defaultServicePeriod, showsServicePeriod } from "@/lib/documents/service-period";
+import { viewerHas } from "@/actions/permission";
+import { leadPath, orderPath } from "@/lib/record-links";
+import { invoiceStartFromOrders } from "@/lib/orders/invoice-draft";
+import { formatOrderId } from "@/lib/order-id";
+import { documentWriteKey } from "@/lib/documents/write-permission";
+import { quoteStart } from "@/lib/quote-requests";
+import {
+  documentDirection,
+  documentListPath,
+  tradeDocumentLabels,
+  tradeDocumentTypeValues,
+} from "@/lib/trade-documents";
+
+export default async function NewDocumentPage({
+  searchParams,
+}: {
+  /** `orders`: order ids, comma-separated — a tax invoice started from them (src/lib/orders/invoice-draft.ts). */
+  searchParams: Promise<{ type?: string; companyId?: string; leadId?: string; orders?: string; rfq?: string }>;
+}) {
+  const params = await searchParams;
+  // A delivery challan is not in this list — it is raised from a consignment, so there is no blank
+  // form for one. The cast narrows to the types that do have one.
+  if (!tradeDocumentTypeValues.includes(params.type as (typeof tradeDocumentTypeValues)[number])) notFound();
+  const docType = params.type as TradeDocumentType;
+  // Seeing documents isn't raising one: without Create for this type
+  // (src/lib/documents/permission-keys.ts) the form could only ever refuse
+  // to save, so it is not found (owner, 8 Oct 2026).
+  if (!(await viewerHas("documents.view")) || !(await viewerHas(documentWriteKey(docType, "create")))) notFound();
+
+  // The branch decides which series the number comes from, so the two number reads wait for it —
+  // and only for it: everything else is fetched alongside.
+  const signedIn = currentUser();
+  const defaultBranch = signedIn.then((me) => (me ? defaultBranchIdFor(me.id) : null));
+  const [parties, salespeople, org, branches, defaultBranchId, numberSetting, nextNumber, lead, me, bank] = await Promise.all([
+    listDocumentParties(docType),
+    listAssignableUsers(),
+    getOrganisation(),
+    listBranchChoices(),
+    defaultBranch,
+    defaultBranch.then((branchId) => getNumberSetting(docType, branchId)),
+    defaultBranch.then((branchId) => previewNextNumber(docType, branchId)),
+    // Raised from a lead only where the plan has leads; otherwise it is a blank document.
+    params.leadId ? isModuleEnabled("leads").then((on) => (on && params.leadId ? leadDocumentDraft(params.leadId) : null)) : Promise.resolve(null),
+    signedIn,
+    documentDirection[docType] === "SALES" ? documentBankChoices() : undefined,
+  ]);
+
+  /**
+   * The person writing the quote, when they are somebody a quote can be attributed to.
+   *
+   * Blank means "the account owner", which is the right answer for an accountant raising an
+   * invoice against somebody else's customer — but wrong for the far commoner case of a
+   * salesperson writing their own proposal and having to pick themselves from a list every time.
+   */
+  const defaultSalespersonId = me && salespeople.some((s) => s.id === me.id) ? me.id : "";
+  // Raised from the writer's own branch (else the head office): its address is where goods leave from.
+  const startBranch = branches.find((b) => b.id === defaultBranchId) ?? branches.find((b) => b.isHeadOffice);
+
+  // Dated today on the workspace's calendar.
+  const defaults = emptyDefaults(await workspaceClock());
+
+  // Raised from orders (the order page, the "to invoice" view): their customer, site and lines.
+  const fromOrders =
+    docType === "INVOICE" && params.orders && me ? await invoiceStartFromOrders(me.id, params.orders.split(","), defaults.issueDate) : null;
+  const orderStart = fromOrders?.ok && parties.some((p) => p.id === fromOrders.orders[0]!.companyId) ? fromOrders : null;
+  defaults.docNumber = nextNumber;
+  defaults.branchId = startBranch?.id ?? "";
+  defaults.dispatchFromAddress = startBranch?.dispatchAddress ?? "";
+  defaults.salespersonId = defaultSalespersonId;
+  if (params.companyId && parties.some((p) => p.id === params.companyId)) {
+    defaults.companyId = params.companyId;
+  }
+
+  if (orderStart) {
+    const first = orderStart.orders[0]!;
+    defaults.companyId = first.companyId;
+    defaults.locationId = first.locationId;
+    defaults.reference = orderStart.reference;
+    defaults.salespersonId = salespeople.some((s) => s.id === first.addedByUserId) ? first.addedByUserId : defaults.salespersonId;
+    defaults.lines = orderStart.lines.map((l) => ({
+      ...blankLine(),
+      companyProductId: l.companyProductId,
+      itemId: l.itemId,
+      itemType: l.itemType,
+      name: l.name,
+      description: l.description,
+      hsnCode: l.hsnCode,
+      unit: l.unit,
+      quantity: String(l.quantity),
+      unitPrice: String(l.unitPrice),
+      taxRatePercent: String(l.taxRatePercent),
+      servicePeriodFrom: l.servicePeriodFrom,
+      servicePeriodTo: l.servicePeriodTo,
+      periodSource: l.periodSource as (typeof defaults.lines)[number]["periodSource"],
+    }));
+  }
+
+  // A reseller's quote request (owner, 26 Nov 2026 — src/lib/quote-requests.ts): to the reseller, the request named in the
+  // reference (which marks it quoted), and its lines matched to the catalogue at the reseller's prices — a line matching
+  // nothing stays as they typed it.
+  const fromRequest = docType === "PROPOSAL" && !orderStart && params.rfq && me ? await quoteStart(me.id, params.rfq) : null;
+  const requestStart = fromRequest && parties.some((p) => p.id === fromRequest.resellerId) ? fromRequest : null;
+  if (requestStart) {
+    defaults.companyId = requestStart.resellerId;
+    defaults.reference = requestStart.reference;
+    defaults.notes = requestStart.notes;
+    defaults.lines = requestStart.lines.map((l) => {
+      const period = l.item && showsServicePeriod(docType) ? defaultServicePeriod({ item: l.item, issueDate: defaults.issueDate }) : null;
+      return {
+        ...blankLine(),
+        itemId: l.item?.id ?? "",
+        itemType: l.item?.type ?? "",
+        servicePeriodFrom: period?.from ?? "",
+        servicePeriodTo: period?.to ?? "",
+        periodSource: period?.source ?? "",
+        name: l.item?.name ?? l.description,
+        description: [l.item ? l.description : "", l.brand, l.notes].filter(Boolean).join(" · "),
+        hsnCode: l.item?.hsnCode ?? "",
+        unit: l.item?.unit ?? "",
+        quantity: String(l.quantity),
+        unitPrice: String(l.price?.unitPrice ?? 0),
+        taxRatePercent: String(l.item?.taxRatePercent ?? workspacePack().tax.defaultRate),
+      };
+    });
+  }
+
+  // Raised from a lead: the deal decides the party, the salesperson and the opening set of lines.
+  // The lead is only honoured if its company is one this document type can actually be raised
+  // against — a sales document can't be addressed to a vendor, whatever the URL says.
+  const fromLead = !orderStart && !requestStart && lead && parties.some((p) => p.id === lead.companyId) ? lead : null;
+  if (fromLead) {
+    defaults.companyId = fromLead.companyId;
+    defaults.leadId = fromLead.id;
+    defaults.reference = fromLead.title;
+    defaults.salespersonId = fromLead.ownerUserId ?? "";
+    if (fromLead.requirements.length > 0) {
+      defaults.lines = fromLead.requirements.map((r) => {
+        // A subscription starts with a year from the document's date, as a picked item does.
+        const period = showsServicePeriod(docType) ? defaultServicePeriod({ item: r.item, issueDate: defaults.issueDate }) : null;
+        return {
+          ...blankLine(),
+          itemType: r.item.type,
+          servicePeriodFrom: period?.from ?? "",
+          servicePeriodTo: period?.to ?? "",
+          periodSource: period?.source ?? "",
+          itemId: r.item.id,
+          name: r.item.name,
+          // The requirement's own note is what the customer actually asked for on the call, so it
+          // beats the catalogue blurb when there is one.
+          description: r.notes ?? r.item.description ?? "",
+          hsnCode: r.item.hsnCode ?? "",
+          unit: r.item.unit ?? "",
+          quantity: String(r.quantity),
+          unitPrice: String(r.item.sellingPrice ?? 0),
+          taxRatePercent: String(r.item.taxRatePercent ?? workspacePack().tax.defaultRate),
+        };
+      });
+    }
+  }
+
+  // In the party's own currency at the day's rate, its opening prices converted (owner, 30 Oct 2026) — else the
+  // workspace's (src/lib/companies/default-currency.ts). A lead's products and an order with no price of its own were
+  // priced from the catalogue, so they take the item's own price in that currency where it has one; an order's agreed
+  // price is converted.
+  const catalogueOrders = new Set(orderStart?.lines.filter((l) => l.priceFromCatalogue).map((l) => l.companyProductId) ?? []);
+  await applyPartyCurrency(defaults, {
+    cataloguePriced: (l) => (l.companyProductId ? catalogueOrders.has(l.companyProductId) : !!fromLead),
+    purchase: documentDirection[docType] !== "SALES",
+  });
+
+  return (
+    <div>
+      <div className="mb-5">
+        <Link
+          href={orderStart ? orderPath(orderStart.orders[0]!.orderSeq) : fromLead ? leadPath(fromLead.leadSeq) : documentListPath[docType]}
+          className="text-sm text-muted hover:text-text"
+        >
+          ← {orderStart ? formatOrderId(orderStart.orders[0]!.orderSeq) : fromLead ? fromLead.title : `${tradeDocumentLabels[docType]}s`}
+        </Link>
+        <h1 className="mt-1 text-xl font-semibold text-text">New {tradeDocumentLabels[docType].toLowerCase()}</h1>
+        <p className="mt-1 text-sm text-muted">
+          {orderStart
+            ? `Started from ${orderStart.orders.length === 1 ? "order" : "orders"} ${orderStart.orders.map((o) => formatOrderId(o.orderSeq)).join(", ")} — each line bills its order for what is still to bill, at the order's price. Check it, save it, then issue it.`
+            : requestStart
+              ? `Started from ${requestStart.reference.split(" · ")[0]} — the lines it matched to your items are at this reseller's prices; the rest are as they typed them. Check it, save it, then issue it.`
+            : fromOrders && !fromOrders.ok
+              ? `Couldn't start from those orders: ${fromOrders.error}`
+            : fromLead
+            ? fromLead.requirements.length > 0
+              ? `Started from this lead's ${fromLead.requirements.length} required product${fromLead.requirements.length === 1 ? "" : "s"}, priced from the catalogue. Check the prices before you issue it.`
+              : "Raised against this lead. It has no products listed yet, so the lines start empty."
+            : "Saved as a draft first, so nothing reaches the customer until you issue it."}
+        </p>
+      </div>
+
+      {/* The "taxed as inter-state" warning is the form's: it follows the branch chosen there. */}
+      <DocumentForm
+        docType={docType}
+        parties={parties}
+        branches={branches}
+        defaultTerms={org.invoiceTerms}
+        roundOffTotals={org.roundOffTotals}
+        numberSetting={numberSetting}
+        salespeople={salespeople}
+        defaults={defaults}
+        bank={bank}
+      />
+    </div>
+  );
+}

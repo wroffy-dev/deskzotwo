@@ -1,0 +1,41 @@
+import { listIndustries } from "@/actions/industry";
+import { listCompanyTypes } from "@/actions/company-type";
+import { listCustomerCategories } from "@/actions/customer-category";
+import { viewerHas } from "@/actions/permission";
+import { newCustomerTermsAdvice } from "@/actions/credit";
+import { NewCompanyForm } from "@/components/companies/new-company-form";
+import { myEnrichProviders } from "@/actions/enrich-credits";
+import { clientRelationshipTypeValues } from "@/lib/validation/company";
+import { isModuleEntitled } from "@/lib/modules-access";
+import { requireUser } from "@/lib/session";
+import { formSetup } from "@/lib/custom-fields/server";
+import { isModuleEnabled } from "@/actions/module";
+import { ModuleDisabledNotice } from "@/components/settings/module-disabled-notice";
+import { getWording } from "@/lib/terms/server";
+import { slot } from "@/lib/terms/dictionary";
+
+export default async function NewCompanyPage() {
+  if (!(await isModuleEnabled("companies"))) return <ModuleDisabledNotice moduleKey="companies" />;
+  const user = await requireUser();
+  const [industries, canAddContacts, termsAdvice, categories, customFields] = await Promise.all([listIndustries(), viewerHas("contacts.view"), isModuleEntitled("receivables").then((has) => (has ? newCustomerTermsAdvice() : null)), listCustomerCategories(), formSetup("COMPANY", user.id)]);
+  const w = await getWording();
+
+  return (
+    <div>
+      <h1 className="text-xl font-semibold text-text">{slot(w, "New company", "company", "New {one:lower}")}</h1>
+      <p className="mt-1 text-sm text-muted">
+        {slot(w, "Company name must be unique — if it already exists, open the existing record instead.", "company", "{one} name must be unique — if it already exists, open the existing record instead.")} For a vendor or
+        commission party, use the Vendors or Commission Parties module instead.
+      </p>
+      <NewCompanyForm
+        industries={industries}
+        companyTypes={await listCompanyTypes()}
+        categories={categories}
+        canAddContacts={canAddContacts}
+        termsAdvice={termsAdvice}
+        customFields={customFields}
+        enrich={await myEnrichProviders()}
+        defaultRelationshipType="CLIENT" relationshipTypeOptions={clientRelationshipTypeValues} />
+    </div>
+  );
+}

@@ -1,0 +1,55 @@
+import { db } from "@/lib/db";
+import { documentAccess } from "@/lib/authz/access";
+import { toPlain } from "@/lib/serialize";
+import { leadsSeenBy } from "@/lib/leads/shown";
+
+/**
+ * One trade document as the detail and print views need it, for a given person — scoped to the
+ * documents the access engine says they reach, so one outside it reads as missing.
+ *
+ * No permission check here: the caller has made it. That is the action behind the pages
+ * (getTradeDocument, for the person signed in) or the print page spending a render pass (for the
+ * person the pass was minted for) — see src/lib/documents/render-grant.ts.
+ */
+export async function findTradeDocumentFor(userId: string, id: string) {
+  const document = await db.tradeDocument.findFirst({
+    // `findFirst` only so the scope can travel with the id: one this person doesn't reach has to
+    // read as missing — this feeds the detail page and the printable copy, both of which render
+    // the customer's whole address and every line they were charged for. The access engine answers
+    // the reach (`documentAccess`; with no level set, the party's account, as before).
+    where: { AND: [{ id }, await documentAccess(userId, "view")] },
+    include: {
+    company: {
+      select: {
+        id: true,
+        name: true,
+        relationshipType: true,
+        companySeq: true,
+        // The fallback contact for a document nobody was named on — see `contact` in the print
+        // page. Matches what creation does and what the form's blank option says it will do.
+        owner: { select: { name: true, email: true, phone: true } },
+      },
+    },
+    location: true,
+    lines: { orderBy: { sortOrder: "asc" } },
+    createdBy: { select: { id: true, name: true } },
+    submittedBy: { select: { id: true, name: true } },
+    approvedBy: { select: { id: true, name: true } },
+    // Email and phone travel with the name because they are printed on the document itself, so
+    // the customer can reach whoever sent it without going back through the switchboard.
+    salesperson: { select: { id: true, name: true, email: true, phone: true } },
+    sourceDocument: { select: { id: true, docNumber: true, docType: true } },
+    againstDocument: { select: { id: true, docNumber: true, docType: true, issueDate: true } },
+    conversions: { select: { id: true, docNumber: true, docType: true, status: true } },
+    creditNotes: { select: { id: true, docNumber: true, docType: true, status: true } },
+    lead: { select: { id: true, title: true, status: true, leadSeq: true } },
+    // Who "we" were on it: the branch it was raised from (null = written before branches, the head
+    // office's) and the registration its GSTIN snapshot came from.
+    branch: { select: { id: true, name: true, code: true, isHeadOffice: true, active: true } },
+    gstRegistration: { select: { id: true, gstin: true, stateCode: true, code: true } },
+  },
+  });
+  if (!document) return null;
+  // Raised from a lead: shown only where the plan has leads (owner, 14 Oct 2026).
+  return toPlain((await leadsSeenBy(userId, [document]))[0]!);
+}

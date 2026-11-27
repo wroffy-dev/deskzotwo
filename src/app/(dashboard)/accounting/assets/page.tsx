@@ -1,0 +1,73 @@
+import { isModuleEnabled } from "@/actions/module";
+import { ModuleDisabledNotice } from "@/components/settings/module-disabled-notice";
+import { listAssetAccounts, listAssets, previewDepreciation } from "@/actions/asset";
+import { listDepartmentOptions, listManagerOptions } from "@/actions/department";
+import { getOrganisation } from "@/lib/organisation";
+import { Card } from "@/components/ui/card";
+import { ReportHeader } from "@/components/accounting/report-chrome";
+import { MonthPicker } from "@/components/accounting/month-picker";
+import { AssetsManager } from "@/components/accounting/assets-manager";
+import { previousIstMonth } from "@/lib/india-time";
+import { notFound } from "next/navigation";
+import { viewerHas } from "@/actions/permission";
+
+export default async function AssetsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ month?: string; year?: string; status?: string }>;
+}) {
+  const enabled = await isModuleEnabled("accounting");
+  if (!enabled) return <ModuleDisabledNotice moduleKey="accounting" />;
+  // The finance function's (`payments.manage`), like every action behind the page: without it the
+  // page is not there, the same as its link (owner, 8 Oct 2026 — pages you can't open are a 404).
+  if (!(await viewerHas("payments.manage"))) notFound();
+
+  const params = await searchParams;
+  const now = new Date();
+  // Last month by default: this month isn't over, and depreciation is charged at a month end.
+  // India's last month (india-time `previousIstMonth`): the host's, on a server in UTC, was still the
+  // month before that until 05:30 IST on the 1st.
+  const previous = previousIstMonth(now);
+  const month = Number(params.month) || previous.month;
+  const year = Number(params.year) || previous.year;
+
+  const [assets, preview, accounts, departments, people, org] = await Promise.all([
+    listAssets({ status: (params.status as "ACTIVE" | "DISPOSED" | "ALL") ?? "ALL" }),
+    previewDepreciation({ month, year }),
+    listAssetAccounts(),
+    listDepartmentOptions(),
+    listManagerOptions(),
+    getOrganisation(),
+  ]);
+
+  if (accounts.length === 0) {
+    return (
+      <Card className="px-6 py-10 text-center text-sm text-muted">
+        The chart of accounts hasn&apos;t been set up yet. Open Accounting → Chart of Accounts first.
+      </Card>
+    );
+  }
+
+  return (
+    <div className="animate-fade-rise">
+      <ReportHeader
+        title="Fixed assets"
+        subtitle="What the company owns, what it's worth now, and the depreciation charged against it"
+        organisation={org.legalName}
+      >
+        <MonthPicker month={month} year={year} />
+      </ReportHeader>
+      <div className="mt-5">
+        <AssetsManager
+          assets={assets}
+          preview={preview}
+          accounts={accounts}
+          departments={departments}
+          people={people}
+          month={month}
+          year={year}
+        />
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,297 @@
+"use client";
+
+import { workspacePack } from "@/lib/country-pack";
+import { useState, useTransition } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import type { ItemType } from "@prisma/client";
+import { bulkUpdateItems } from "@/actions/item";
+import { itemTypeValues, itemTypeLabels } from "@/lib/validation/item";
+import { formatItemId } from "@/lib/order-id";
+import { itemPath } from "@/lib/record-links";
+import { formatCurrency } from "@/lib/utils";
+import { Badge, Card } from "@/components/ui/card";
+import { CustomFieldBodyCells, CustomFieldHeaderCells, type CustomColumn } from "@/components/custom-fields/custom-field-cells";
+import { Button } from "@/components/ui/button";
+import { Select } from "@/components/ui/input";
+import { BulkBar, Checkbox, useRowSelection } from "@/components/ui/bulk-select";
+import type { BrandOption } from "@/components/items/item-fields";
+import { OptionCombobox } from "@/components/ui/option-combobox";
+import { HsnCombobox } from "@/components/items/hsn-combobox";
+import { useWording } from "@/components/terms/wording-provider";
+import { slot } from "@/lib/terms/dictionary";
+
+const TYPE_TONE: Record<ItemType, "default" | "blue" | "green" | "amber"> = {
+  GOOD: "default",
+  SERVICE: "blue",
+  SUBSCRIPTION: "green",
+  PERPETUAL: "amber",
+};
+
+export type ItemRow = {
+  id: string;
+  itemSeq: number;
+  name: string;
+  sku: string;
+  type: ItemType;
+  category: string | null;
+  sellingPrice: number;
+  trackInventory: boolean;
+  stockQuantity: number;
+  reorderLevel: number | null;
+  active: boolean;
+  brand: { id: string; name: string } | null;
+  productFamily: { id: string; name: string } | null;
+  hsnCode: string | null;
+};
+
+export function ItemsTable({
+  items,
+  brands,
+  customColumns = { columns: [], texts: {} },
+  hsnProblems = {},
+  categories = [],
+  subscriptions = false,
+}: {
+  items: ItemRow[];
+  brands: BrandOption[];
+  /** The workspace's item categories, for the bulk bar's category picker. */
+  categories?: { id: string; name: string }[];
+  /** Renewals is available, so the bulk bar may make services subscriptions. */
+  subscriptions?: boolean;
+  /** Why an item's HSN/SAC needs fixing, by id — an Indian workspace's (src/lib/platform/hsn-directory.ts). */
+  hsnProblems?: Record<string, string>;
+  /** The workspace's own fields marked "a column in the list" (src/lib/custom-fields/server.ts `listColumns`, `listedOnly`): no column picker here. */
+  customColumns?: { columns: CustomColumn[]; texts: Record<string, Record<string, string>> };
+}) {
+  const router = useRouter();
+  // The workspace's own word for an item (Settings → Wording).
+  const wording = useWording();
+  const selection = useRowSelection(items);
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  const [brandId, setBrandId] = useState("");
+  const [productFamilyId, setProductFamilyId] = useState("");
+  const [type, setType] = useState("");
+  const [category, setCategory] = useState("");
+  const [active, setActive] = useState("");
+  const [hsnCode, setHsnCode] = useState("");
+  // HSN/SAC is India's GST classification (owner, 14 Nov 2026): not a column a UAE workspace fills.
+  const india = workspacePack().india;
+
+  const selectedBrand = brands.find((b) => b.id === brandId);
+
+  function resetChanges() {
+    setBrandId("");
+    setProductFamilyId("");
+    setType("");
+    setCategory("");
+    setActive("");
+    setHsnCode("");
+  }
+
+  function apply() {
+    setError(null);
+    setDone(null);
+    startTransition(async () => {
+      const result = await bulkUpdateItems({
+        itemIds: selection.ids,
+        brandId,
+        productFamilyId,
+        type,
+        category,
+        active,
+        hsnCode,
+      });
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      setDone(`Updated ${result.data.count} item(s).`);
+      selection.clear();
+      resetChanges();
+      router.refresh();
+    });
+  }
+
+  return (
+    <div>
+      <BulkBar count={selection.count} onClear={selection.clear} error={error} notice={done}>
+        <div className="flex w-full flex-wrap items-center gap-2">
+            {/* The bulk bar has no captions — the "no change" option is the only visible cue, and an
+                option is not a name. Each control carries its own. */}
+            {/* Searched, not scrolled — the catalogue can hold a thousand brands. "Remove brand" is
+                offered first, as the one choice that isn't a brand. */}
+            <div className="w-52">
+              <OptionCombobox
+                listLabel="Brands"
+                options={[{ id: "clear", name: "Remove brand" }, ...brands.map((b) => ({ id: b.id, name: b.name }))]}
+                value={brandId}
+                onSelect={(b) => {
+                  setBrandId(b?.id ?? "");
+                  setProductFamilyId("");
+                }}
+                placeholder="Brand — no change"
+              />
+            </div>
+            <Select
+              value={productFamilyId}
+              onChange={(e) => setProductFamilyId(e.target.value)}
+              disabled={!selectedBrand}
+              className="h-9 w-44"
+              aria-label="Product family"
+            >
+              <option value="">{selectedBrand ? "Family — no change" : "Family — pick a brand"}</option>
+              {selectedBrand?.families.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </Select>
+            <Select value={type} onChange={(e) => setType(e.target.value)} className="h-9 w-44" aria-label="Type">
+              <option value="">Type — no change</option>
+              {itemTypeValues
+                .filter((t) => t !== "SUBSCRIPTION" || subscriptions)
+                .map((t) => (
+                  <option key={t} value={t}>
+                    {itemTypeLabels[t]}
+                  </option>
+                ))}
+            </Select>
+            {/* From the workspace's list, like the item form's — "Remove category" first, as the one
+                choice that isn't a category. */}
+            <div className="w-52">
+              <OptionCombobox
+                listLabel="Categories"
+                options={[{ id: "clear", name: "Remove category" }, ...categories.map((c) => ({ id: c.name, name: c.name }))]}
+                value={category}
+                onSelect={(c) => setCategory(c?.id ?? "")}
+                placeholder="Category — no change"
+              />
+            </div>
+            {/* One code for every item picked — the quick way to fix a run of them the list flagged. */}
+            {india && (
+              <div className="w-64">
+                <HsnCombobox value={hsnCode} onChange={setHsnCode} placeholder="HSN/SAC — no change" aria-label="HSN/SAC code" />
+              </div>
+            )}
+            <Select value={active} onChange={(e) => setActive(e.target.value)} className="h-9 w-44" aria-label="Status">
+              <option value="">Status — no change</option>
+              <option value="true">Mark active</option>
+              <option value="false">Mark inactive</option>
+            </Select>
+          <Button size="sm" disabled={isPending} onClick={apply}>
+            {isPending ? "Applying…" : `Apply to ${selection.count}`}
+          </Button>
+        </div>
+        <p className="w-full text-xs text-muted">
+          Only the fields you change are applied — everything left on &ldquo;no change&rdquo; is untouched.
+        </p>
+      </BulkBar>
+
+      <Card className="overflow-hidden">
+        <div className="relative overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="border-b border-line bg-surface-sunken text-left text-xs uppercase tracking-wide text-muted">
+              <tr>
+                <th className="w-10 px-4 py-2.5">
+                  <Checkbox
+                    checked={selection.allSelected}
+                    onChange={selection.toggleAll}
+                    aria-label={slot(wording, "Select all items on this page", "item", "Select all {many:lower} on this page")}
+                  />
+                </th>
+                <th className="px-4 py-2.5">{slot(wording, "Item ID", "item", "{one} ID")}</th>
+                <th className="px-4 py-2.5">{slot(wording, "Item", "item", "{one}")}</th>
+                <th className="px-4 py-2.5">Type</th>
+                <th className="px-4 py-2.5">SKU</th>
+                {india && <th className="px-4 py-2.5">HSN/SAC</th>}
+                <th className="px-4 py-2.5">Brand / family</th>
+                <th className="px-4 py-2.5">Category</th>
+                <th className="px-4 py-2.5">Selling price</th>
+                <th className="px-4 py-2.5">Stock</th>
+                <th className="px-4 py-2.5">Status</th>
+                <CustomFieldHeaderCells columns={customColumns.columns} className="px-4 py-2.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => {
+                const lowStock =
+                  item.trackInventory && item.reorderLevel !== null && item.stockQuantity <= item.reorderLevel;
+                return (
+                  <tr key={item.id} className="border-b border-line last:border-0 hover:bg-surface-sunken">
+                    <td className="px-4 py-2.5">
+                      <Checkbox
+                        checked={selection.isSelected(item.id)}
+                        onChange={() => selection.toggle(item.id)}
+                        aria-label={`Select ${item.name}`}
+                      />
+                    </td>
+                    <td className="px-4 py-2.5 font-mono text-xs text-muted">{formatItemId(item.itemSeq)}</td>
+                    <td className="px-4 py-2.5">
+                      <Link href={itemPath(item.itemSeq)} className="font-medium text-text hover:underline">
+                        {item.name}
+                      </Link>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <Badge tone={TYPE_TONE[item.type]}>{itemTypeLabels[item.type]}</Badge>
+                    </td>
+                    <td className="px-4 py-2.5 text-muted">{item.sku}</td>
+                    {india && (
+                    <td className="px-4 py-2.5">
+                      {hsnProblems[item.id] ? (
+                        // What is wrong, in words, for whoever hovers or reads it out.
+                        <span className="font-mono text-xs text-danger" title={hsnProblems[item.id]}>
+                          {item.hsnCode ?? "Missing"}
+                          <span className="sr-only"> — {hsnProblems[item.id]}</span>
+                        </span>
+                      ) : (
+                        <span className="font-mono text-xs text-muted">{item.hsnCode ?? "—"}</span>
+                      )}
+                    </td>
+                    )}
+                    <td className="px-4 py-2.5 text-muted">
+                      {item.brand ? (
+                        <>
+                          {item.brand.name}
+                          {item.productFamily && <span className="text-subtle"> · {item.productFamily.name}</span>}
+                        </>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 text-muted">{item.category ?? "—"}</td>
+                    <td className="px-4 py-2.5 text-muted">{formatCurrency(String(item.sellingPrice))}</td>
+                    <td className="px-4 py-2.5 text-muted">
+                      {item.trackInventory ? (
+                        <span className={lowStock ? "font-medium text-warning" : undefined}>
+                          {item.stockQuantity}
+                          {lowStock && " (low)"}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      {item.active ? <Badge tone="green">Active</Badge> : <Badge tone="red">Inactive</Badge>}
+                    </td>
+                    <CustomFieldBodyCells columns={customColumns.columns} texts={customColumns.texts[item.id]} className="px-4 py-2.5 text-muted" />
+                  </tr>
+                );
+              })}
+              {items.length === 0 && (
+                <tr>
+                  <td colSpan={(india ? 11 : 10) + customColumns.columns.length} className="px-4 py-8 text-center text-subtle">
+                    {slot(wording, "No items found.", "item", "No {many:lower} found.")}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}

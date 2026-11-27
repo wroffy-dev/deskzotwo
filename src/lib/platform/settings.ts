@@ -1,0 +1,244 @@
+import { controlDb } from "@/lib/platform/control-db";
+import { openForPlatform, sealForPlatform } from "@/lib/platform/kek";
+
+/**
+ * The platform's own settings, set from the console (src/app/platform-console/(console)/settings and
+ * billing) — and a few the platform keeps for itself, like when the daily billing work last ran.
+ *
+ * Secrets — the gateways' keys — are typed into the console, sealed under the platform key, and
+ * never shown back: the console learns only whether one is set. Nothing here comes from the
+ * environment, so a key is changed without a deploy and never sits in a file.
+ */
+
+export const GATEWAY_SECRET_KEYS = ["stripe.secretKey", "stripe.webhookSecret", "razorpay.keyId", "razorpay.keySecret", "razorpay.webhookSecret"] as const;
+/**
+ * `cloudflare.apiToken`: workspaces' own addresses on Cloudflare for SaaS (src/lib/platform/cloudflare-hostnames.ts).
+ * `offsite.secret`: the off-site store's SAS token or secret access key (src/lib/offsite/config.ts).
+ * `storage.connection`: the storage box's Azure connection string (src/lib/storage/box.ts).
+ */
+export const SECRET_KEYS = [...GATEWAY_SECRET_KEYS, "cloudflare.apiToken", "offsite.secret", "storage.connection"] as const;
+export type SecretKey = (typeof SECRET_KEYS)[number];
+/**
+ * `platform.lastTick`: what the platform tick did last, as JSON (src/lib/platform/tick-summary.ts).
+ * `support.*`: Contact Support — typed, with their defaults, in src/lib/support/settings.ts.
+ * `partners.*`: the partner programme — typed, with their defaults, in src/lib/partners/settings.ts.
+ * `domains.offered`: whether workspaces may add custom domains (`customDomainsOffered`).
+ * `cloudflare.zoneId`: the zone their addresses are custom hostnames of (src/lib/platform/cloudflare-hostnames.ts).
+ */
+export const PLAIN_KEYS = [
+  "signup.open",
+  "trial.days",
+  "trial.seats",
+  "invoice.sellerName",
+  "invoice.sellerAddress",
+  "invoice.sellerState",
+  "invoice.sellerGstin",
+  "invoice.sellerPan",
+  "invoice.sac",
+  "invoice.prefix",
+  // Where a bank transfer goes, printed on every proforma (src/lib/billing/proforma.ts).
+  "invoice.bankAccountName",
+  "invoice.bankName",
+  "invoice.bankAccount",
+  "invoice.bankIfsc",
+  "invoice.bankUpi",
+  "billing.autoDeprovision",
+  "billing.dailyRanOn",
+  "staff.twoFactor",
+  "platform.lastTick",
+  "domains.offered",
+  "cloudflare.zoneId",
+  "console.timezone",
+  "support.enabled",
+  "support.email",
+  "support.helpline",
+  "support.hours",
+  "support.languages",
+  "support.recording",
+  "support.retentionDays",
+  "partners.twoFactor",
+  "partners.statementDay",
+  "partners.dealDays",
+  "partners.refCookieDays",
+  "partners.applications",
+  "partners.directory",
+  "partners.clawbackMonths",
+  "partners.twoPersonPayout",
+  "mail.documents.personDaily",
+  "mail.documents.workspaceDaily",
+  "mail.helpdesk.fromOwnAddress",
+  // The wording of Deskzo's own emails as edited in the console, JSON by template key (src/lib/platform/mail/templates.ts).
+  "mail.templates",
+  // Deskzo AI (src/lib/ai): the kill switch, the packs on sale (JSON), and a free trial's credits.
+  "ai.paused",
+  "ai.packs",
+  "trial.aiCredits",
+  // Off-site backups and the log archive (src/lib/offsite/config.ts): the store, and how long each is kept there.
+  "storage.container",
+  "offsite.provider",
+  "offsite.config",
+  "offsite.backupKeepDays",
+  "offsite.logKeepDays",
+  // The platform's own security logs (staff, CMS, partners) are archived through this day, UTC (src/lib/logs/archive.ts).
+  "offsite.logsThrough",
+  // A "Run now" from the console waiting for the platform worker, and the day closed workspaces' backups were last swept off-site (src/lib/offsite/chores.ts).
+  "offsite.requested",
+  "offsite.orphansSweptOn",
+  // The last check of this server's clock against India's time servers (src/lib/platform/time-sync.ts), as JSON.
+  "platform.clockCheck",
+  // When the platform worker's loop last ran (src/lib/platform/worker-heartbeat.ts), as an ISO instant.
+  "worker.lastSeen",
+  // Who the alerts are emailed to, comma-separated (src/lib/platform/alert-notify.ts); empty = every active owner.
+  "alerts.emails",
+  // The workspace Deskzo's own sales team works in — enquiries, sign-ups and their billing go there (src/lib/platform/sales-crm.ts).
+  "sales.crm.workspace",
+] as const;
+export type PlainKey = (typeof PLAIN_KEYS)[number];
+
+/** Whether a gateway's keys are its test or live ones — from the key's prefix; null when none is set. */
+export type GatewayMode = "test" | "live" | "unknown" | null;
+export type GatewayModes = { stripe: GatewayMode; razorpay: GatewayMode };
+
+/** One setting as the console lists it: a secret only as set or not, a plain one with its value, and who changed it last. */
+export type SettingRow = {
+  key: SecretKey | PlainKey;
+  kind: "secret" | "plain";
+  set: boolean;
+  value: string | null;
+  updatedBy: string | null;
+  /** The staff member's name, or `updatedBy` as it is ("tick", "check", "billing", a script). */
+  updatedByName: string | null;
+  updatedAt: Date | null;
+};
+
+export async function getSetting(key: PlainKey): Promise<string | null> {
+  const row = await controlDb().platformSetting.findUnique({ where: { key }, select: { value: true } });
+  return row?.value ?? null;
+}
+
+export async function setSetting(key: PlainKey, value: string | null, by: string): Promise<void> {
+  await controlDb().platformSetting.upsert({ where: { key }, create: { key, value, updatedBy: by }, update: { value, updatedBy: by } });
+}
+
+export async function getSecret(key: SecretKey): Promise<string | null> {
+  const row = await controlDb().platformSetting.findUnique({ where: { key }, select: { secretCipher: true } });
+  return row?.secretCipher ? openForPlatform("platform-setting", row.secretCipher) : null;
+}
+
+/** Null removes it. */
+export async function setSecret(key: SecretKey, value: string | null, by: string): Promise<void> {
+  const secretCipher = value ? sealForPlatform("platform-setting", value) : null;
+  await controlDb().platformSetting.upsert({ where: { key }, create: { key, secretCipher, updatedBy: by }, update: { secretCipher, updatedBy: by } });
+}
+
+/** Which secrets are set, and nothing about them. */
+export async function secretsSet(): Promise<Record<SecretKey, boolean>> {
+  const rows = await controlDb().platformSetting.findMany({ where: { key: { in: [...SECRET_KEYS] } }, select: { key: true, secretCipher: true } });
+  return Object.fromEntries(SECRET_KEYS.map((k) => [k, rows.some((r) => r.key === k && !!r.secretCipher)])) as Record<SecretKey, boolean>;
+}
+
+/** A key's mode from its prefix. The key itself goes no further than this. */
+function modeOf(sealed: string | null | undefined, test: RegExp, live: RegExp): GatewayMode {
+  if (!sealed) return null;
+  let key: string;
+  try {
+    key = openForPlatform("platform-setting", sealed).trim();
+  } catch {
+    return "unknown"; // Set, but not readable under this platform key.
+  }
+  return test.test(key) ? "test" : live.test(key) ? "live" : "unknown";
+}
+
+/**
+ * Whether each gateway runs on its test keys or its live ones — Stripe from its secret key
+ * (sk_/rk_ test or live), Razorpay from its key id (rzp_test_/rzp_live_). Only the mode leaves here.
+ */
+export async function gatewayModes(): Promise<GatewayModes> {
+  const rows = await controlDb().platformSetting.findMany({ where: { key: { in: ["stripe.secretKey", "razorpay.keyId"] } }, select: { key: true, secretCipher: true } });
+  const sealed = (key: SecretKey) => rows.find((r) => r.key === key)?.secretCipher;
+  return {
+    stripe: modeOf(sealed("stripe.secretKey"), /^(sk|rk)_test_/, /^(sk|rk)_live_/),
+    razorpay: modeOf(sealed("razorpay.keyId"), /^rzp_test_/, /^rzp_live_/),
+  };
+}
+
+/**
+ * Every setting the platform has, each once and in a fixed order — unset ones included — for the
+ * console's settings page. A secret is only "set" or not; nothing sealed leaves this function.
+ */
+export async function settingsOverview(): Promise<SettingRow[]> {
+  const control = controlDb();
+  const rows = await control.platformSetting.findMany({ select: { key: true, value: true, secretCipher: true, updatedBy: true, updatedAt: true } });
+  const byKey = new Map(rows.map((r) => [r.key, { set: !!r.secretCipher, value: r.value, updatedBy: r.updatedBy, updatedAt: r.updatedAt }]));
+  const ids = [...new Set(rows.map((r) => r.updatedBy).filter((by): by is string => !!by))];
+  const staff = ids.length ? await control.platformUser.findMany({ where: { id: { in: ids } }, select: { id: true, name: true } }) : [];
+  const names = new Map(staff.map((s) => [s.id, s.name]));
+  const row = (key: SecretKey | PlainKey, kind: SettingRow["kind"]): SettingRow => {
+    const r = byKey.get(key);
+    const updatedBy = r?.updatedBy ?? null;
+    return {
+      key,
+      kind,
+      set: kind === "secret" ? !!r?.set : r?.value !== null && r?.value !== undefined,
+      value: kind === "plain" ? (r?.value ?? null) : null,
+      updatedBy,
+      updatedByName: updatedBy === null ? null : (names.get(updatedBy) ?? updatedBy),
+      updatedAt: r?.updatedAt ?? null,
+    };
+  };
+  return [...SECRET_KEYS.map((k) => row(k, "secret")), ...PLAIN_KEYS.map((k) => row(k, "plain"))];
+}
+
+/** What staff two-factor is when an owner has never said: required in production, optional elsewhere. */
+export const staffTwoFactorDefault = (): "required" | "off" => (process.env.NODE_ENV === "production" ? "required" : "off");
+
+/**
+ * Whether staff use an authenticator to reach the console (src/lib/platform/staff-session.ts) —
+ * "required" of everyone, or "off": a password alone for everyone, owners and whoever set one up
+ * included (their authenticators are kept, for when it is required again). An owner chooses on the
+ * console's Staff page; until then it follows the environment. "optional", stored before, meant off.
+ */
+export async function staffTwoFactorPolicy(): Promise<{ mode: "required" | "off"; chosen: boolean }> {
+  const value = await getSetting("staff.twoFactor");
+  if (value === "required") return { mode: "required", chosen: true };
+  if (value === "off" || value === "optional") return { mode: "off", chosen: true };
+  return { mode: staffTwoFactorDefault(), chosen: false };
+}
+
+/** Anybody may sign up, without an invitation. Off until billing can charge them. */
+export async function signupOpen(): Promise<boolean> {
+  return (await getSetting("signup.open")) === "1";
+}
+
+/** How long a new workspace's trial lasts. */
+export async function trialDays(): Promise<number> {
+  const n = Number(await getSetting("trial.days"));
+  return Number.isInteger(n) && n >= 1 && n <= 90 ? n : 14;
+}
+
+/** The most people a workspace on its free trial may have (owner, 11 Oct 2026: 25), until it pays. */
+export const TRIAL_SEATS_DEFAULT = 25;
+export const TRIAL_SEATS_MAX = 1000;
+
+export async function trialSeats(): Promise<number> {
+  const n = Number(await getSetting("trial.seats"));
+  return Number.isInteger(n) && n >= 1 && n <= TRIAL_SEATS_MAX ? n : TRIAL_SEATS_DEFAULT;
+}
+
+/**
+ * Whether a workspace whose subscription ended is closed on its own, ninety days after it was held.
+ * Off unless staff turn it on: closing drops a database, and the platform should not start doing
+ * that by itself until somebody has decided it should.
+ */
+export async function autoDeprovision(): Promise<boolean> {
+  return (await getSetting("billing.autoDeprovision")) === "1";
+}
+
+/**
+ * Whether workspace owners may add custom domains from Settings › Domain (src/lib/platform/
+ * domains.ts). Off until staff turn it on — once the HTTPS certificates for them are automated. Staff
+ * add and check addresses from the console whatever it says, and addresses already added keep working.
+ */
+export async function customDomainsOffered(): Promise<boolean> {
+  return (await getSetting("domains.offered")) === "1";
+}

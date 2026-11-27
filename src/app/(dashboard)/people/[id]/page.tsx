@@ -1,0 +1,212 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { isModuleEnabled } from "@/actions/module";
+import { db } from "@/lib/db";
+import { canonicalise, parseRecordRef } from "@/lib/record-url";
+import { formatUserId } from "@/lib/order-id";
+import { ModuleDisabledNotice } from "@/components/settings/module-disabled-notice";
+import { getPerson, hrCapabilities, hrTasksFor, personChecklist } from "@/actions/hr";
+import { leaveBalances } from "@/actions/leave";
+import { salaryHistory, salarySplitSetup, taxDeclarations } from "@/actions/payroll";
+import { listEmployeeDocuments, listEmployeeLetters, listEmploymentHistory } from "@/actions/employee-docs";
+import { listLetterTemplates } from "@/actions/letter-templates";
+import { EmployeeFile } from "@/components/hr/employee-file";
+import { availableLetters } from "@/lib/hr/letters";
+import { serviceYears } from "@/lib/hr/settlement";
+import { SalaryCard } from "@/components/hr/salary-card";
+import { TaxDeclarationCard } from "@/components/hr/tax-declaration-card";
+import { EmployeeRecord } from "@/components/hr/employee-record";
+import { HrChecklist } from "@/components/hr/hr-checklist";
+import { HrTasks } from "@/components/hr/hr-tasks";
+import { handoverHistory } from "@/actions/handover";
+import { HandoverHistory } from "@/components/people/handover-history";
+import { isModuleEntitled } from "@/lib/modules-access";
+import { mayViewPersonActivity } from "@/lib/activity/timeline";
+import { assetsHeldBy } from "@/actions/it-asset";
+import { AssetsHeldCard } from "@/components/hr/assets-held-card";
+import { resignationFor } from "@/actions/resignation";
+import { ResignationDecisionCard } from "@/components/hr/resignation";
+
+export default async function PersonPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<Record<string, string | string[] | undefined>> }) {
+  const enabled = await isModuleEnabled("hr");
+  if (!enabled) return <ModuleDisabledNotice moduleKey="hr" />;
+
+  const [{ id }, query] = await Promise.all([params, searchParams]);
+  /**
+   * The sequence resolves to the cuid before the action runs, so every check that action already
+   * made still happens — this translates the reference, it does not bypass anything. A sequence
+   * matching nothing falls through as the original segment and the action answers null, which is
+   * the same refusal a bad cuid gets.
+   */
+  const ref = parseRecordRef(id);
+  const resolved =
+    ref.kind === "seq"
+      ? ((await db.user.findUnique({ where: { userSeq: ref.seq }, select: { id: true } }))?.id ?? id)
+      : ref.id;
+
+  const [person, caps] = await Promise.all([getPerson(resolved), hrCapabilities()]);
+  if (!person) notFound();
+
+  // After the check, never before — see `canonicalise`.
+  canonicalise(id, "/people", formatUserId(person.userSeq), query);
+
+  /**
+   * `person.id`, not `id`.
+   *
+   * `id` is whatever is in the URL, and for this route the canonical form is the sequence — so on
+   * `/people/USR-000001` these eight were each handed the string "USR-000001" as a user id. Most
+   * answered empty, which looks like a person with no documents and no leave rather than a bug;
+   * `leaveBalances` opens the year's balance on first read, so it tried to *write* a row against
+   * that string and the page died on a foreign-key violation.
+   */
+  // Salary is the payroll module's: a plan without it shows no salary card, and asks for none.
+  const payrollInPlan = await isModuleEntitled("payroll");
+  // What they hold from the asset register (owner, 31 Oct 2026) — where IT Assets is on and open to the viewer;
+  // the action answers only to whoever sees every asset, or the person themselves.
+  const held = (await isModuleEnabled("it_assets")) ? await assetsHeldBy(person.id) : null;
+  // Their resignation, to them and to whoever may decide it (owner, 31 Oct 2026).
+  const resigned = await resignationFor(person.id);
+  const [balances, structures, splitSetup, letterTemplates, tax, documents, history, letters, checklist, tasks, handovers, seesWork] = await Promise.all([
+    leaveBalances(person.id),
+    payrollInPlan ? salaryHistory(person.id) : Promise.resolve([]),
+    // How a CTC is split, for whoever sets salaries — the dialog splits as they type.
+    payrollInPlan && caps.payroll ? salarySplitSetup() : Promise.resolve(null),
+    // HR's own letter templates, offered beside the built-in letters to whoever drafts them.
+    caps.manage ? listLetterTemplates({ activeOnly: true }) : Promise.resolve([]),
+    payrollInPlan ? taxDeclarations(person.id) : Promise.resolve(null),
+    listEmployeeDocuments(person.id),
+    listEmploymentHistory(person.id),
+    listEmployeeLetters(person.id),
+    personChecklist(person.id),
+    hrTasksFor(person.id),
+    handoverHistory(person.id),
+    // Their Work activity, offered to whoever may see it: themselves, their managers, everyone's viewers.
+    mayViewPersonActivity(caps.userId, person.id),
+  ]);
+
+  const profile = person.employeeProfile;
+  const letterOptions = availableLetters({
+    joinedOn: profile?.joinedOn ?? null,
+    confirmedOn: profile?.confirmedOn ?? null,
+    exitedOn: profile?.exitedOn ?? null,
+    employmentType: profile?.employmentType ?? null,
+    // Passed so a gratuity statement isn't offered to somebody the Act doesn't cover — the same
+    // rounding the settlement uses, rather than a second opinion about how long they were here.
+    serviceYears:
+      profile?.joinedOn && profile.exitedOn ? serviceYears(profile.joinedOn, profile.exitedOn) : 0,
+  });
+
+  return (
+    <div className="animate-fade-rise">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Link href="/people" className="text-sm text-muted hover:text-text">
+          ← People
+        </Link>
+        <div className="flex flex-wrap items-center gap-4">
+          {/* Their ID card (owner, 31 Oct 2026), for HR while they still work here — src/lib/id-cards. */}
+          {caps.manage && !profile?.exitedOn && person.active && (
+            <a href={`/id-cards/print?ids=${person.id}`} target="_blank" rel="noopener" className="text-sm text-brand hover:underline">
+              Print ID card →
+            </a>
+          )}
+          {seesWork && (
+            <Link href={`/activity/work?person=${person.id}`} className="text-sm text-brand hover:underline">
+              Work activity →
+            </Link>
+          )}
+        </div>
+      </div>
+      <div className="mt-3">
+        <EmployeeRecord
+          person={person}
+          balances={balances}
+          canManage={caps.manage}
+          canHandOver={caps.handover}
+          canMove={caps.manage && caps.payroll}
+          isSelf={caps.userId === person.id}
+        />
+      </div>
+
+      {/* Pay sits behind its own permission, so the card only renders for payroll or for the
+          person themselves — and salaryHistory returns nothing to anybody else regardless. */}
+      {payrollInPlan && (caps.payroll || caps.userId === person.id) && (
+        <div className="mt-5 grid max-w-4xl gap-4 md:grid-cols-2">
+          <SalaryCard userId={person.id} name={person.name} structures={structures} canEdit={caps.payroll} setup={splitSetup} />
+          {tax && tax.declarations.length > 0 && (
+            <TaxDeclarationCard userId={person.id} name={person.name} years={tax.years} current={tax.current} declarations={tax.declarations} canEdit={caps.payroll} />
+          )}
+        </div>
+      )}
+
+      {profile?.exitedOn && (caps.payroll || caps.userId === person.id) && (
+        <div className="mt-5">
+          <Link
+            href={`/people/${person.id}/settlement`}
+            className="inline-block rounded-base border border-line px-3 py-2 text-sm text-brand hover:underline"
+          >
+            Full &amp; final settlement →
+          </Link>
+        </div>
+      )}
+
+      {resigned.resignation && resigned.resignation.status !== "WITHDRAWN" && (
+        <div className="mt-5 max-w-4xl">
+          <ResignationDecisionCard resignation={resigned.resignation} canDecide={resigned.canDecide} />
+        </div>
+      )}
+
+      {held && (held.length > 0 || caps.manage) && (
+        <div className="mt-5 max-w-4xl">
+          <AssetsHeldCard assets={held} leaving={Boolean(profile?.exitedOn)} />
+        </div>
+      )}
+
+      {(handovers.length > 0 || caps.handover) && (
+        <div className="mt-5 max-w-2xl">
+          <HandoverHistory
+            entries={handovers}
+            personId={person.id}
+            personName={person.name}
+            canHandOver={caps.handover && caps.userId !== person.id}
+          />
+        </div>
+      )}
+
+      {/* Onboarding while they are here, offboarding once an exit is recorded — the same card, because
+          it is the same question at two ends of the same employment. HR only: it reads as a list of
+          what the company still owes the employee and vice versa, not as a to-do for them. */}
+      {checklist && caps.manage && (
+        <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <HrChecklist
+            title={checklist.stage === "OFFBOARDING" ? "Offboarding" : "Onboarding"}
+            subtitle={
+              checklist.stage === "OFFBOARDING"
+                ? "What still has to happen before this employment is properly closed."
+                : "What is still missing before the machine works properly for them."
+            }
+            items={checklist.items}
+          />
+          <HrTasks
+            userId={person.id}
+            tasks={tasks}
+            canManage={caps.manage}
+            hasExited={Boolean(profile?.exitedOn)}
+          />
+        </div>
+      )}
+
+      <div className="mt-5">
+        <EmployeeFile
+          userId={person.id}
+          userName={person.name}
+          documents={documents}
+          history={history}
+          letters={letters}
+          canManage={caps.manage}
+          letterOptions={letterOptions}
+          templates={letterTemplates.map((t) => ({ id: t.id, name: t.name }))}
+        />
+      </div>
+    </div>
+  );
+}

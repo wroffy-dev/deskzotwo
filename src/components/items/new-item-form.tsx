@@ -1,0 +1,155 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import type { z } from "zod";
+import { useForm, type UseFormRegister, type FieldValues } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useRouter } from "next/navigation";
+import { createItemSchema, type CreateItemInput } from "@/lib/validation/item";
+import { createItem } from "@/actions/item";
+import { Button } from "@/components/ui/button";
+import { CurrencyPricesCard, currencyPricesForSave, ItemDetailFields, type BrandOption, type CurrencyPriceDraft } from "@/components/items/item-fields";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  CustomFieldInputs,
+  missingRequired,
+  type CustomFieldFormValues,
+  type CustomFieldPerson,
+} from "@/components/custom-fields/custom-field-inputs";
+import type { CustomFieldDef } from "@/lib/custom-fields/rules";
+import { itemPath } from "@/lib/record-links";
+import { HSN_REQUIRED_MESSAGE } from "@/lib/hsn";
+import { useWording } from "@/components/terms/wording-provider";
+import { slot } from "@/lib/terms/dictionary";
+import { workspacePack } from "@/lib/country-pack";
+
+type FormValues = z.input<typeof createItemSchema>;
+
+export function NewItemForm({
+  brands,
+  showRevenuePattern = false,
+  customFields = { fields: [], values: {}, people: [] },
+  hsnRequired = false,
+  categories = [],
+  subscriptions = false,
+}: {
+  brands: BrandOption[];
+  showRevenuePattern?: boolean;
+  /** The workspace's own product fields (src/lib/custom-fields/server.ts `formSetup`). */
+  customFields?: { fields: CustomFieldDef[]; values: CustomFieldFormValues; people: CustomFieldPerson[] };
+  /** An Indian workspace: HSN/SAC is required, and checked against the GST portal's directory. */
+  hsnRequired?: boolean;
+  /** The workspace's item categories, to pick from. */
+  categories?: { id: string; name: string }[];
+  /** Renewals is available, so a service may be managed as a subscription. */
+  subscriptions?: boolean;
+}) {
+  const router = useRouter();
+  const wording = useWording();
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [custom, setCustom] = useState<CustomFieldFormValues>(customFields.values);
+  const [customErrors, setCustomErrors] = useState<Record<string, string>>({});
+  const [currencyPrices, setCurrencyPrices] = useState<CurrencyPriceDraft[]>([]);
+  const {
+    register,
+    handleSubmit,
+    watch,
+    setValue,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm<FormValues, unknown, CreateItemInput>({
+    resolver: zodResolver(createItemSchema),
+    // The workspace's default rate to start (Settings › Taxes; owner, 23 Nov 2026): a blank one left items with none.
+    defaultValues: { type: "GOOD", trackInventory: true, active: true, taxRatePercent: workspacePack().tax.defaultRate },
+  });
+
+  // Typed as the schema reads it (a retired PERPETUAL is read as SERVICE), so narrowed here.
+  const itemType = String(watch("type") ?? "GOOD");
+  const brandId = watch("brandId");
+  const hsnCode = watch("hsnCode");
+  const category = watch("category");
+  const trackInventory = watch("trackInventory");
+
+  useEffect(() => {
+    if (itemType !== "GOOD") setValue("trackInventory", false);
+  }, [itemType, setValue]);
+
+  // A family belongs to one brand, so switching brand invalidates whatever family was picked.
+  useEffect(() => {
+    setValue("productFamilyId", "");
+  }, [brandId, setValue]);
+
+  async function onSubmit(values: CreateItemInput) {
+    setServerError(null);
+    if (hsnRequired && !values.hsnCode) {
+      setError("hsnCode", { message: HSN_REQUIRED_MESSAGE }, { shouldFocus: true });
+      return;
+    }
+    const missing = missingRequired(customFields.fields, custom);
+    setCustomErrors(missing);
+    if (Object.keys(missing).length > 0) return;
+    const prices = currencyPricesForSave(currencyPrices);
+    if (!prices.ok) return setServerError(prices.error);
+    const result = await createItem({ ...values, customFields: custom, currencyPrices: prices.rows });
+    if (!result.ok) {
+      // What the GST directory said about the code belongs under the code.
+      if (/\b(HSN|SAC)\b/.test(result.error)) setError("hsnCode", { message: result.error }, { shouldFocus: true });
+      else setServerError(result.error);
+      return;
+    }
+    router.push(itemPath(result.data.itemSeq));
+  }
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="mt-6 space-y-6">
+      {serverError && <div className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{serverError}</div>}
+
+      <ItemDetailFields
+        register={register as unknown as UseFormRegister<FieldValues>}
+        errors={errors}
+        itemType={itemType}
+        brands={brands}
+        brandId={brandId}
+        onBrandChange={(id) => setValue("brandId", id, { shouldDirty: true })}
+        hsnCode={typeof hsnCode === "string" ? hsnCode : ""}
+        taxRate={watch("taxRatePercent")}
+        onHsnChange={(code) => setValue("hsnCode", code, { shouldDirty: true, shouldValidate: !!errors.hsnCode })}
+        onTypeChange={(type) => setValue("type", type, { shouldDirty: true })}
+        categories={categories}
+        category={typeof category === "string" ? category : ""}
+        onCategoryChange={(name) => setValue("category", name, { shouldDirty: true })}
+        subscriptions={subscriptions}
+        trackInventory={!!trackInventory}
+        showOpeningStock
+        showRevenuePattern={showRevenuePattern}
+        hsnRequired={hsnRequired}
+      />
+
+      <CurrencyPricesCard value={currencyPrices} onChange={setCurrencyPrices} />
+
+      {customFields.fields.length > 0 && (
+        <Card>
+          <CardHeader className="text-sm font-medium text-text">More details</CardHeader>
+          <CardContent>
+            <CustomFieldInputs
+              fields={customFields.fields}
+              values={custom}
+              people={customFields.people}
+              errors={customErrors}
+              onChange={(key, value) => setCustom((c) => ({ ...c, [key]: value }))}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      <div className="flex justify-end gap-3">
+        <Button type="button" variant="secondary" onClick={() => router.back()}>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={isSubmitting}>
+          {isSubmitting ? "Saving…" : slot(wording, "Save item", "item", "Save {one:lower}")}
+        </Button>
+      </div>
+    </form>
+  );
+}

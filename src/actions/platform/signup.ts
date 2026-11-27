@@ -1,0 +1,516 @@
+"use server";
+
+import { spawn } from "node:child_process";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import path from "node:path";
+import bcrypt from "bcryptjs";
+import { cookies, headers } from "next/headers";
+import { WORLD_COUNTRIES } from "@/lib/geo/world-countries";
+import { isDisposableDomain, parseEmailAddress } from "@/lib/email-verification";
+import { resolveSignupAttribution } from "@/lib/partners/attribution";
+import { findActiveReferral, partnerInviteProblem } from "@/lib/partners/referrals";
+import { controlDb } from "@/lib/platform/control-db";
+import { createHandoffTicket } from "@/lib/platform/handoff";
+import { sendPlatformMail } from "@/lib/platform/mailer";
+import { signupOpen } from "@/lib/platform/settings";
+import { siteAllowance } from "@/lib/platform/find-workspaces";
+import { inviteHold, judgeName, type InviteHold } from "@/lib/platform/name-rules";
+import { ProvisioningRefused, startProvisioning } from "@/lib/platform/provisioning";
+import { signupNameVerdict } from "@/lib/workspace-names";
+import { lockoutState, recordFailure } from "@/lib/security/lockout";
+import {
+  CODE_ATTEMPTS_USED,
+  CODE_EXPIRED,
+  CODE_TTL_MINUTES,
+  MAX_CODE_ATTEMPTS,
+  codeShapeProblem,
+  companyNameProblem,
+  countryProblem,
+  disposableEmailMessage,
+  emailShapeProblem,
+  firstIssue,
+  ownerNameProblem,
+  passwordProblem,
+  slugRequiredProblem,
+  wrongCodeMessage,
+  type SignupIssueField,
+  type SignupIssues,
+} from "@/lib/signup-fields";
+import { clientIpFrom } from "@/lib/client-ip";
+import { protocolFor, requestHost } from "@/lib/tenancy/host";
+import { newSignupCode, signupCodeTemplateMail } from "@/lib/platform/signup-code";
+import { SIGNUP_BROWSER_MS } from "@/lib/console-shared/signup-browser";
+import { subdomainHost } from "@/lib/tenancy/registry";
+import { templateOf } from "@/lib/industry-templates/catalogue";
+import { productByKey } from "@/lib/products";
+import { productTrialPlan, signupPlanKey } from "@/lib/platform/product-plans";
+import { productCountryProblem, productUnavailableMessage } from "@/lib/signup-fields";
+
+/**
+ * Signing up for a workspace — the public site on the platform's own address (src/app/platform-site).
+ *
+ *   1. `startSignup`: the form. By invitation until staff open signup in the console (src/lib/
+ *      platform/settings.ts); after that an invitation is optional, and names the plan when given.
+ *      Refuses a disposable address, a name that is taken or reserved, a short password. Emails a
+ *      six-digit code and remembers the browser (a cookie whose secret only this browser has).
+ *   2. `verifySignup`: the code. Spends the invitation if there is one, reserves the name, queues
+ *      the workspace on a free trial (src/lib/platform/provisioning.ts) and starts the worker.
+ *      Its plan (`signupPlanKey`): the invitation's; else the product chosen on its page
+ *      (/signup?product=books — that product's trial alone); else a partner referral's; else the default.
+ *   3. `signupProgress`: what the progress page polls. Once the workspace is up, it hands the owner
+ *      a one-time pass to it — once, to this browser only — and the page follows it straight in.
+ *
+ * An invitation may hold an address for the customer it is for (made in the console): its signup gets
+ * exactly that address — filled in and locked on the form (`heldAddress`) — without the signup rules,
+ * and provisioning checks it again with the same hold. Nobody else may take it while it is open.
+ *
+ * Partners (src/lib/partners): a partner's invitation code works only while its partner is ACTIVE,
+ * and a partner's referral code on the form must be live. Verifying works out which partner the
+ * workspace belongs to (attribution.ts) and provisioning records it with the workspace.
+ *
+ * None of this touches a workspace's database: there is none yet. Attempts are limited per address
+ * (src/lib/security/lockout.ts, under "platform|"), codes per signup.
+ *
+ * A refusal names every problem at once, field by field (`issues`, in the words of src/lib/signup-fields.ts
+ * — the same rules the form runs as each field is left), with `formError` for what is no one field's: too
+ * many attempts from here, or signup by invitation only and no code given. `error` repeats the first of
+ * them, for callers that read one line. None of it says more than before: not whether an address already
+ * owns a workspace, and not which way an invitation code is wrong.
+ */
+
+const COOKIE = "deskzo.signup";
+/** Live (unverified, unexpired) signup codes one address may have at once. */
+const MAX_LIVE_CODES_PER_ADDRESS = 3;
+const CODE_TTL_MS = CODE_TTL_MINUTES * 60_000;
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+export type SignupResult<T = null> =
+  | { ok: true; data: T }
+  | {
+      ok: false;
+      /** The first problem — kept for callers that read one line. */
+      error: string;
+      /** Every field's problem, in plain words. */
+      issues?: SignupIssues;
+      /** What isn't one field's: too many attempts, signup by invitation only with no code, an expired signup. */
+      formError?: string;
+    };
+
+/** A refusal: every field's problem, and the form's own if there is one. */
+function refused(issues: SignupIssues, formError?: string): { ok: false; error: string; issues: SignupIssues; formError?: string } {
+  const first = firstIssue(issues);
+  return { ok: false, error: formError ?? (first ? issues[first]! : "Check the form and try again."), issues, ...(formError ? { formError } : {}) };
+}
+
+/**
+ * Signups are limited per caller — or, when the caller's address cannot be known (no trusted proxy,
+ * src/lib/client-ip.ts), per address being signed up: one shared bucket would let anybody stop
+ * everybody signing up.
+ */
+async function callerKey(email: string): Promise<string> {
+  const ip = clientIpFrom(await headers());
+  // "caller:", so an IPv6 address is counted by its /64 (security review, 15 Nov 2026 — RL-01; src/lib/security/lockout.ts).
+  return ip ? `platform|signup|caller:${ip}` : `platform|signup-email:${String(email ?? "").trim().toLowerCase()}`;
+}
+
+/**
+ * Signups across everybody (security review, 15 Nov 2026 — RL-01): each verified one makes a workspace and a database,
+ * and the per-caller limit alone held nobody with many addresses. Counted in the control database, so a restart or a
+ * second process doesn't reset it. SIGNUPS_PER_HOUR and SIGNUPS_PER_DAY raise it for a launch day.
+ */
+const SIGNUPS_PER_HOUR = Number(process.env.SIGNUPS_PER_HOUR) || 60;
+const SIGNUPS_PER_DAY = Number(process.env.SIGNUPS_PER_DAY) || 300;
+
+async function signupsFull(): Promise<boolean> {
+  const now = Date.now();
+  const [hour, day] = await Promise.all([
+    controlDb().pendingSignup.count({ where: { createdAt: { gt: new Date(now - 3_600_000) } } }),
+    controlDb().pendingSignup.count({ where: { createdAt: { gt: new Date(now - 86_400_000) } } }),
+  ]);
+  return hour >= SIGNUPS_PER_HOUR || day >= SIGNUPS_PER_DAY;
+}
+
+async function limited(email: string): Promise<string | null> {
+  const key = await callerKey(email);
+  const state = lockoutState([key]);
+  if (state.lockedOut) return `Too many attempts from here. Try again in ${Math.ceil(state.retryInSeconds / 60)} minute(s).`;
+  recordFailure([key]);
+  return null;
+}
+
+/**
+ * Signup's whole answer about an address: the rules for every workspace (pattern, platform addresses,
+ * staff's blocks, reserved words, our name and competitors'), then what a business signing itself up
+ * must also meet — eight letters at least, made from its registered name — and only then whether it
+ * is free (src/lib/workspace-names.ts `signupNameVerdict`). With an invitation that holds an address
+ * for its customer: that address exactly, without the signup rules.
+ */
+async function signupSlugProblem(slug: string, legalName: string, hold: InviteHold | null = null): Promise<string | null> {
+  const verdict = await judgeName(slug, hold, (facts) => signupNameVerdict(slug, legalName, facts));
+  return verdict.ok ? null : verdict.message;
+}
+
+/**
+ * The live check beside the address field, against the registered name typed above it. Never with an
+ * invitation's hold: an address held for the visitor is filled in and locked, and not checked live
+ * (`heldAddress` is the one, limited, way to ask about a code).
+ */
+export async function checkWorkspaceName(input: string, legalName = ""): Promise<SignupResult<{ host: string }>> {
+  const slug = String(input ?? "").trim().toLowerCase();
+  // Security audit round two, 13 Nov 2026 (low): limited like `heldAddress`, per caller (when known) and for the
+  // whole process, so it can't be used to list which workspace names exist at speed. Signup itself checks again.
+  const ip = clientIpFrom(await headers());
+  if (!siteAllowance([...(ip ? [{ key: `platform|name-check-caller:${ip}`, max: NAME_CHECKS.perCaller }] : []), { key: "platform|name-check:all", max: NAME_CHECKS.all }])) {
+    return { ok: false, error: "Too many checks just now — try again in a little while." };
+  }
+  const problem = await signupSlugProblem(slug, String(legalName ?? "").trim().slice(0, 120));
+  return problem ? { ok: false, error: problem } : { ok: true, data: { host: subdomainHost(slug) } };
+}
+
+/** How often one caller, and the whole process, may check a name as it is typed (`siteAllowance`'s window). */
+const NAME_CHECKS = { perCaller: 300, all: 20_000 } as const;
+
+/** How often one caller, and the whole process, may ask which address a code holds — an hour at a time. */
+const HELD_LOOKUPS = { perCaller: 30, all: 1000 } as const;
+
+/**
+ * The address an invitation code holds for its customer, for the form to fill in and lock — typed, or
+ * from the signup link (`?invite=`). Only a live code that holds one is answered; anything else — a
+ * wrong code, one used up, expired or ended, one that holds nothing, a partner's — is the same `null`,
+ * so this says nothing about codes beyond what they hold. Limited per caller (when known) and for the
+ * whole process, like the site's other lookups; past the limit the answer is `null` too, and signup
+ * still works — `startSignup` names the held address if a different one is sent.
+ */
+export async function heldAddress(code: string): Promise<{ slug: string } | null> {
+  const value = String(code ?? "").trim();
+  if (value.length < 6 || value.length > 100) return null;
+  const ip = clientIpFrom(await headers());
+  const allowed = siteAllowance([...(ip ? [{ key: `platform|held-lookup-caller:${ip}`, max: HELD_LOOKUPS.perCaller }] : []), { key: "platform|held-lookup:all", max: HELD_LOOKUPS.all }]);
+  if (!allowed) return null;
+  const hold = await inviteHold(sha256(value));
+  return hold ? { slug: hold.slug } : null;
+}
+
+export type SignupForm = {
+  companyName: string;
+  slug: string;
+  ownerName: string;
+  email: string;
+  password: string;
+  country: string;
+  /** An industry template's key (src/lib/industry-templates/catalogue.ts), or empty for none. Optional, so a form without it still works. */
+  industry?: string;
+  invite: string;
+  /** A partner's referral code — from a /signup?ref= link, the referral cookie, or typed. Optional, so a form without it still works. */
+  referral?: string;
+  referralVia?: "link" | "cookie" | "typed" | "";
+  /** The product chosen on its page (src/lib/products.ts key), to start a trial of it alone; empty: the default plan. Optional, so a form without it still works. */
+  product?: string;
+};
+
+/** Country codes as the form names them: "India". */
+const countryNames = (codes: readonly string[]) => codes.map((code) => WORLD_COUNTRIES.find((c) => c.code === code)?.name ?? code);
+
+const inviteRefusal = (open: boolean) =>
+  open ? "That invitation code isn't valid — leave it empty to sign up without one." : "That invitation code isn't valid. Signing up is by invitation for now.";
+
+async function inviteProblem(code: string, open: boolean): Promise<string | null> {
+  const invite = await controlDb().signupInvite.findUnique({ where: { codeHash: sha256(code.trim()) } });
+  if (!invite || invite.uses >= invite.maxUses || (invite.expiresAt && invite.expiresAt < new Date())) {
+    return inviteRefusal(open);
+  }
+  // A partner's code works only while its partner is ACTIVE — refused in the same words.
+  if (await partnerInviteProblem(invite.codeHash, new Date())) return inviteRefusal(open);
+  return null;
+}
+
+const REFERRAL_VIA = ["link", "cookie", "typed"] as const;
+
+/** One mailbox however it is written: its case, a "+tag", and Gmail's dots all reach the same inbox. */
+function mailboxKey(local: string, domain: string): string {
+  const d = domain.toLowerCase() === "googlemail.com" ? "gmail.com" : domain.toLowerCase();
+  const l = local.toLowerCase().split("+")[0]!;
+  return `${d === "gmail.com" ? l.split(".").join("") : l}@${d}`;
+}
+
+/**
+ * Whether this mailbox already owns a workspace — or owned one, closed since (security review, 23 Oct 2026). Every
+ * signup was a fresh free trial with its seats and AI credits, so one person could start one after another. Another
+ * workspace for somebody who has one is set up by Deskzo (or by an invitation, which skips this), not by a new trial.
+ */
+async function ownedWorkspaceBefore(local: string, domain: string): Promise<boolean> {
+  const key = mailboxKey(local, domain);
+  const domains = ["gmail.com", "googlemail.com"].includes(domain.toLowerCase()) ? ["gmail.com", "googlemail.com"] : [domain.toLowerCase()];
+  const owners = await controlDb().tenant.findMany({ where: { OR: domains.map((d) => ({ ownerEmail: { endsWith: `@${d}`, mode: "insensitive" as const } })) }, select: { ownerEmail: true } });
+  return owners.some(({ ownerEmail }) => {
+    const at = ownerEmail?.lastIndexOf("@") ?? -1;
+    return at > 0 && mailboxKey(ownerEmail!.slice(0, at), ownerEmail!.slice(at + 1)) === key;
+  });
+}
+
+/** The plan key when it names an edition (what a workspace starts on), otherwise null. */
+async function editionOnly(planKey: string | null): Promise<string | null> {
+  if (!planKey) return null;
+  const plan = await controlDb().plan.findUnique({ where: { key: planKey }, select: { kind: true } });
+  return plan?.kind === "EDITION" ? planKey : null;
+}
+
+/** Whether this code is a live invitation made by Deskzo's staff (not a partner's). Its other checks are inviteProblem's. */
+async function staffInvitation(code: string): Promise<boolean> {
+  if (!code) return false;
+  const invite = await controlDb().signupInvite.findUnique({ where: { codeHash: sha256(code) }, select: { partnerId: true } });
+  return !!invite && !invite.partnerId;
+}
+
+export async function startSignup(form: SignupForm): Promise<SignupResult<{ email: string }>> {
+  const slow = await limited(form.email);
+  if (slow) return refused({}, slow);
+
+  const companyName = String(form.companyName ?? "").trim();
+  const ownerName = String(form.ownerName ?? "").trim();
+  const slug = String(form.slug ?? "").trim().toLowerCase();
+  const parsed = parseEmailAddress(form.email);
+  const email = parsed ? { ...parsed, address: `${parsed.local}@${parsed.domain}` } : null;
+  const country = WORLD_COUNTRIES.find((c) => c.code === String(form.country ?? "").toUpperCase());
+  const password = String(form.password ?? "");
+
+  // Every field is looked at, and every problem said at once.
+  const issues: SignupIssues = {};
+  const put = (field: SignupIssueField, problem: string | null) => {
+    if (problem && !issues[field]) issues[field] = problem;
+  };
+  put("companyName", companyNameProblem(companyName));
+  put("ownerName", ownerNameProblem(ownerName));
+  put("email", emailShapeProblem(String(form.email ?? "")) ?? (email ? null : "That doesn't look like an email address — check it for a typo."));
+  if (email && isDisposableDomain(email.domain)) put("email", disposableEmailMessage(email.domain));
+  // Security audit round two, 13 Nov 2026 (B3): only a staff invitation skips the one-trial-per-mailbox rule. A
+  // partner's code is handed out by the partner, so a person with a workspace could get one after another with it.
+  if (email && !(await staffInvitation(String(form.invite ?? "").trim())) && (await ownedWorkspaceBefore(email.local, email.domain))) {
+    put("email", "This email address already has a Deskzo workspace — sign in to it. For another one, write to us and we'll set it up.");
+  }
+  put("country", country ? null : countryProblem("", () => false));
+  put("password", passwordProblem(password));
+  const industryInput = String(form.industry ?? "").trim();
+  const industry = industryInput ? templateOf(industryInput) : null;
+  if (industryInput && !industry) put("industry", "Choose your kind of business from the list — or leave it for later.");
+  // An invitation that holds an address for its customer: this signup gets exactly it, without the
+  // signup rules. The registered name is still asked for, and kept — just not matched against it.
+  const inviteCode = String(form.invite ?? "").trim();
+  const hold = inviteCode ? await inviteHold(sha256(inviteCode)) : null;
+  put("slug", slug ? await signupSlugProblem(slug, companyName, hold) : slugRequiredProblem(slug));
+  // Without an invitation only once signup is open; one given is checked either way — and refused in
+  // the same words whether it is mistyped, used up, expired or a suspended partner's.
+  const open = await signupOpen();
+  let formError = !open && !inviteCode ? "Signing up is by invitation for now — enter the code from your invitation." : undefined;
+  if (inviteCode) put("invite", await inviteProblem(inviteCode, open));
+  // The product chosen on its page: a trial of it alone, where it is sold — unless the invitation names
+  // a plan, which wins and makes the choice moot. An unknown key is no choice: the default plan.
+  const chosen = productByKey(String(form.product ?? "").trim().toLowerCase());
+  const invitePlan = chosen && inviteCode ? ((await controlDb().signupInvite.findUnique({ where: { codeHash: sha256(inviteCode) }, select: { planKey: true } }))?.planKey ?? null) : null;
+  const product = chosen && !invitePlan ? chosen : null;
+  if (product && country) {
+    const trial = await productTrialPlan(product.key, country.code);
+    if (!trial.ok && trial.reason === "country") put("country", productCountryProblem(product.name, countryNames(trial.soldIn)));
+    else if (!trial.ok) formError ??= productUnavailableMessage(product.name);
+  }
+  // A partner's code on the form must be live; an empty one is simply no partner code.
+  const referralInput = String(form.referral ?? "").trim();
+  const referral = referralInput ? await findActiveReferral(referralInput, new Date()) : null;
+  if (referralInput && !referral) put("referral", "That partner code isn't valid — clear it to sign up without one.");
+  if (formError || firstIssue(issues) || !email || !country) return refused(issues, formError);
+  const referralVia = referral ? ((REFERRAL_VIA as readonly string[]).includes(String(form.referralVia)) ? String(form.referralVia) : "typed") : null;
+
+  // A few live codes per address at a time (security audit, Nov 2026): every signup brings a fresh code
+  // with fresh tries, so starting signup after signup for one address was a way to keep guessing.
+  const liveCodes = await controlDb().pendingSignup.count({ where: { email: email.address, verifiedAt: null, codeExpiresAt: { gt: new Date() } } });
+  if (liveCodes >= MAX_LIVE_CODES_PER_ADDRESS) {
+    return refused({}, "We've already sent several codes to this address in the last few minutes. Use the latest one, or try again shortly.");
+  }
+
+  if (await signupsFull()) {
+    return refused({}, "We're getting more signups than usual right now. Please try again in a little while, or write to us and we'll set you up.");
+  }
+
+  const code = newSignupCode();
+  const secret = randomBytes(24).toString("base64url");
+  const head = await headers();
+  const pending = await controlDb().pendingSignup.create({
+    data: {
+      email: email.address,
+      ownerName,
+      companyName,
+      slug,
+      country: country.code,
+      passwordHash: await bcrypt.hash(password, 10),
+      inviteCodeHash: inviteCode ? sha256(inviteCode) : null,
+      codeHash: sha256(code),
+      codeExpiresAt: new Date(Date.now() + CODE_TTL_MS),
+      browserSecretHash: sha256(secret),
+      ip: clientIpFrom(head),
+      referralCode: referral?.code ?? null,
+      referralVia,
+      industryTemplate: industry?.key ?? null,
+      productKey: product?.key ?? null,
+    },
+    select: { id: true },
+  });
+
+  const host = requestHost(head);
+  (await cookies()).set(COOKIE, `${pending.id}.${secret}`, {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/",
+    secure: typeof host === "string" && protocolFor(host) === "https",
+    // The signup's day: staff's "Send a new code" is offered for as long (src/lib/console-shared/signup-browser.ts).
+    maxAge: SIGNUP_BROWSER_MS / 1000,
+  });
+
+  await sendPlatformMail({ type: "ACCOUNT", to: email.address, ...(await signupCodeTemplateMail({ ownerName, companyName, slug, code, minutes: CODE_TTL_MINUTES })) });
+  return { ok: true, data: { email: email.address } };
+}
+
+/** The signup this browser started, when its cookie is genuine. */
+async function thisBrowsersSignup() {
+  const raw = (await cookies()).get(COOKIE)?.value ?? "";
+  const [id, secret] = raw.split(".");
+  if (!id || !secret) return null;
+  const pending = await controlDb().pendingSignup.findUnique({ where: { id } });
+  if (!pending) return null;
+  const a = Buffer.from(pending.browserSecretHash);
+  const b = Buffer.from(sha256(secret));
+  return a.length === b.length && timingSafeEqual(a, b) ? pending : null;
+}
+
+const WORKER = path.join(process.cwd(), "scripts", "platform-worker.ts");
+const TSX_CLI = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+
+/**
+ * The emailed code. What is wrong with it is said at the code field — wrong (with the tries left),
+ * expired, or used up — and the form offers to send a new one (`startSignup` again). A code that isn't
+ * six digits is refused without costing a try: it can't be the one.
+ */
+export async function verifySignup(input: string): Promise<SignupResult> {
+  const pending = await thisBrowsersSignup();
+  if (!pending) return refused({}, "This signup has expired — start again, and we'll send you a new code.");
+  if (pending.verifiedAt) return { ok: true, data: null };
+  if (pending.codeExpiresAt < new Date()) return refused({ code: CODE_EXPIRED });
+  if (pending.attempts >= MAX_CODE_ATTEMPTS) return refused({ code: CODE_ATTEMPTS_USED });
+
+  const code = String(input ?? "").replace(/\s+/g, "");
+  const shape = codeShapeProblem(code);
+  if (shape) return refused({ code: shape });
+
+  /**
+   * Guesses at one address's codes are counted across all its signups too (security audit, Nov 2026):
+   * each new signup brings a fresh code and five fresh tries, so the per-signup count alone let
+   * somebody keep starting signups for an address they don't own and keep guessing.
+   */
+  const addressKey = `platform|signup-verify:${pending.email.trim().toLowerCase()}`;
+  const addressLock = lockoutState([addressKey]);
+  if (addressLock.lockedOut) return refused({}, `Too many wrong codes for this address. Try again in ${Math.ceil(addressLock.retryInSeconds / 60)} minute(s).`);
+
+  /**
+   * A try is taken before the code is compared, in one conditional update (security audit, Nov 2026).
+   * Checking `attempts` from the row read above and counting the wrong guess afterwards let requests
+   * sent at once all be compared before any of them was counted — five tries became as many as fitted
+   * in the gap. Now a comparison happens only after its try is reserved.
+   */
+  const reserved = await controlDb().pendingSignup.updateMany({
+    where: { id: pending.id, verifiedAt: null, attempts: { lt: MAX_CODE_ATTEMPTS }, codeExpiresAt: { gt: new Date() } },
+    data: { attempts: { increment: 1 } },
+  });
+  if (reserved.count !== 1) {
+    const now = await controlDb().pendingSignup.findUnique({ where: { id: pending.id }, select: { verifiedAt: true, codeExpiresAt: true } });
+    if (now?.verifiedAt) return { ok: true, data: null };
+    return refused({ code: !now || now.codeExpiresAt < new Date() ? CODE_EXPIRED : CODE_ATTEMPTS_USED });
+  }
+  if (sha256(code) !== pending.codeHash) {
+    recordFailure([addressKey]);
+    return refused({ code: wrongCodeMessage(Math.max(0, MAX_CODE_ATTEMPTS - pending.attempts - 1)) });
+  }
+
+  // The invitation is spent now — conditionally, so two signups on one single-use code get one workspace.
+  const inviteCodeHash = pending.inviteCodeHash;
+  if (inviteCodeHash) {
+    const spent = await controlDb().$executeRaw`
+      UPDATE "signup_invites" SET "uses" = "uses" + 1
+      WHERE "codeHash" = ${inviteCodeHash} AND "uses" < "maxUses" AND ("expiresAt" IS NULL OR "expiresAt" > now())`;
+    if (spent !== 1) return refused({}, "That invitation has been used in the meantime — ask for a new one.");
+  } else if (!(await signupOpen())) {
+    return refused({}, "Signing up is by invitation for now.");
+  }
+
+  const found = inviteCodeHash ? await controlDb().signupInvite.findUnique({ where: { codeHash: inviteCodeHash }, select: { planKey: true, partnerId: true } }) : null;
+  // Security audit round two, 13 Nov 2026 (B3): a partner's code made before the fix may name an add-on or bundle —
+  // a workspace starts only on an edition, so such a plan counts as none (the default plan).
+  const invite = found ? { planKey: found.partnerId ? await editionOnly(found.planKey) : found.planKey } : null;
+  // The address it holds, if any — though spending it may have just used it up, this signup is the one it was for.
+  const hold = inviteCodeHash ? await inviteHold(inviteCodeHash, { open: false }) : null;
+  let tenantId: string;
+  try {
+    // A partner's invitation whose partner is no longer ACTIVE is refused in the usual words — and goes back, below.
+    if (inviteCodeHash && (await partnerInviteProblem(inviteCodeHash, new Date()))) throw new ProvisioningRefused(inviteRefusal(await signupOpen()));
+    const now = new Date();
+    const attribution = await resolveSignupAttribution({ inviteCodeHash, referralCode: pending.referralCode, email: pending.email, country: pending.country }, now);
+    // The referral link is read again now: the plan it names applies when nothing before it does.
+    const referral = pending.referralCode ? await findActiveReferral(pending.referralCode, now, pending.country) : null;
+    // The product chosen on its page, asked again: staff may have retired its plan since the form was sent.
+    const product = invite?.planKey ? null : productByKey(pending.productKey);
+    const trial = product ? await productTrialPlan(product.key, pending.country) : null;
+    if (product && !trial?.ok) throw new ProvisioningRefused(productUnavailableMessage(product.name));
+    ({ tenantId } = await startProvisioning({
+      slug: pending.slug,
+      companyName: pending.companyName,
+      ownerName: pending.ownerName,
+      ownerEmail: pending.email,
+      ownerPasswordHash: pending.passwordHash,
+      country: pending.country,
+      planKey: signupPlanKey({ invitePlan: invite?.planKey ?? null, productPlan: trial?.ok ? trial.planKey : null, referralPlan: await editionOnly(referral?.planKey ?? null) }),
+      attribution,
+      hold,
+      industryTemplate: pending.industryTemplate,
+    }));
+  } catch (err) {
+    // The invitation goes back: nothing was made with it.
+    if (inviteCodeHash) await controlDb().signupInvite.update({ where: { codeHash: inviteCodeHash }, data: { uses: { decrement: 1 } } });
+    if (err instanceof ProvisioningRefused) return refused({}, err.message);
+    throw err;
+  }
+  // The password now lives only on the job, which clears it once the owner exists.
+  await controlDb().pendingSignup.update({ where: { id: pending.id }, data: { verifiedAt: new Date(), tenantId, passwordHash: "" } });
+
+  // A worker for this job now, so nobody has to have set one up; a running one finds nothing left.
+  try {
+    spawn(process.execPath, [TSX_CLI, WORKER, "--once"], { cwd: process.cwd(), detached: true, stdio: "ignore", env: process.env }).unref();
+  } catch (err) {
+    console.error("[signup] could not start the worker; a running one will take the job", err);
+  }
+  return { ok: true, data: null };
+}
+
+export type SignupProgress =
+  | { state: "setting-up"; step: string }
+  | { state: "ready"; url: string }
+  | { state: "failed"; message: string }
+  | { state: "gone" };
+
+export async function signupProgress(): Promise<SignupProgress> {
+  const pending = await thisBrowsersSignup();
+  if (!pending?.tenantId) return { state: "gone" };
+  const control = controlDb();
+  const [tenant, job] = await Promise.all([
+    control.tenant.findUnique({ where: { id: pending.tenantId }, select: { id: true, slug: true, status: true } }),
+    control.provisioningJob.findFirst({ where: { tenantId: pending.tenantId }, orderBy: { createdAt: "desc" }, select: { status: true, step: true } }),
+  ]);
+  if (!tenant) return { state: "gone" };
+  if (job?.status === "FAILED") return { state: "failed", message: job.step };
+  if (tenant.status !== "ACTIVE") return { state: "setting-up", step: job?.step ?? "Waiting to start" };
+
+  const host = subdomainHost(tenant.slug);
+  const origin = `${protocolFor(host)}://${host}`;
+  // The pass, once: a second look (a refresh) is sent to the sign-in page instead.
+  const claimed = await control.pendingSignup.updateMany({ where: { id: pending.id, handedOffAt: null }, data: { handedOffAt: new Date() } });
+  if (claimed.count !== 1) return { state: "ready", url: `${origin}/login` };
+  const ticket = await createHandoffTicket(tenant.id, pending.email, "owner-signup");
+  return { state: "ready", url: `${origin}/handoff?t=${encodeURIComponent(ticket)}` };
+}

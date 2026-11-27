@@ -1,0 +1,123 @@
+"use client";
+
+import Link from "next/link";
+import { CompanyLink } from "@/components/companies/company-link";
+import { useRouter } from "next/navigation";
+import { useState, useTransition } from "react";
+import { dismissDuplicate, type DuplicateRow } from "@/actions/company-merge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { ActionNotice } from "@/components/ui/action-notice";
+import { useWording } from "@/components/terms/wording-provider";
+import { slot } from "@/lib/terms/dictionary";
+
+/**
+ * Likely duplicates, a pair to a row. The first company in each is the one suggested to keep — the
+ * one with more history under it — and the merge screen can swap them.
+ */
+export function DuplicatesList({ rows }: { rows: DuplicateRow[] }) {
+  const router = useRouter();
+  const [pending, startTransition] = useTransition();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const w = useWording();
+
+  function dismiss(row: DuplicateRow) {
+    const [a, b] = row.companies;
+    const key = `${a!.id}|${b!.id}`;
+    setBusy(key);
+    setError(null);
+    startTransition(async () => {
+      const result = await dismissDuplicate(a!.id, b!.id);
+      setBusy(null);
+      if (!result.ok) setError(result.error);
+      else router.refresh();
+    });
+  }
+
+  if (rows.length === 0) {
+    return (
+      <Card className="px-4 py-6 text-center text-sm text-muted">
+        {slot(w, "No likely duplicates among the companies you can see.", "company", "No likely duplicates among the {many:lower} you can see.")}
+      </Card>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {error && <ActionNotice tone="error">{error}</ActionNotice>}
+      {rows.map((row) => {
+        const [keep, drop] = row.companies;
+        const key = `${keep!.id}|${drop!.id}`;
+        // Both with Zoho invoices (owner, 18 Nov 2026): the first is still the one to keep — say so, and why.
+        const bothZoho = keep!.zohoInvoices > 0 && drop!.zohoInvoices > 0;
+        const why = keep!.zohoInvoices > drop!.zohoInvoices ? "it has more of them" : keep!.records > drop!.records ? "it has more under it" : "it's the older record";
+        return (
+          <Card key={key} className="space-y-2 px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${
+                  row.strength === "strong" ? "bg-danger/10 text-danger" : "bg-surface-sunken text-muted"
+                }`}
+              >
+                {row.strength === "strong" ? "Very likely" : "Possibly"}
+              </span>
+              <span className="text-xs text-muted">{row.reasons.join(" · ")}</span>
+              {/* Which way it goes (src/lib/companies/bulk-merge.ts): with the rest in one go, or by a person and why. */}
+              <span className={`ml-auto text-[11px] ${row.bulk === true ? "text-success" : "text-subtle"}`}>
+                {row.bulk === true ? "Merges with the rest" : row.bulk === "business" ? "Has orders or documents — merge by hand" : "A weaker match — check by hand"}
+              </span>
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              {row.companies.map((c, i) => (
+                <div key={c.id} className={`min-w-0 rounded-base border px-3 py-2 ${bothZoho && i === 0 ? "border-success" : "border-line"}`}>
+                  <CompanyLink href={`/companies/${c.ref}`} className="block truncate text-sm font-medium text-text hover:underline">
+                    {c.name}
+                  </CompanyLink>
+                  {/* Where it came from, and its Zoho Books invoices — the one with them is suggested to keep (owner, 14 Nov 2026). */}
+                  <div className="mt-0.5 flex flex-wrap gap-1">
+                    {c.fromZoho && <span className="rounded-full bg-brand-subtle px-2 py-0.5 text-[11px] font-medium text-brand">Zoho Books</span>}
+                    {c.fromOldCrm && <span className="rounded-full bg-warning-bg px-2 py-0.5 text-[11px] font-medium text-warning">Old CRM</span>}
+                    {!c.fromZoho && !c.fromOldCrm && <span className="rounded-full bg-surface-sunken px-2 py-0.5 text-[11px] text-muted">Made in Deskzo</span>}
+                    {c.zohoInvoices > 0 &&
+                      (i === 0 ? (
+                        <span className="rounded-full bg-success-bg px-2 py-0.5 text-[11px] font-medium text-success">
+                          {c.zohoInvoices.toLocaleString("en-IN")} Zoho invoice{c.zohoInvoices === 1 ? "" : "s"} — keep this one
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-surface-sunken px-2 py-0.5 text-[11px] text-muted">
+                          {c.zohoInvoices.toLocaleString("en-IN")} Zoho invoice{c.zohoInvoices === 1 ? "" : "s"} — they move to the one kept
+                        </span>
+                      ))}
+                  </div>
+                  <p className="text-xs text-muted">
+                    <span className="font-mono">{c.ref}</span> · {c.kind}
+                    {c.place ? ` · ${c.place}` : ""}
+                    {c.manager ? ` · ${c.manager}` : ""} · {c.records} record{c.records === 1 ? "" : "s"}
+                  </p>
+                </div>
+              ))}
+            </div>
+            {bothZoho && (
+              <p className="text-xs text-muted">
+                Both have Zoho invoices. Keep <span className="font-medium text-text">{keep!.name}</span>
+                {` — ${why}`}; {drop!.name}&apos;s invoices move across with the merge, nothing lost.
+              </p>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Link
+                href={`/companies/merge?keep=${keep!.ref}&drop=${drop!.ref}`}
+                className="inline-flex h-8 items-center rounded-base bg-brand px-3 text-[13px] text-brand-contrast shadow-sm hover:brightness-110"
+              >
+                Review merge
+              </Link>
+              <Button size="sm" variant="ghost" disabled={pending && busy === key} onClick={() => dismiss(row)}>
+                {pending && busy === key ? "Saving…" : "Not duplicates"}
+              </Button>
+            </div>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}

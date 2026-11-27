@@ -1,0 +1,32 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Reading the call log: only calls with numbers on a customer the person can see leave the phone. -->
+  <uses-permission android:name="android.permission.READ_CALL_LOG" />
+  <!-- Knowing when a call starts and ends; with the call log, the ringing number too. -->
+  <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <!-- Told when a screenshot is taken in the app (Android 14+), for the workspace's screenshot allowance. Granted at
+       install; it says only that one was taken, never what is in it. -->
+  <uses-permission android:name="android.permission.DETECT_SCREEN_CAPTURE" />
+  <!-- Call recordings (owner, 9 Nov 2026): reading the audio files the phone's own call recorder saved, to send the one
+       made for a call Deskzo logged. Asked only when the workspace has recordings on. -->
+  <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
+  <application>
+    <!--
+      Phone state, delivered with the app closed (one of the broadcasts Android still sends to a manifest
+      receiver). Only the system may send it: MODIFY_PHONE_STATE is the telephony service's own permission,
+      so no other app can make the phone look up or sync a number it invented.
+    -->
+    <receiver
+      android:name="com.deskzo.calls.CallStateReceiver"
+      android:exported="true"
+      android:permission="android.permission.MODIFY_PHONE_STATE">
+      <intent-filter>
+        <action android:name="android.intent.action.PHONE_STATE" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>

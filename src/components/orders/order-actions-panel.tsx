@@ -1,0 +1,589 @@
+"use client";
+
+import { Lock } from "lucide-react";
+import { useState, useTransition } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import type { OrderStatus, PaymentTerms } from "@prisma/client";
+import { approveOrder, processOrder, fulfillOrder, cancelOrder } from "@/actions/order";
+import { createVendorPoForOrder } from "@/actions/order-vendor-po";
+import { documentPath, tradeDocumentStatusLabels } from "@/lib/trade-documents";
+import type { TradeDocumentStatus } from "@prisma/client";
+import { Button } from "@/components/ui/button";
+import { Input, Label, Textarea } from "@/components/ui/input";
+import { Dialog } from "@/components/ui/dialog";
+import { CompanyCombobox } from "@/components/ui/company-combobox";
+import { PaymentsDialog, type PayableOrder } from "@/components/payments/payments-dialog";
+import { paymentTermsLabels } from "@/lib/gst";
+import { CreditBadge } from "@/components/credit/credit-badge";
+import { MIN_OVERRIDE_REASON, type CreditRating, type TermsKey } from "@/lib/credit/engine";
+import { formatCurrency } from "@/lib/utils";
+import { MIN_INCREASE_REASON, needsSalesApproval, savingAmount, shortDay, type ReleaseState } from "@/lib/orders/handoff-rules";
+import { useClock } from "@/components/time/clock-provider";
+import { useWording } from "@/components/terms/wording-provider";
+import { slot } from "@/lib/terms/dictionary";
+
+type VendorOption = { id: string; name: string; paymentTerms: PaymentTerms };
+
+/** Where the order stands with purchase — what the purchasing box and the cancel dialog need to say. */
+export type OrderPurchaseState = {
+  purchaseRelease: ReleaseState;
+  releaseOn: Date | string | null;
+  /** The most purchase may pay without asking sales (see `priceCeiling`), for the signed-in purchaser. */
+  priceCeiling: number | null;
+  /** The salesperson's distributor price — what a saving is measured against. */
+  quotePrice: number | null;
+  /**
+   * The distributor that price came from (owner, 16 Nov 2026: "if sales person has already added vendor name and
+   * price, why not showing the selected distributor"): the vendor box starts at it, and purchase changes it for a
+   * better price elsewhere. A name typed without a vendor record is only said.
+   */
+  quoteVendorId?: string | null;
+  quoteVendorName?: string | null;
+  /** A higher price is waiting for sales. */
+  pendingIncrease: boolean;
+  /** Money received against the order, which cancelling would move on account. */
+  paid: number;
+  vendorName: string | null;
+};
+
+/**
+ * Our purchase order to the vendor (owner, 15 Oct 2026 — src/lib/orders/vendor-po.ts): null where the
+ * plan has no purchase orders. `canRaise` is "Create purchase orders"; `live` the order's PO, a draft
+ * included; `canOpen` whether the viewer may open documents at all.
+ */
+export type OrderVendorPo = {
+  canRaise: boolean;
+  canOpen: boolean;
+  live: { id: string; docNumber: string; status: TradeDocumentStatus } | null;
+};
+
+/** The order's credit position while it awaits approval — see `orderCreditPosition`. */
+export type OrderCredit = {
+  rating: CreditRating;
+  score: number | null;
+  recommendedTerms: TermsKey;
+  terms: TermsKey;
+  limit: number;
+  outstanding: number;
+  overdue: number;
+  concerns: string[];
+  termsDecided: boolean;
+  canOverride: boolean;
+};
+
+export function OrderActionsPanel({
+  order,
+  currentUserId,
+  canApprove,
+  canProcess,
+  canRecordPayments,
+  canDeletePayments,
+  vendorOptions,
+  companyId,
+  companyName,
+  credit = null,
+  purchase,
+  vendorPo = null,
+}: {
+  order: PayableOrder & { orderStatus: OrderStatus; vendorId: string | null; purchasePrice: unknown; ourPoNumber: string | null; addedByUserId: string };
+  purchase: OrderPurchaseState;
+  currentUserId: string;
+  canApprove: boolean;
+  canProcess: boolean;
+  canRecordPayments: boolean;
+  canDeletePayments: boolean;
+  vendorOptions: VendorOption[];
+  companyId: string;
+  companyName: string;
+  credit?: OrderCredit | null;
+  vendorPo?: OrderVendorPo | null;
+}) {
+  const router = useRouter();
+  const clock = useClock();
+  // The workspace's own words (Settings → Wording).
+  const wording = useWording();
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [approveNotes, setApproveNotes] = useState("");
+  const [creditReason, setCreditReason] = useState("");
+  const [showReject, setShowReject] = useState(false);
+  const [showCancel, setShowCancel] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [showPayments, setShowPayments] = useState(false);
+
+  // What purchase saved, else the salesperson's distributor where it's one of the vendors offered.
+  const quotedVendor = purchase.quoteVendorId && vendorOptions.some((v) => v.id === purchase.quoteVendorId) ? purchase.quoteVendorId : null;
+  const [vendorId, setVendorId] = useState(order.vendorId ?? quotedVendor ?? "");
+  const [purchasePrice, setPurchasePrice] = useState(
+    order.purchasePrice ? String(order.purchasePrice) : purchase.quotePrice !== null ? String(purchase.quotePrice) : "",
+  );
+  const [ourPoNumber, setOurPoNumber] = useState(order.ourPoNumber ?? "");
+  const [increaseReason, setIncreaseReason] = useState("");
+  const [purchasingError, setPurchasingError] = useState<string | null>(null);
+  const [purchasingNotice, setPurchasingNotice] = useState<string | null>(null);
+
+  // The price typed, against the salesperson's distributor price — said before saving, not after.
+  const typedPrice = purchasePrice === "" ? null : Number(purchasePrice);
+  const aboveCeiling = typedPrice !== null && Number.isFinite(typedPrice) && needsSalesApproval(purchase.priceCeiling, typedPrice);
+  const saving =
+    typedPrice !== null && Number.isFinite(typedPrice) && purchase.quotePrice !== null && purchase.priceCeiling !== null && !aboveCeiling
+      ? savingAmount(purchase.quotePrice, typedPrice, order.quantity)
+      : null;
+  const released = purchase.purchaseRelease === "RELEASED";
+  /**
+   * A price far from the distributor's — a tenth of it, or ten times — is more likely a slip (₹1 typed
+   * for ₹1,00,000, the order's total typed as a unit price) than a bargain. Said, not refused.
+   */
+  const farOff =
+    typedPrice !== null && Number.isFinite(typedPrice) && typedPrice > 0 && purchase.quotePrice !== null && purchase.quotePrice > 0
+      ? typedPrice < purchase.quotePrice / 10
+        ? "below"
+        : typedPrice > purchase.quotePrice * 10
+          ? "above"
+          : null
+      : null;
+  // Fulfilling goes by what was saved, so it waits until the vendor and price are.
+  const savedForPurchase = !!order.vendorId && order.purchasePrice !== null && order.purchasePrice !== undefined && order.purchasePrice !== "";
+  const vendorName = (id: string) => vendorOptions.find((v) => v.id === id)?.name ?? "the vendor";
+  /**
+   * "Create vendor PO" raises the PO from what is saved, so it waits for a saved vendor and price, for
+   * sales to accept a higher one, and for the box's own changes to be saved.
+   */
+  const offersPo = !!vendorPo?.canRaise && !vendorPo.live;
+  /**
+   * Our PO is issued to the vendor (owner, 16 Nov 2026: "since po is created and issued to vendor … the form field
+   * should get locked"): the vendor, price and PO number are what it says, so they stay as saved. Changing them means
+   * cancelling that PO first — then they open again. A draft PO isn't sent yet, so it locks nothing.
+   */
+  const lockedByPo = !!vendorPo?.live && vendorPo.live.status !== "DRAFT" && vendorPo.live.status !== "CANCELLED";
+  const unsavedChanges = vendorId !== (order.vendorId ?? "") || purchasePrice !== (order.purchasePrice ? String(order.purchasePrice) : "");
+  const poReady = savedForPurchase && !purchase.pendingIncrease && !unsavedChanges;
+
+  function handleApprove(approved: boolean, notes?: string) {
+    setError(null);
+    startTransition(async () => {
+      const result = await approveOrder({ orderId: order.id, approved, notes: notes ?? "", creditOverrideReason: creditReason });
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      setShowReject(false);
+      router.refresh();
+    });
+  }
+
+  function handleProcess() {
+    setPurchasingError(null);
+    setPurchasingNotice(null);
+    if (!vendorId) return setPurchasingError("Pick the vendor first.");
+    if (purchasePrice === "") return setPurchasingError("Enter the purchase price per unit.");
+    startTransition(async () => {
+      const result = await processOrder({ orderId: order.id, vendorId, purchasePrice, ourPoNumber, increaseReason });
+      if (!result.ok) {
+        setPurchasingError(result.error);
+        return;
+      }
+      if (result.data.awaitingSales) {
+        setPurchasingNotice("Sent to sales to accept the higher price. The order is processed once they do.");
+        setIncreaseReason("");
+      } else {
+        // Said, so a save is seen to have happened — before, the box just looked the same afterwards.
+        setPurchasingNotice(
+          `Saved — ${vendorName(vendorId)} at ${formatCurrency(Number(purchasePrice))} a unit${ourPoNumber.trim() ? `, our PO ${ourPoNumber.trim()}` : ""}.${
+            offersPo ? " Create the vendor PO next, and mark it fulfilled once it's delivered." : " Mark it fulfilled once it's delivered."
+          }`,
+        );
+      }
+      router.refresh();
+    });
+  }
+
+  /** A draft PO to the saved vendor, opened to check and issue (src/actions/order-vendor-po.ts). */
+  function handleCreatePo() {
+    setPurchasingError(null);
+    setPurchasingNotice(null);
+    startTransition(async () => {
+      const result = await createVendorPoForOrder(order.id);
+      if (!result.ok) {
+        setPurchasingError(result.error);
+        router.refresh();
+        return;
+      }
+      router.push(documentPath(result.data.id));
+    });
+  }
+
+  function handleFulfill() {
+    setPurchasingError(null);
+    setPurchasingNotice(null);
+    startTransition(async () => {
+      const result = await fulfillOrder(order.id);
+      if (!result.ok) {
+        setPurchasingError(result.error);
+        return;
+      }
+      router.refresh();
+    });
+  }
+
+  function handleCancel() {
+    setError(null);
+    startTransition(async () => {
+      const result = await cancelOrder(order.id, cancelReason);
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      setShowCancel(false);
+      router.refresh();
+    });
+  }
+
+  const canCancel =
+    order.orderStatus !== "FULFILLED" &&
+    order.orderStatus !== "CANCELLED" &&
+    (order.addedByUserId === currentUserId || canApprove || canProcess);
+  // Once it is with purchase, cancelling it affects them — so they are told, and a reason is needed.
+  const cancelNeedsReason = released;
+
+  return (
+    // A size container: the panel sits in the order page's side column, so its own width — not the
+    // window's — decides whether the purchasing fields sit side by side.
+    <div className="@container min-w-0 space-y-4">
+      {error && <p className="text-sm text-danger">{error}</p>}
+
+      {order.orderStatus === "PENDING_APPROVAL" && canApprove && (
+        <div className="space-y-2 rounded-md border border-warning bg-warning-bg p-3">
+          <p className="text-sm font-medium text-text">Awaiting your review</p>
+          {credit && (
+            <div className="space-y-1.5 rounded-md border border-line bg-surface p-2.5 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-muted">Credit</span>
+                <CreditBadge rating={credit.rating} score={credit.score} />
+                <span className="text-muted">
+                  {paymentTermsLabels[credit.terms]} on this order · up to {paymentTermsLabels[credit.recommendedTerms]} suggested · owes{" "}
+                  {formatCurrency(credit.outstanding)} of {formatCurrency(credit.limit)}
+                  {credit.overdue > 0 && <span className="text-danger"> ({formatCurrency(credit.overdue)} overdue)</span>}
+                </span>
+              </div>
+              {credit.termsDecided && <p className="text-muted">Its terms were approved as a credit override when it was punched.</p>}
+              {credit.concerns.length > 0 && (
+                <div className="space-y-1.5 text-warning">
+                  <p className="font-medium">Approving this needs a credit override:</p>
+                  <ul className="list-disc space-y-0.5 pl-4">
+                    {credit.concerns.map((c) => (
+                      <li key={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</li>
+                    ))}
+                  </ul>
+                  {credit.canOverride ? (
+                    <Textarea
+                      aria-label="Why approve it anyway"
+                      placeholder="Why approve it anyway — kept on the customer's credit record"
+                      value={creditReason}
+                      onChange={(e) => setCreditReason(e.target.value)}
+                    />
+                  ) : (
+                    <p className="text-muted">Only someone who can override credit terms can approve it. You can still reject it.</p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          <Textarea
+            aria-label="Approval notes"
+            placeholder="Notes (optional)"
+            value={approveNotes}
+            onChange={(e) => setApproveNotes(e.target.value)}
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="sm"
+              disabled={isPending || (!!credit && credit.concerns.length > 0 && (!credit.canOverride || creditReason.trim().length < MIN_OVERRIDE_REASON))}
+              onClick={() => handleApprove(true, approveNotes)}
+            >
+              {isPending ? "Saving…" : credit && credit.concerns.length > 0 ? "Approve with credit override" : "Approve"}
+            </Button>
+            <Button type="button" variant="danger" size="sm" disabled={isPending} onClick={() => setShowReject(true)}>
+              Reject
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {order.orderStatus === "APPROVED" && canProcess && !released && (
+        <div className="space-y-1 rounded-md border border-line bg-surface-sunken p-3">
+          <p className="text-sm font-medium text-text">Purchasing</p>
+          <p className="text-sm text-muted">
+            {purchase.purchaseRelease === "HELD"
+              ? slot(wording, "Sales is holding this order — it hasn't been sent to purchase yet.", "order", "Sales is holding this {one:lower} — it hasn't been sent to purchase yet.")
+              : `This order comes to purchase on ${purchase.releaseOn ? shortDay(purchase.releaseOn, clock) : "its scheduled day"}.`}
+          </p>
+        </div>
+      )}
+
+      {(order.orderStatus === "APPROVED" || order.orderStatus === "PROCESSING") && canProcess && released && (
+        <div className="space-y-2 rounded-md border border-info bg-info-bg p-3">
+          <p className="text-sm font-medium text-text">Purchasing</p>
+          {purchase.quotePrice !== null && (
+            <p className="text-xs text-muted">
+              {purchase.priceCeiling === null
+                ? `You entered the ${slot(wording, "vendor", "vendor", "{one:lower}")} price (${formatCurrency(purchase.quotePrice)} a unit) yourself when the order was punched, so it isn't a limit for you, and no saving is recorded against it.`
+                : `Sales has a ${slot(wording, "vendor", "vendor", "{one:lower}")} price of ${formatCurrency(purchase.quotePrice)} a unit${
+                    purchase.priceCeiling > purchase.quotePrice ? `, and accepted up to ${formatCurrency(purchase.priceCeiling)}` : ""
+                  }.`}
+            </p>
+          )}
+          <div className="min-w-0 space-y-1">
+            <Label className="text-xs">{slot(wording, "Vendor", "vendor", "{one}")}</Label>
+            <CompanyCombobox
+              companies={vendorOptions.map((v) => ({
+                id: v.id,
+                name: v.name,
+                hint: paymentTermsLabels[v.paymentTerms],
+              }))}
+              value={vendorId}
+              onSelect={(vendor) => setVendorId(vendor?.id ?? "")}
+              placeholder={slot(wording, "Type to search vendors…", "vendor", "Type to search {many:lower}…")}
+              // Held while saving: a change typed now would be neither in this save nor kept after it. Fixed once our PO is issued.
+              disabled={isPending || lockedByPo}
+            />
+            {!order.vendorId && (quotedVendor || purchase.quoteVendorName) && (
+              <p className="text-xs text-subtle">
+                {quotedVendor && vendorId === quotedVendor
+                  ? `The salesperson's ${slot(wording, "vendor", "vendor", "{one:lower}")} — change it if another ${slot(wording, "vendor", "vendor", "{one:lower}")} gives a better price.`
+                  : purchase.quoteVendorName
+                    ? `The salesperson quoted from ${purchase.quoteVendorName}, not one of your ${slot(wording, "vendors", "vendor", "{many:lower}")} yet.`
+                    : null}
+              </p>
+            )}
+          </div>
+          {/* One column in a narrow panel, two from 24rem. `min-w-0` lets a field shrink to its track —
+              a number input's own width otherwise pushes the grid past the card. */}
+          <div className="grid grid-cols-1 gap-2 @sm:grid-cols-2">
+            <div className="min-w-0 space-y-1">
+              <Label htmlFor="order-purchase-price" className="text-xs">Purchase price / unit</Label>
+              <Input
+                id="order-purchase-price"
+                type="number"
+                step="0.01"
+                value={purchasePrice}
+                onChange={(e) => setPurchasePrice(e.target.value)}
+                disabled={isPending || lockedByPo}
+              />
+            </div>
+            <div className="min-w-0 space-y-1">
+              <Label htmlFor="order-our-po" className="text-xs">{slot(wording, "Our PO to vendor", "vendor", "Our PO to {one:lower}")}</Label>
+              <Input id="order-our-po" value={ourPoNumber} onChange={(e) => setOurPoNumber(e.target.value)} disabled={isPending || lockedByPo} />
+            </div>
+          </div>
+          {saving !== null && (
+            <p className={`text-xs ${saving >= 0 ? "text-success" : "text-danger"}`}>
+              {saving > 0
+                ? `${formatCurrency(saving)} below the ${slot(wording, "vendor", "vendor", "{one:lower}")} price on ${order.quantity} unit${order.quantity === 1 ? "" : "s"} — recorded as your saving.`
+                : saving === 0
+                  ? `The same as the ${slot(wording, "vendor", "vendor", "{one:lower}")} price.`
+                  : `${formatCurrency(-saving)} above the ${slot(wording, "vendor", "vendor", "{one:lower}")} price, within what sales accepted.`}
+            </p>
+          )}
+          {farOff && !aboveCeiling && (
+            <p className="text-xs text-warning">
+              {formatCurrency(typedPrice ?? 0)} a unit is far {farOff} the {slot(wording, "vendor", "vendor", "{one:lower}")} price of {formatCurrency(purchase.quotePrice ?? 0)} — check
+              it&apos;s the price for one unit.
+            </p>
+          )}
+          {aboveCeiling && (
+            <div className="space-y-1">
+              <p className="text-xs text-warning">
+                {formatCurrency((typedPrice ?? 0) - (purchase.priceCeiling ?? 0))} a unit above{" "}
+                {purchase.quotePrice !== null && purchase.priceCeiling === purchase.quotePrice ? `the salesperson's ${slot(wording, "vendor", "vendor", "{one:lower}")} price` : "the price sales accepted"}.
+                Say why — the salesperson is asked to accept it, and the order waits until they do.
+              </p>
+              <Textarea
+                aria-label="Why the higher price"
+                placeholder={`Why it costs more (at least ${MIN_INCREASE_REASON} characters)`}
+                value={increaseReason}
+                onChange={(e) => setIncreaseReason(e.target.value)}
+                disabled={isPending}
+              />
+            </div>
+          )}
+          {lockedByPo && vendorPo?.live && (
+            <p className="flex items-start gap-1.5 text-xs text-muted">
+              <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+              <span>
+                Locked — {vendorPo.live.docNumber} is issued to the {slot(wording, "vendor", "vendor", "{one:lower}")}. To change the {slot(wording, "vendor", "vendor", "{one:lower}")} or price, cancel that PO
+                first; these open again.
+              </span>
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            {!lockedByPo && (
+              <Button
+                type="button"
+                size="sm"
+                disabled={isPending || (aboveCeiling && increaseReason.trim().length < MIN_INCREASE_REASON)}
+                onClick={handleProcess}
+              >
+                {isPending ? "Saving…" : aboveCeiling ? "Ask sales to accept" : "Save purchasing details"}
+              </Button>
+            )}
+            {offersPo && (
+              <Button type="button" variant="secondary" size="sm" disabled={isPending || !poReady} onClick={handleCreatePo}>
+                Create vendor PO
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={isPending || !savedForPurchase || purchase.pendingIncrease}
+              onClick={handleFulfill}
+            >
+              Mark fulfilled
+            </Button>
+          </div>
+          {vendorPo?.live && (
+            <p className="text-xs text-muted">
+              Purchase order{" "}
+              {vendorPo.canOpen ? (
+                <Link href={documentPath(vendorPo.live.id)} className="font-mono text-brand hover:underline">
+                  {vendorPo.live.docNumber}
+                </Link>
+              ) : (
+                <span className="font-mono text-text">{vendorPo.live.docNumber}</span>
+              )}{" "}
+              · {tradeDocumentStatusLabels[vendorPo.live.status]}
+              {vendorPo.live.status === "DRAFT" ? " — check it and issue it; its number then fills in Our PO to vendor." : ""}
+            </p>
+          )}
+          {/* Why "Mark fulfilled" (and "Create vendor PO") can't be pressed, in words rather than in a tooltip nobody sees. */}
+          {(purchase.pendingIncrease || !savedForPurchase) && (
+            <p className="text-xs text-subtle">
+              {purchase.pendingIncrease
+                ? offersPo
+                  ? "The PO and Mark fulfilled wait for sales to accept the higher price."
+                  : "Mark fulfilled waits for sales to accept the higher price."
+                : offersPo
+                  ? "Save the vendor and purchase price first — then create the PO, and mark it fulfilled once it's delivered."
+                  : "Save the vendor and purchase price first — then it can be marked fulfilled."}
+            </p>
+          )}
+          {offersPo && savedForPurchase && !purchase.pendingIncrease && unsavedChanges && (
+            <p className="text-xs text-subtle">Save your changes first — the PO is raised from the saved vendor and price.</p>
+          )}
+          {purchasingError && (
+            <p role="alert" className="text-xs text-danger">
+              {purchasingError}
+            </p>
+          )}
+          {purchasingNotice && (
+            <p role="status" className="text-xs text-success">
+              {purchasingNotice}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* The customer's money, kept apart from the vendor's: the purchasing box above is what we pay the
+          distributor; this is what the customer has paid us. They sat on one row and read as one thing. */}
+      {(canRecordPayments || canDeletePayments || canCancel) && (
+        <div className="flex flex-wrap items-center gap-2 border-t border-line pt-3">
+          {(canRecordPayments || canDeletePayments) && (
+            <Button type="button" variant="secondary" size="sm" onClick={() => setShowPayments(true)}>
+              {slot(wording, "Customer payments", "customer", "{one} payments")}
+            </Button>
+          )}
+          {canCancel && (
+            <Button type="button" variant="ghost" size="sm" className="ml-auto text-danger" onClick={() => setShowCancel(true)}>
+              {slot(wording, "Cancel order", "order", "Cancel {one:lower}")}
+            </Button>
+          )}
+        </div>
+      )}
+
+      <Dialog open={showReject} onClose={() => setShowReject(false)} title={slot(wording, "Reject order", "order", "Reject {one:lower}")}>
+        <p className="text-sm text-muted">
+          {slot(wording, "This tells the sales person the order needs rework before it can proceed.", "order", "This tells the sales person the {one:lower} needs rework before it can proceed.")}
+        </p>
+        <Textarea
+          aria-label="Reason for rejecting"
+          className="mt-2"
+          placeholder="Reason (optional)"
+          value={approveNotes}
+          onChange={(e) => setApproveNotes(e.target.value)}
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <Button type="button" variant="ghost" size="sm" onClick={() => setShowReject(false)} disabled={isPending}>
+            Cancel
+          </Button>
+          <Button type="button" variant="danger" size="sm" disabled={isPending} onClick={() => handleApprove(false, approveNotes)}>
+            {isPending ? "Saving…" : "Reject"}
+          </Button>
+        </div>
+      </Dialog>
+
+      <Dialog open={showCancel} onClose={() => setShowCancel(false)} title={slot(wording, "Cancel order", "order", "Cancel {one:lower}")}>
+        <p className="text-sm text-muted">This can&apos;t be undone.</p>
+        <ul className="mt-2 list-disc space-y-1 pl-4 text-sm text-muted">
+          {!released && <li>It hasn&apos;t gone to purchase, so nobody there is affected{purchase.purchaseRelease === "SCHEDULED" ? " — its scheduled day is dropped" : ""}.</li>}
+          {released && order.orderStatus !== "PROCESSING" && <li>It&apos;s with purchase — they&apos;re told, and it leaves their queue.</li>}
+          {order.orderStatus === "PROCESSING" && (
+            <li>
+              Purchase has placed it{purchase.vendorName ? ` with ${purchase.vendorName}` : ""}. The purchaser is told, and the order shows
+              &ldquo;Vendor PO to cancel&rdquo; until they confirm.
+            </li>
+          )}
+          {vendorPo?.live && (
+            <li>
+              Its purchase order {vendorPo.live.docNumber} is cancelled with it, saying it was this order.
+              {vendorPo.live.status !== "DRAFT" && order.orderStatus !== "PROCESSING"
+                ? " It went to the vendor, so the order shows \u201cVendor PO to cancel\u201d until purchase confirms they cancelled it too."
+                : ""}
+            </li>
+          )}
+          {purchase.pendingIncrease && <li>The higher price waiting for sales is dropped.</li>}
+          {purchase.paid > 0 && (
+            <li>
+              {formatCurrency(purchase.paid)} paid against it moves on account — accounts is told to refund it or apply it to another order.
+            </li>
+          )}
+        </ul>
+        <Textarea
+          aria-label="Reason for cancelling"
+          className="mt-2"
+          placeholder={cancelNeedsReason ? "Reason (required)" : "Reason (optional)"}
+          value={cancelReason}
+          onChange={(e) => setCancelReason(e.target.value)}
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <Button type="button" variant="ghost" size="sm" onClick={() => setShowCancel(false)} disabled={isPending}>
+            {slot(wording, "Keep order", "order", "Keep {one:lower}")}
+          </Button>
+          <Button
+            type="button"
+            variant="danger"
+            size="sm"
+            disabled={isPending || (cancelNeedsReason && cancelReason.trim().length < 3)}
+            onClick={handleCancel}
+          >
+            {isPending ? "Cancelling…" : slot(wording, "Cancel order", "order", "Cancel {one:lower}")}
+          </Button>
+        </div>
+      </Dialog>
+
+      {showPayments && (
+        <PaymentsDialog
+          order={order}
+          open
+          onClose={() => setShowPayments(false)}
+          canRecord={canRecordPayments}
+          canDelete={canDeletePayments}
+          companyId={companyId}
+          companyName={companyName}
+        />
+      )}
+    </div>
+  );
+}

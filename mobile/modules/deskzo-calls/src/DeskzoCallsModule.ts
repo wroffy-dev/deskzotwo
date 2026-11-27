@@ -1,0 +1,28 @@
+import { NativeModule, requireNativeModule } from "expo";
+
+/** The Deskzo app's native calling module (android/src/main/java/com/deskzo/calls). Android only. */
+
+export type NativeSession = { baseUrl: string; token: string; host: string | null };
+
+declare class DeskzoCallsModule extends NativeModule<{ onScreenshot: () => void }> {
+  getSession(): NativeSession | null;
+  /** Deskzo said this phone is no longer signed in, while the app was closed. */
+  signedOut(): boolean;
+  setSession(baseUrl: string, token: string, host: string | null): void;
+  clearSession(): void;
+  getCallSync(): { on: boolean; from: number; lastSyncAt: number };
+  setCallSync(on: boolean): void;
+  /** Sending the phone recorder's files for logged calls (Recordings.kt). */
+  getRecordings(): boolean;
+  recordingsPermitted(): boolean;
+  setRecordings(on: boolean): void;
+  syncNow(): Promise<{ sent: number; logged: number; error: string | null }>;
+  ignoresBatteryOptimizations(): boolean;
+  openBatterySettings(): void;
+  /** Android 14 and later tell the app when a screenshot is taken. */
+  screenshotsDetectable(): boolean;
+  /** Blocks screenshots and screen recording on the app's screens, or lets them be. */
+  setScreenshotsBlocked(blocked: boolean): void;
+}
+
+export default requireNativeModule<DeskzoCallsModule>("DeskzoCalls");

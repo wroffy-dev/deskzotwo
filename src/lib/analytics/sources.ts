@@ -1,0 +1,849 @@
+import { db } from "@/lib/db";
+import { writeOffsFor } from "@/lib/receivables/write-off";
+import {
+  accessLevel,
+  customerReachIds,
+  documentAccess,
+  leadAccess,
+  orderAccess,
+  paymentAccess,
+  throughAccount,
+  ticketAccess,
+  visitAccess,
+  type AccessRecord,
+} from "@/lib/authz/access";
+import { notMigratedYet } from "@/lib/custom-fields/server";
+import type { CustomFieldEntityKey } from "@/lib/custom-fields/rules";
+import { buildWhere, countActiveFilters, withoutMaskedFilters } from "@/lib/workspace/filters";
+import { workspaceClock } from "@/lib/time/workspace";
+import { NONE, ROW_CAP, type FactSource, type SourceContext } from "./types";
+import { listLeadMasker, maskLeads } from "@/lib/leads/masking";
+import { maskCustomValues } from "@/lib/authz/fields";
+import { companyMasker, maskCompanyWith } from "@/lib/companies/masking";
+import { SOLD_THIS_YEAR } from "@/lib/documents/imported";
+import { AGING_BUCKETS, agingBucket, daysOverdue, settleInvoice } from "@/lib/receivables";
+import { firstBilledBetween } from "@/lib/customers/first-billed";
+
+/**
+ * The fact tables, and everything each one can be sliced by.
+ *
+ * One entry per kind of record. A dimension listed here is a dimension the explorer offers, so this
+ * file is the answer to "what can I break this down by" — there is nowhere else to look. The one
+ * exception is the workspace's own fields, which no file can list because each workspace makes its
+ * own: each source names the records its rows reach (`customFields`), and src/lib/analytics/custom.ts
+ * adds the fields on them that the person asking may see.
+ *
+ * Every `load` applies the rule its record's own screen uses — orders the order rule, invoices the
+ * document rule, and so on (src/lib/authz/access.ts). That is the whole security surface of this
+ * module: a report is a way to read thousands of rows at once, so if scoping were wrong
+ * here it would be wrong in the most consequential possible place, and it would look like a
+ * feature rather than a leak.
+ */
+
+/**
+ * The window is half-open: `gte: from, lt: to`.
+ *
+ * `ctx.to` is the midnight that *begins* the day after the one asked for — see `indianWindow` in
+ * src/actions/analytics.ts. Comparing with `lte` against an inclusive `23:59:59.999` is the
+ * traditional way to write this and it leaves a millisecond nothing is supposed to land in; a
+ * half-open interval has no edge at all.
+ */
+
+const money = (v: unknown) => Number(v ?? 0);
+
+/**
+ * The rows of a source this person may see — its record's rule — with the workspace filters on top.
+ *
+ * Both, always, and inside an AND: the rule decides what this person may see at all and the filters
+ * narrow within it — so no combination of filters can ever widen the result, which is the property
+ * that makes it safe to hand somebody forty of them.
+ */
+/**
+ * The date window, on the column the report was actually placed on.
+ *
+ * Every `load` used to hard-code its own column while the "Dated on" control only steered the
+ * bucketing — so choosing "Expires on" loaded the orders *punched* in the window and then grouped
+ * them by expiry. A renewals report, which is the commonest question this business asks, returned
+ * entirely the wrong rows and looked plausible because the columns were labelled with expiry dates.
+ *
+ * A nullable column excludes nulls, which is right: an order with no expiry is not "expiring in
+ * October", and including it would put a row in a window it has no date for.
+ */
+const dateWindow = (ctx: SourceContext) => ({ [ctx.dateColumn]: { gte: ctx.from, lt: ctx.to } });
+
+async function scoped<W extends object>(ctx: SourceContext, rule: W): Promise<{ AND: W[] }> {
+  // Security audit round three, 14 Nov 2026: account filters on a field this person can't read in a list are dropped
+  // (R3-21 — "city is Pune" answered a masked city), and a report is the one place that may count a reseller's end
+  // customers when asked (R3-20 — `countingReport`).
+  const filters = ctx.companyFilters ? buildWhere(withoutMaskedFilters(ctx.companyFilters, await companyMasker(ctx.userId, "list")), await workspaceClock(), { countingReport: true }) : {};
+  // Every model here reaches its company through `company` and has the window's column, which is
+  // what the cast says; the rule is the record's own fragment.
+  return { AND: [rule, (Object.keys(filters).length === 0 ? {} : { company: filters }) as W, dateWindow(ctx) as W] };
+}
+
+/**
+ * What a source's rows are narrowed to, in words — from the level its query asks, so a note can't
+ * describe a different rule from the one applied. `all` and `accounts` are the two notes a record that
+ * follows the account has always had; the rest are for a level a role sets.
+ */
+async function reachNote(ctx: SourceContext, record: AccessRecord, noun: string, all: string, accounts: string): Promise<string> {
+  switch (await accessLevel(ctx.userId, record, "view")) {
+    case "ALL":
+      return all;
+    case "FOLLOW":
+      return (await customerReachIds(ctx.userId)) === null ? all : accounts;
+    case "BRANCH":
+      return `Only ${noun} in your branch.`;
+    case "TEAM":
+      return `Only ${noun} that are yours or your team's.`;
+    case "OWN":
+      return `Only your own ${noun}.`;
+    default:
+      return `None — you can't see ${noun}.`;
+  }
+}
+
+/**
+ * A scope note, plus what the account filters did to it.
+ *
+ * Every `scopeNote` below branched on the permission check alone and never consulted
+ * `ctx.companyFilters` — so a report narrowed to a single industry announced full-company scope,
+ * word for word. Measured as one admin over one window: 378 rows and 12.86 crore plain, 32 rows and
+ * 71.9 lakh with an industry filter, under a byte-identical note. A scope note is the one line
+ * somebody quotes when they forward a report, so it has to be derived from everything the query
+ * narrows by rather than from the half of it that is about permissions.
+ *
+ * `includeResellerManaged` and `productExcludes` are deliberately not counted. Neither narrows on
+ * its own: the first *widens*, by lifting the reseller exclusion `buildWhere` applies by default,
+ * and the second only flips the sense of the product clause a sibling filter supplies — and is
+ * already counted through that sibling. Counting them would print "narrowed" over a report nothing
+ * narrowed, which is the failure this is here to fix rather than a smaller version of it.
+ */
+function withAccountFilters(ctx: SourceContext, note: string): string {
+  /**
+   * The same count the rest of the screen uses, with nothing excused.
+   *
+   * This subtracted `includeResellerManaged` and `productExcludes` first, on the reasoning that
+   * neither narrows on its own. Both halves of that were wrong, in opposite directions:
+   * `productExcludes` **inverts** the sibling product clause, so a report and its exact opposite
+   * carried a byte-identical note; and `includeResellerManaged` **widens** the set, so a report that
+   * reached into a reseller's end customers claimed to have been narrowed by one filter fewer.
+   *
+   * It also put a third number on a screen that already had two: the Filters badge and the print
+   * sheet both call `countActiveFilters` unmodified, so a report could say "2 account filters" beside
+   * a badge reading 3. One definition, used everywhere.
+   *
+   * "Applied", not "narrowed", because a count cannot tell the reader which direction a filter moved
+   * the set and it should not pretend to.
+   */
+  const applied = ctx.companyFilters ? countActiveFilters(ctx.companyFilters) : 0;
+  if (applied === 0) return note;
+  return `${note} ${applied} account filter${applied === 1 ? "" : "s"} applied.`;
+}
+
+/**
+ * Each row's company as a list shows it to this person (owner, 5 Nov 2026 — Phase 3 masking fixes, audit H.4.7): its
+ * locations' address parts and the workspace's own company fields through the companies policy
+ * (src/lib/companies/masking.ts), list answers — so a breakdown by "City" or "State", or by one of those fields, can't
+ * name what the Customers list masks. The name isn't one of them: it is every record's label (see that file).
+ */
+async function companiesAsListed<R extends { company: { locations?: { city?: string | null; state?: string | null }[]; customFields?: unknown } | null }>(ctx: SourceContext, rows: R[]): Promise<R[]> {
+  const masker = await companyMasker(ctx.userId, "list");
+  if (!masker.active) return rows;
+  return rows.map((r) => (r.company ? ({ ...r, company: maskCompanyWith(masker, r.company) } as R) : r));
+}
+
+/** A company's tags, or a single "untagged" bucket. Multi-valued — see `Dimension.of`. */
+const tagsOf = (tags: string[]): string | string[] => (tags.length === 0 ? NONE : tags);
+
+type Wanted = ReadonlySet<CustomFieldEntityKey>;
+const NO_FIELDS: Wanted = new Set();
+
+/**
+ * A load, carrying the workspace's own fields it was asked for (`ctx.customFields`) — or, in a
+ * workspace whose records don't have the column yet, the same load without them.
+ *
+ * A release serves before `tenants:migrate` has reached every workspace (NOT_YET_EVERYWHERE in
+ * src/lib/tenancy/clients.ts), and a query naming a column that isn't there fails outright. A report
+ * that fails because one of its optional breakdowns can't be read yet is worse than one that reads
+ * those breakdowns as empty, so the query is made again without them. In practice a workspace that
+ * far behind has no field definitions either (`definitionsFor` reads none), so it is never asked.
+ *
+ * Asked for nothing, the query names none of those columns: the same SQL the load always sent.
+ */
+async function withOwnFields<T>(ctx: SourceContext, query: (want: Wanted) => Promise<T>): Promise<T> {
+  const want = ctx.customFields ?? NO_FIELDS;
+  if (want.size === 0) return query(NO_FIELDS);
+  try {
+    return await query(want);
+  } catch (err) {
+    if (!notMigratedYet(err)) throw err;
+    return query(NO_FIELDS);
+  }
+}
+
+/**
+ * The record's own `customFields`, when wanted. It is left out of every query that doesn't name it
+ * (NOT_YET_EVERYWHERE), so `false` here is how it is named — and `true` is what it already was.
+ */
+const ownFields = (want: Wanted, entity: CustomFieldEntityKey) => ({ customFields: !want.has(entity) });
+
+// ─── Orders ─────────────────────────────────────────────────────────────────────────────────────
+
+const orderInclude = (want: Wanted) =>
+  ({
+    company: {
+      select: {
+        name: true,
+        tags: true,
+        source: true,
+        industry: { select: { name: true } },
+        owner: { select: { name: true } },
+        locations: { select: { city: true, state: true, isPrimary: true } },
+        customFields: want.has("COMPANY"),
+      },
+    },
+    item: {
+      select: {
+        name: true,
+        sku: true,
+        type: true,
+        category: true,
+        brand: { select: { name: true } },
+        productFamily: { select: { name: true } },
+        customFields: want.has("ITEM"),
+      },
+    },
+    vendor: { select: { name: true } },
+    addedBy: { select: { name: true, department: { select: { name: true } } } },
+  }) as const;
+
+type OrderRow = Awaited<ReturnType<typeof loadOrders>>[number];
+
+async function loadOrders(ctx: SourceContext) {
+  const where = await scoped(ctx, await orderAccess(ctx.userId, "view"));
+  const rows = await withOwnFields(ctx, (want) =>
+    db.companyProduct.findMany({
+      where,
+      include: orderInclude(want),
+      omit: ownFields(want, "ORDER"),
+      take: ROW_CAP,
+      orderBy: { createdAt: "asc" },
+    }),
+  );
+  return companiesAsListed(ctx, rows);
+}
+
+/** The primary location's city/state, falling back to the first one on file. */
+const place = (row: OrderRow, which: "city" | "state") => {
+  const loc = row.company.locations.find((l) => l.isPrimary) ?? row.company.locations[0];
+  return loc?.[which] || NONE;
+};
+
+/** What this line sold for. `unitPrice` null means the item's list price was used. */
+const orderValue = (row: OrderRow) => money(row.unitPrice ?? 0) * row.quantity;
+
+const ordersSource: FactSource<OrderRow> = {
+  key: "orders",
+  companyAnchored: true,
+  label: "Orders",
+  description: "Everything punched — value, margin, quantity — by whoever, whatever and whenever.",
+  moduleKey: "orders",
+  load: loadOrders,
+  scopeNote: async (ctx) =>
+    withAccountFilters(ctx, await reachNote(ctx, "orders", "orders", "Every account in the company.", "Only the accounts you and your team manage.")),
+  dateFields: [
+    { key: "createdAt", label: "Punched on", get: (r) => r.createdAt },
+    { key: "startDate", label: "Starts on", get: (r) => r.startDate },
+    { key: "endDate", label: "Expires on", get: (r) => r.endDate },
+  ],
+  measures: [
+    { key: "value", label: "Order value", unit: "currency", value: orderValue },
+    {
+      key: "margin",
+      label: "Margin",
+      unit: "currency",
+      // Only where a cost was actually recorded. Treating a missing cost as zero would report the
+      // whole sale price as profit, which is the most flattering possible way to be wrong.
+      value: (r) => (r.purchasePrice === null ? 0 : (money(r.unitPrice) - money(r.purchasePrice)) * r.quantity),
+      description: "Sale less the purchase price on file. Lines with no cost recorded contribute nothing.",
+    },
+    { key: "quantity", label: "Quantity", unit: "number", value: (r) => r.quantity },
+    { key: "count", label: "Number of orders", unit: "number", value: () => 1 },
+  ],
+  dimensions: [
+    { key: "salesperson", label: "Salesperson", of: (r) => r.addedBy?.name ?? NONE },
+    { key: "team", label: "Team / department", of: (r) => r.addedBy?.department?.name ?? NONE },
+    { key: "accountManager", label: "Account manager", of: (r) => r.company.owner?.name ?? NONE },
+    { key: "company", label: "Customer", of: (r) => r.company.name },
+    { key: "industry", label: "Industry", of: (r) => r.company.industry?.name ?? NONE },
+    { key: "tag", label: "Customer tag", of: (r) => tagsOf(r.company.tags), multi: true },
+    { key: "source", label: "Lead source", of: (r) => r.company.source ?? NONE },
+    { key: "city", label: "City", of: (r) => place(r, "city") },
+    { key: "state", label: "State", of: (r) => place(r, "state") },
+    { key: "item", label: "Product", of: (r) => r.item.name },
+    { key: "sku", label: "SKU", of: (r) => r.item.sku },
+    { key: "category", label: "Product category", of: (r) => r.item.category || NONE },
+    { key: "brand", label: "Brand", of: (r) => r.item.brand?.name ?? NONE },
+    { key: "family", label: "Product family", of: (r) => r.item.productFamily?.name ?? NONE },
+    { key: "itemType", label: "Product type", of: (r) => r.item.type },
+    { key: "businessType", label: "New vs renewal", of: (r) => r.businessType.replaceAll("_", " ") },
+    { key: "orderStatus", label: "Order status", of: (r) => r.orderStatus.replaceAll("_", " ") },
+    { key: "vendor", label: "Vendor", of: (r) => r.vendor?.name ?? NONE },
+  ],
+  customFields: [
+    { entity: "ORDER", noun: "Order", own: true, values: (r) => r.customFields },
+    { entity: "COMPANY", noun: "Customer", values: (r) => r.company.customFields },
+    { entity: "ITEM", noun: "Product", values: (r) => r.item.customFields },
+  ],
+};
+
+// ─── Leads ──────────────────────────────────────────────────────────────────────────────────────
+
+type LeadRow = Awaited<ReturnType<typeof loadLeads>>[number];
+
+async function loadLeads(ctx: SourceContext) {
+  /**
+   * Through the account, on `companies.viewAll` — the same rule as every other source here and the
+   * same rule as the leads screen.
+   *
+   * This read `scopeUserIds(ctx.userId, "targets.viewAll")` and filtered on `Lead.ownerUserId`,
+   * with a comment saying it matched the leads screen. Both halves were wrong and the comment was
+   * the reason nobody looked:
+   *
+   *   · **The key.** `targets.viewAll` is a different permission, held far more widely — 31 of the
+   *     98 active users in this database hold it *without* `companies.viewAll`. For every one of
+   *     them `scopeUserIds` returned `null` and the spread collapsed to nothing, so the query ran
+   *     with no account filter at all. A sales executive whose own leads screen showed 60 got all
+   *     482 leads in the business, 422 of them on accounts she may not open.
+   *
+   *   · **The relation.** `leadListWhere` (src/actions/lead.ts) scopes through `company.ownerUserId`
+   *     and its docblock argues explicitly against the owner branch — assignment is a field anybody
+   *     with the bulk-edit bar can set, so an OR on it lets reassignment quietly widen the scope.
+   *     This took the branch that file had already rejected.
+   *
+   * The failure was invisible in the ordinary way: `scopeNote` truthfully said "Every lead in the
+   * company", and nobody queries a report for returning too much.
+   */
+  // The lead rule, as the leads screen asks it (src/lib/authz/access.ts) — which is the point. Leads
+  // had their own hand-rolled predicate, and that is where the divergence lived.
+  const where = await scoped(ctx, await leadAccess(ctx.userId, "view"));
+  // A report is a list: the company a lead is for, and its own fields, as this person's field access
+  // shows them in one (src/lib/leads/masking.ts) — so a breakdown can't name what a list would mask.
+  const masker = await listLeadMasker(ctx.userId);
+  const rows = await withOwnFields(ctx, (want) =>
+    db.lead.findMany({
+      where,
+      include: {
+        company: {
+          select: {
+            name: true,
+            tags: true,
+            source: true,
+            industry: { select: { name: true } },
+            customFields: want.has("COMPANY"),
+          },
+        },
+        owner: { select: { name: true, department: { select: { name: true } } } },
+        sourcedBy: { select: { name: true } },
+      },
+      omit: ownFields(want, "LEAD"),
+      take: ROW_CAP,
+      orderBy: { createdAt: "asc" },
+    }),
+  );
+  const listed = await companiesAsListed(ctx, rows);
+  if (!masker.active) return listed;
+  const reasons = await lostReasonsAsListed(masker, listed);
+  return listed.map((r) => ({
+    ...r,
+    company: { ...r.company, name: masker.present("companyName", r.company.name) ?? "" },
+    ...("customFields" in r && r.customFields && typeof r.customFields === "object" ? { customFields: maskCustomValues(masker, r.customFields as Record<string, unknown>) } : {}),
+    ...(r.lostReason ? { lostReason: reasons.get(r.id) ?? null } : {}),
+  }));
+}
+
+/** How many lost leads' values are read at a time to redact their reasons — well inside a query's bind limit. */
+const REASON_CHUNK = 5_000;
+
+/**
+ * Why each lost lead was lost, as the Leads list shows it to this person (owner, 5 Nov 2026 — Phase 3 masking fixes,
+ * audit L-8: "`lostReason` is raw in reports and exports"). The reason is free text that quotes the lead's own values
+ * as often as not — "went with a cheaper quote, Kinetic Logistics" — and the "Lost reason" breakdown printed it whole
+ * beside a Company column that masked the same name.
+ *
+ * Redacted, not masked whole: the reason is what the breakdown exists to count ("Price", "Went with a competitor"), and
+ * stars would fold every reason into one bucket for anybody with any lead field masked. The redactor is the one the
+ * Leads list and the lead's own page already run over this text (`maskLeads`, src/lib/leads/masking.ts), with each
+ * lead's values read whole, so the report names no more than the list does. Best-effort, as it is there: a value
+ * quoted in another form isn't caught.
+ */
+async function lostReasonsAsListed(masker: Awaited<ReturnType<typeof listLeadMasker>>, rows: { id: string; lostReason: string | null }[]): Promise<Map<string, string | null>> {
+  const lost = rows.filter((r) => r.lostReason).map((r) => ({ id: r.id, lostReason: r.lostReason }));
+  const out = new Map<string, string | null>();
+  for (let i = 0; i < lost.length; i += REASON_CHUNK) {
+    for (const r of await maskLeads(masker, lost.slice(i, i + REASON_CHUNK))) out.set(r.id, r.lostReason);
+  }
+  return out;
+}
+
+const leadsSource: FactSource<LeadRow> = {
+  key: "leads",
+  companyAnchored: true,
+  label: "Leads",
+  description: "The pipeline — how many, worth how much, from where, and what became of them.",
+  // Only where the plan has leads (owner, 14 Oct 2026); a workspace that had them keeps them, unreported.
+  moduleKey: "leads",
+  load: loadLeads,
+  /**
+   * The note said "Only leads owned by you and your team", which described the old owner-based
+   * filter rather than the rule — and said it while the query was in fact returning everything.
+   * A scope note is the one line somebody quotes when they forward a report, so it has to be
+   * derived from the same thing the query is.
+   */
+  scopeNote: async (ctx) =>
+    withAccountFilters(ctx, await reachNote(ctx, "leads", "leads", "Every lead in the company.", "Only leads on the accounts you and your team manage.")),
+  dateFields: [{ key: "createdAt", label: "Created on", get: (r) => r.createdAt }],
+  measures: [
+    { key: "count", label: "Number of leads", unit: "number", value: () => 1 },
+    { key: "value", label: "Estimated value", unit: "currency", value: (r) => money(r.estimatedValue) },
+    { key: "won", label: "Won", unit: "number", value: (r) => (r.status === "WON" ? 1 : 0) },
+    {
+      key: "wonValue",
+      label: "Won value",
+      unit: "currency",
+      value: (r) => (r.status === "WON" ? money(r.estimatedValue) : 0),
+    },
+    { key: "lost", label: "Lost", unit: "number", value: (r) => (r.status === "LOST" ? 1 : 0) },
+  ],
+  dimensions: [
+    { key: "source", label: "Lead source", of: (r) => r.company.source ?? NONE },
+    { key: "status", label: "Status", of: (r) => r.status.replaceAll("_", " ") },
+    { key: "owner", label: "Owner", of: (r) => r.owner?.name ?? NONE },
+    { key: "team", label: "Team / department", of: (r) => r.owner?.department?.name ?? NONE },
+    { key: "sourcedBy", label: "Sourced by", of: (r) => r.sourcedBy?.name ?? NONE },
+    { key: "company", label: "Company", of: (r) => r.company.name },
+    { key: "industry", label: "Industry", of: (r) => r.company.industry?.name ?? NONE },
+    { key: "tag", label: "Company tag", of: (r) => tagsOf(r.company.tags), multi: true },
+    { key: "lostReason", label: "Lost reason", of: (r) => r.lostReason || NONE },
+  ],
+  customFields: [
+    { entity: "LEAD", noun: "Lead", own: true, values: (r) => r.customFields },
+    { entity: "COMPANY", noun: "Company", values: (r) => r.company.customFields },
+  ],
+};
+
+// ─── Tickets ────────────────────────────────────────────────────────────────────────────────────
+
+type TicketRow = Awaited<ReturnType<typeof loadTickets>>[number];
+
+async function loadTickets(ctx: SourceContext) {
+  const where = await scoped(ctx, await ticketAccess(ctx.userId, "view"));
+  return companiesAsListed(ctx, await withOwnFields(ctx, (want) =>
+    db.ticket.findMany({
+      where,
+      include: {
+        company: {
+          select: { name: true, tags: true, industry: { select: { name: true } }, customFields: want.has("COMPANY") },
+        },
+        assignedTo: { select: { name: true, department: { select: { name: true } } } },
+      },
+      take: ROW_CAP,
+      orderBy: { createdAt: "asc" },
+    }),
+  ));
+}
+
+const DAY = 86_400_000;
+
+const ticketsSource: FactSource<TicketRow> = {
+  key: "tickets",
+  companyAnchored: true,
+  label: "Tickets",
+  description: "Support load — how many raised, how many closed, and how long they took.",
+  moduleKey: "helpdesk",
+  load: loadTickets,
+  scopeNote: async (ctx) =>
+    withAccountFilters(ctx, await reachNote(ctx, "tickets", "tickets", "Every account in the company.", "Only tickets against accounts you and your team manage.")),
+  dateFields: [
+    { key: "createdAt", label: "Raised on", get: (r) => r.createdAt },
+    { key: "resolvedAt", label: "Resolved on", get: (r) => r.resolvedAt },
+  ],
+  measures: [
+    { key: "count", label: "Tickets raised", unit: "number", value: () => 1 },
+    { key: "resolved", label: "Tickets resolved", unit: "number", value: (r) => (r.resolvedAt ? 1 : 0) },
+    { key: "open", label: "Still open", unit: "number", value: (r) => (r.resolvedAt ? 0 : 1) },
+    {
+      key: "resolutionDays",
+      label: "Average days to resolve",
+      unit: "days",
+      // Averaged over resolved tickets only. Summing days across tickets is a number with no
+      // meaning, and counting unresolved ones as zero would make a bad month look like a good one.
+      average: true,
+      value: (r) => (r.resolvedAt ? (r.resolvedAt.getTime() - r.createdAt.getTime()) / DAY : 0),
+    },
+  ],
+  dimensions: [
+    { key: "priority", label: "Priority", of: (r) => r.priority },
+    { key: "status", label: "Status", of: (r) => r.status.replaceAll("_", " ") },
+    { key: "assignee", label: "Assigned to", of: (r) => r.assignedTo?.name ?? NONE },
+    { key: "team", label: "Team / department", of: (r) => r.assignedTo?.department?.name ?? NONE },
+    { key: "company", label: "Customer", of: (r) => r.company.name },
+    { key: "industry", label: "Industry", of: (r) => r.company.industry?.name ?? NONE },
+    { key: "tag", label: "Customer tag", of: (r) => tagsOf(r.company.tags), multi: true },
+  ],
+  customFields: [{ entity: "COMPANY", noun: "Customer", values: (r) => r.company.customFields }],
+};
+
+// ─── Invoices ───────────────────────────────────────────────────────────────────────────────────
+
+type InvoiceRow = Awaited<ReturnType<typeof loadInvoices>>[number];
+
+async function loadInvoices(ctx: SourceContext) {
+  const where = await scoped(ctx, await documentAccess(ctx.userId, "view"));
+  // What each invoice has had paid and credited against it — and, on one brought from the old system, settled
+  // there (`paidBefore`, read by name: NOT_YET_EVERYWHERE) — so its balance is the receivables module's own
+  // (settleInvoice). A workspace without the column yet reads it as nothing settled before Deskzo.
+  const read = (want: Wanted, settledBefore: boolean) =>
+    db.tradeDocument.findMany({
+      where: {
+        direction: "SALES",
+        docType: { in: ["INVOICE", "CREDIT_NOTE"] },
+        status: { in: ["ISSUED", "PARTIALLY_PAID", "PAID"] },
+        ...where,
+        // The year's sales: one still open from before the books started was sold, and counted, there; the rest of
+        // the year brought across counts (src/lib/documents/imported.ts). Under AND beside whatever the scope brought,
+        // so neither replaces the other.
+        AND: [...(where.AND ? (Array.isArray(where.AND) ? where.AND : [where.AND]) : []), SOLD_THIS_YEAR],
+      },
+      include: {
+        company: {
+          select: {
+            name: true,
+            tags: true,
+            source: true,
+            industry: { select: { name: true } },
+            owner: { select: { name: true } },
+            customFields: want.has("COMPANY"),
+          },
+        },
+        branch: { select: { name: true } },
+        salesperson: { select: { name: true } },
+        payments: { select: { amount: true } },
+        creditsReceived: { select: { amount: true } },
+        // Turnover before GST, and what it cost: the order a line came from, else its item (lineTurnover below).
+        lines: {
+          select: {
+            taxableValue: true,
+            quantity: true,
+            companyProduct: { select: { purchasePrice: true, unitPrice: true, fullTermUnitPrice: true, businessType: true } },
+            item: { select: { costPrice: true } },
+          },
+        },
+      },
+      omit: { paidBefore: !settledBefore },
+      take: ROW_CAP,
+      orderBy: { issueDate: "asc" },
+    });
+  const rows = await companiesAsListed(
+    ctx,
+    await withOwnFields(ctx, async (want) => {
+      try {
+        return await read(want, true);
+      } catch (err) {
+        if (!notMigratedYet(err)) throw err;
+        return read(want, false);
+      }
+    }),
+  );
+  // New or old customer for the period reported (owner, 9 Nov 2026): new when the first invoice ever — the old system's
+  // included — falls in the window (src/lib/customers/first-billed.ts), old when it was before. Rows come earliest
+  // first, so a customer's first row in the window is the one that counts them.
+  const companyIds = [...new Set(rows.map((r) => r.companyId).filter((v): v is string => !!v))];
+  const fresh = new Set(
+    companyIds.length === 0 ? [] : (await firstBilledBetween(db as never, { gte: ctx.from, lt: ctx.to }, await workspaceClock(), companyIds)).map((f) => f.companyId),
+  );
+  const seen = new Set<string>();
+  // Written off as bad debt (src/lib/receivables/write-off.ts): settled, as receivables counts it.
+  const writtenOff = await writeOffsFor(rows.map((r) => r.id));
+  return rows.map((r) => {
+    const first = !!r.companyId && r.docType !== "CREDIT_NOTE" && !seen.has(r.companyId);
+    if (first) seen.add(r.companyId!);
+    return { ...r, newCustomer: !!r.companyId && fresh.has(r.companyId), firstOfCustomer: first, worked: workLines(r), writtenOff: writtenOff.get(r.id) ?? 0 };
+  });
+}
+
+type LoadedLine = {
+  taxableValue: unknown;
+  quantity: unknown;
+  companyProduct: { purchasePrice: unknown; unitPrice: unknown; fullTermUnitPrice: unknown; businessType: string | null } | null;
+  item: { costPrice: unknown } | null;
+};
+
+/**
+ * An invoice's turnover before GST, in rupees, and what it cost where that's known, split renewal / fresh business.
+ *
+ * Cost: a line from an order costs its share of the order's purchase price — the purchase price over the order's
+ * full-term price, times what the line billed — so a month's bill of a yearly subscription costs a month's share,
+ * not the year's. A line with no order, or an order with no purchase price, costs its item's cost price per unit.
+ * Neither known: no cost, and its turnover is left out of "Turnover with a known cost", so margin isn't flattered.
+ * A renewal is a line from a RENEWAL order; everything else billed is fresh business. A credit note counts against.
+ */
+function workLines(r: { docType: string; exchangeRate: unknown; lines: LoadedLine[] }) {
+  const sign = r.docType === "CREDIT_NOTE" ? -1 : 1;
+  const rate = money(r.exchangeRate) || 1;
+  const out = { turnover: 0, renewal: 0, cost: 0, costed: 0 };
+  for (const l of r.lines) {
+    const value = sign * money(l.taxableValue) * rate;
+    out.turnover += value;
+    const cp = l.companyProduct;
+    if (cp?.businessType === "RENEWAL") out.renewal += value;
+    const full = money(cp?.fullTermUnitPrice ?? cp?.unitPrice);
+    let cost: number | null = null;
+    if (cp && cp.purchasePrice != null && full > 0) cost = (value * money(cp.purchasePrice)) / full;
+    else if (l.item?.costPrice != null) cost = sign * money(l.quantity) * money(l.item.costPrice);
+    if (cost !== null) {
+      out.cost += cost;
+      out.costed += value;
+    }
+  }
+  return out;
+}
+
+/**
+ * An invoice's settlement, as the receivables module works it out: paid, credited and still due. A credit note
+ * is the credit, not something owed, so it has nothing received and nothing outstanding of its own.
+ */
+const settlementOf = (r: InvoiceRow) => {
+  if (r.docType === "CREDIT_NOTE") return { paid: 0, balance: 0 };
+  const sum = (rows: { amount: unknown }[]) => rows.reduce((t, x) => t + money(x.amount), 0);
+  const before = "paidBefore" in r ? money((r as { paidBefore?: unknown }).paidBefore) : 0;
+  return settleInvoice(money(r.total), sum(r.payments), sum(r.creditsReceived) + r.writtenOff, before);
+};
+
+/** Where an invoice stands today: paid, part-paid, unpaid and not yet due, or overdue. */
+function paymentStatusOf(r: InvoiceRow): string {
+  if (r.docType === "CREDIT_NOTE") return "Credit note";
+  const s = settlementOf(r);
+  if (s.balance < 0.01) return "Paid";
+  if (daysOverdue(r.dueDate, r.issueDate, new Date()) > 0) return "Overdue";
+  return s.paid > 0 ? "Partially paid" : "Unpaid";
+}
+
+const AGING_LABEL = new Map<string, string>(AGING_BUCKETS.map((b) => [b.key, b.label]));
+
+const invoicesSource: FactSource<InvoiceRow> = {
+  key: "invoices",
+  companyAnchored: true,
+  label: "Invoices",
+  description: "What was actually billed, net of credit notes, with the tax split out.",
+  moduleKey: "sales_documents",
+  load: loadInvoices,
+  scopeNote: async (ctx) =>
+    withAccountFilters(ctx, await reachNote(ctx, "documents", "invoices", "Every account in the company.", "Only the accounts you and your team manage.")),
+  dateFields: [
+    { key: "issueDate", label: "Issued on", get: (r) => r.issueDate },
+    { key: "dueDate", label: "Due on", get: (r) => r.dueDate },
+  ],
+  measures: [
+    {
+      key: "net",
+      label: "Invoiced (net of credit notes)",
+      unit: "currency",
+      // A credit note is a negative invoice. Adding them up is the whole point of netting.
+      value: (r) => (r.docType === "CREDIT_NOTE" ? -money(r.total) : money(r.total)),
+    },
+    { key: "tax", label: "Tax", unit: "currency", value: (r) => money(r.cgstAmount) + money(r.sgstAmount) + money(r.igstAmount) },
+    {
+      key: "received",
+      label: "Amount received",
+      unit: "currency",
+      description: "Paid against each invoice so far, as the receivables module settles it.",
+      value: (r) => settlementOf(r).paid,
+    },
+    {
+      key: "outstanding",
+      label: "Outstanding",
+      unit: "currency",
+      description: "What is still due on each invoice today, after payments and credit notes.",
+      value: (r) => settlementOf(r).balance,
+    },
+    { key: "count", label: "Number of documents", unit: "number", value: () => 1 },
+    { key: "turnover", label: "Turnover (before GST)", unit: "currency", description: "What the lines billed before tax, in rupees, net of credit notes.", value: (r) => r.worked.turnover },
+    { key: "renewalTurnover", label: "Renewal turnover", unit: "currency", description: "Turnover from lines billed off a renewal order.", value: (r) => r.worked.renewal },
+    { key: "freshTurnover", label: "Fresh business turnover", unit: "currency", description: "Turnover that isn't a renewal: new products, add-ons, one-off sales.", value: (r) => r.worked.turnover - r.worked.renewal },
+    { key: "cost", label: "Cost (where known)", unit: "currency", description: "The order's purchase price, else the item's cost price. Lines with neither have no cost.", value: (r) => r.worked.cost },
+    { key: "costedTurnover", label: "Turnover with a known cost", unit: "currency", description: "The turnover the margin is worked on — lines whose cost is known.", value: (r) => r.worked.costed },
+    { key: "margin", label: "Margin (where known)", unit: "currency", description: "Turnover with a known cost, less that cost.", value: (r) => r.worked.costed - r.worked.cost },
+    { key: "customers", label: "Customers billed", unit: "number", description: "Each customer once, at their first invoice in the period.", value: (r) => (r.firstOfCustomer ? 1 : 0) },
+  ],
+  dimensions: [
+    { key: "company", label: "Customer", of: (r) => r.company.name },
+    { key: "customerAge", label: "New or old customer", of: (r) => (r.newCustomer ? "New customer" : "Old customer") },
+    { key: "salesperson", label: "Salesperson", of: (r) => r.salesperson?.name ?? NONE },
+    { key: "accountManager", label: "Account manager", of: (r) => r.company.owner?.name ?? NONE },
+    { key: "industry", label: "Industry", of: (r) => r.company.industry?.name ?? NONE },
+    { key: "tag", label: "Customer tag", of: (r) => tagsOf(r.company.tags), multi: true },
+    { key: "source", label: "Lead source", of: (r) => r.company.source ?? NONE },
+    { key: "docType", label: "Document type", of: (r) => r.docType.replaceAll("_", " ") },
+    { key: "status", label: "Status", of: (r) => r.status.replaceAll("_", " ") },
+    { key: "placeOfSupply", label: "Place of supply", of: (r) => r.placeOfSupplyCode || NONE },
+    { key: "branch", label: "Branch", of: (r) => r.branch?.name ?? NONE },
+    { key: "paymentStatus", label: "Payment status", of: paymentStatusOf },
+    {
+      key: "ageing",
+      label: "Age past due",
+      of: (r) => (r.docType === "CREDIT_NOTE" || settlementOf(r).balance < 0.01 ? NONE : (AGING_LABEL.get(agingBucket(r.dueDate, r.issueDate, new Date())) ?? NONE)),
+    },
+  ],
+  customFields: [{ entity: "COMPANY", noun: "Customer", values: (r) => r.company.customFields }],
+};
+
+// ─── Payments ───────────────────────────────────────────────────────────────────────────────────
+
+type PaymentRow = Awaited<ReturnType<typeof loadPayments>>[number];
+
+async function loadPayments(ctx: SourceContext) {
+  const where = await scoped(ctx, await paymentAccess(ctx.userId, "view"));
+  return companiesAsListed(ctx, await withOwnFields(ctx, (want) =>
+    db.payment.findMany({
+      where,
+      include: {
+        company: {
+          select: {
+            name: true,
+            tags: true,
+            industry: { select: { name: true } },
+            owner: { select: { name: true } },
+            customFields: want.has("COMPANY"),
+          },
+        },
+        recordedBy: { select: { name: true } },
+      },
+      take: ROW_CAP,
+      orderBy: { paidOn: "asc" },
+    }),
+  ));
+}
+
+const paymentsSource: FactSource<PaymentRow> = {
+  key: "payments",
+  companyAnchored: true,
+  label: "Payments",
+  description: "Money in — when it landed, from whom, and how.",
+  moduleKey: "payments",
+  load: loadPayments,
+  scopeNote: async (ctx) =>
+    withAccountFilters(ctx, await reachNote(ctx, "payments", "payments", "Every account in the company.", "Only the accounts you and your team manage.")),
+  dateFields: [{ key: "paidOn", label: "Received on", get: (r) => r.paidOn }],
+  measures: [
+    { key: "amount", label: "Amount collected", unit: "currency", value: (r) => money(r.amount) },
+    { key: "count", label: "Number of receipts", unit: "number", value: () => 1 },
+  ],
+  dimensions: [
+    { key: "company", label: "Customer", of: (r) => r.company?.name ?? NONE },
+    { key: "accountManager", label: "Account manager", of: (r) => r.company?.owner?.name ?? NONE },
+    { key: "industry", label: "Industry", of: (r) => r.company?.industry?.name ?? NONE },
+    { key: "tag", label: "Customer tag", of: (r) => tagsOf(r.company?.tags ?? []), multi: true },
+    { key: "method", label: "Method", of: (r) => r.method?.replaceAll("_", " ") ?? NONE },
+    { key: "recordedBy", label: "Recorded by", of: (r) => r.recordedBy?.name ?? NONE },
+  ],
+  // Through `?.`, as the dimensions above read the company: a payment without one reads as no value.
+  customFields: [{ entity: "COMPANY", noun: "Customer", values: (r) => r.company?.customFields }],
+};
+
+// ─── Visits ─────────────────────────────────────────────────────────────────────────────────────
+
+type VisitRow = Awaited<ReturnType<typeof loadVisits>>[number];
+
+async function loadVisits(ctx: SourceContext) {
+  // Two gates, both applied: the account has to be visible, and so does the visit — the visit rule,
+  // as the visits screen asks it (src/lib/authz/access.ts): a visit log is a record of where somebody
+  // spent their day.
+  const where = await scoped(ctx, { AND: [await throughAccount(ctx.userId, "view"), await visitAccess(ctx.userId, "view")] });
+  return companiesAsListed(ctx, await withOwnFields(ctx, (want) =>
+    db.visit.findMany({
+      where,
+      include: {
+        company: {
+          select: { name: true, tags: true, industry: { select: { name: true } }, customFields: want.has("COMPANY") },
+        },
+        user: { select: { name: true, department: { select: { name: true } } } },
+      },
+      take: ROW_CAP,
+      orderBy: { scheduledFor: "asc" },
+    }),
+  ));
+}
+
+const visitsSource: FactSource<VisitRow> = {
+  key: "visits",
+  companyAnchored: true,
+  label: "Field visits",
+  description: "Who went where, what for, and whether it happened.",
+  moduleKey: "visits",
+  load: loadVisits,
+  /**
+   * Both gates, because `loadVisits` applies both.
+   *
+   * This branched on `visits.viewAll` alone, so somebody behind the account gate as well was told
+   * "Only visits by you and your team" over a set the account gate had narrowed further. Twenty-six
+   * active users are behind both gates today; for one of them the note claimed a team's three visits
+   * over a report that returned none of them, because not one of those visits was against an account
+   * he can see. The note has to name the same gates the query applies or it is a guess about it.
+   */
+  scopeNote: async (ctx) => {
+    const [level, accounts] = await Promise.all([accessLevel(ctx.userId, "visits", "view"), customerReachIds(ctx.userId)]);
+    // The account gate is named whether or not it is narrowing when the visits aren't; otherwise only
+    // when it narrows, which is what these notes have always said.
+    const against = accounts === null ? "" : ", against accounts you can see";
+    const note =
+      level === "ALL"
+        ? "Every visit against accounts you can see."
+        : level === "TEAM"
+          ? `Only visits by you and your team${against}.`
+          : level === "BRANCH"
+            ? `Only visits by your branch${against}.`
+            : level === "OWN"
+              ? `Only your own visits${against}.`
+              : "None — you can't see visits.";
+    return withAccountFilters(ctx, note);
+  },
+  dateFields: [
+    { key: "scheduledFor", label: "Scheduled for", get: (r) => r.scheduledFor },
+    { key: "checkInAt", label: "Checked in", get: (r) => r.checkInAt },
+  ],
+  measures: [
+    { key: "count", label: "Visits", unit: "number", value: () => 1 },
+    { key: "completed", label: "Completed", unit: "number", value: (r) => (r.status === "COMPLETED" ? 1 : 0) },
+    { key: "distance", label: "Distance (km)", unit: "number", value: (r) => money(r.distanceKm) },
+  ],
+  dimensions: [
+    { key: "person", label: "Person", of: (r) => r.user?.name ?? NONE },
+    { key: "team", label: "Team / department", of: (r) => r.user?.department?.name ?? NONE },
+    { key: "purpose", label: "Purpose", of: (r) => r.purpose.replaceAll("_", " ") },
+    { key: "status", label: "Status", of: (r) => r.status.replaceAll("_", " ") },
+    { key: "company", label: "Customer", of: (r) => r.company.name },
+    { key: "industry", label: "Industry", of: (r) => r.company.industry?.name ?? NONE },
+    { key: "tag", label: "Customer tag", of: (r) => tagsOf(r.company.tags), multi: true },
+  ],
+  customFields: [{ entity: "COMPANY", noun: "Customer", values: (r) => r.company.customFields }],
+};
+
+// ─── The registry ───────────────────────────────────────────────────────────────────────────────
+
+// The `never` in FactSource<never> makes the array assignable while each entry stays fully typed
+// against its own row — the alternative is `any` on every `of` and `value`, which would defeat the
+// point of declaring them.
+export const FACT_SOURCES = [
+  ordersSource,
+  leadsSource,
+  invoicesSource,
+  paymentsSource,
+  ticketsSource,
+  visitsSource,
+] as unknown as FactSource<never>[];
+
+export function getSource(key: string): FactSource<never> | undefined {
+  return FACT_SOURCES.find((s) => s.key === key);
+}

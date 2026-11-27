@@ -1,0 +1,138 @@
+/**
+ * Takes one backup, from the command line.
+ *
+ * This is what a scheduler calls. Windows Task Scheduler, cron, a systemd timer — the app has no
+ * job runner of its own, and inventing one so that backups can be scheduled would put the most
+ * important recurring job in the system inside the process most likely to be restarted.
+ *
+ *   npm run db:backup                 take one now, whatever the schedule says
+ *   npm run db:backup -- --if-due     take one only if the stored schedule says it is time
+ *   npm run db:backup -- --seal-existing   encrypt the backups already on disk (once, after the release that
+ *                                          encrypted backups at rest — src/lib/backup/at-rest.ts)
+ *
+ * Of the first workspace, unless `--workspace <slug>` names another or `--all-workspaces` asks for
+ * every active one (each on its own schedule, into its own folder).
+ *
+ * ## Which of those to put in the scheduler
+ *
+ * `--if-due`, every five or ten minutes. It looks wasteful and is the opposite: the scheduled task
+ * becomes dumb and permanent, and *the time of day lives in the app*, where somebody with the
+ * permission can change it without a login to the server. Set it once, never touch it again.
+ *
+ * Point the task at plain `npm run db:backup` instead and the time is in Task Scheduler, the
+ * settings page can only lie about it, and the two drift the first time anybody changes one.
+ *
+ * It runs with the web app stopped, which is the other reason this is the recommended driver: the
+ * only thing that has to be up is the database, and the database has to be up to be backed up.
+ *
+ * Exits non-zero when the backup failed, so a scheduler that watches exit codes notices. A backup
+ * job that always exits zero is a backup job nobody is monitoring. A skipped run is *not* a
+ * failure — `--if-due` exits zero when there is nothing to do, because almost every run is that.
+ */
+import "dotenv/config";
+import { runBackup } from "../src/lib/backup/run";
+import { runScheduledBackup } from "../src/lib/backup/scheduled";
+import { runDueWorkspaceReset } from "../src/lib/workspace-reset";
+import { sealExistingBackups } from "../src/lib/backup/seal-existing";
+import { backupRoot } from "../src/lib/backup/maintenance";
+import { currentTenant } from "../src/lib/tenancy/resolve";
+import { formatBytes } from "../src/lib/backup/policy";
+import { formatTimeOfDay } from "../src/lib/backup/schedule";
+import { db } from "../src/lib/db";
+import { closeControlDb } from "../src/lib/platform/control-db";
+import { forEachTenant } from "../src/lib/platform/fanout";
+import { activeTenants, legacyTenant, tenantBySlug } from "../src/lib/tenancy/registry";
+import type { Tenant } from "../src/lib/tenancy/state";
+
+function report(result: Awaited<ReturnType<typeof runBackup>>, seconds: number): void {
+  if (!result.ok) {
+    console.error(`\n  Backup FAILED after ${seconds}s\n`);
+    console.error(`  ${result.error}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`\n  ${result.filename}`);
+  console.log(`  ${formatBytes(result.sizeBytes)} in ${seconds}s, via ${result.via}`);
+  if (result.pruned > 0) console.log(`  ${result.pruned} older backup(s) pruned`);
+  console.log(
+    "\n  This file is on the same machine as the database it came from, which means it is not yet\n" +
+      "  a backup. Copy it somewhere else.\n",
+  );
+}
+
+/**
+ * Which workspaces: the first, unless told otherwise.
+ *
+ *   --workspace <slug>    that one
+ *   --all-workspaces      every active one, two at a time, each under the same lease the backup tick
+ *                         takes — so this and a scheduler calling /api/backup/tick never overlap
+ */
+async function targets(args: string[]): Promise<Tenant[]> {
+  if (args.includes("--all-workspaces")) return activeTenants();
+  const named = args.indexOf("--workspace");
+  const tenant = named >= 0 ? await tenantBySlug(args[named + 1] ?? "") : await legacyTenant();
+  if (!tenant) throw new Error(named >= 0 ? `There is no workspace "${args[named + 1]}".` : "There is no first workspace.");
+  return [tenant];
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const tenants = await targets(args);
+  const outcomes = await forEachTenant(
+    "backup-tick",
+    tenants,
+    async (tenant) => {
+      if (tenants.length > 1) console.log(`\n— ${tenant.name} (${tenant.slug}) —`);
+      await backupOne(args);
+    },
+    { concurrency: 2, timeoutMs: 45 * 60_000 },
+  );
+  for (const o of outcomes) {
+    if ("skipped" in o) console.log(`${o.slug}: skipped — a backup of it is already running`);
+    else if (!o.ok) {
+      console.error(`${o.slug}: ${o.error}`);
+      process.exitCode = 1;
+    }
+  }
+}
+
+async function backupOne(args: string[]) {
+  if (args.includes("--seal-existing")) {
+    const sealed = await sealExistingBackups(await backupRoot(), (await currentTenant()).id);
+    console.log(`Encrypted ${sealed.dumps} full backup(s) and ${sealed.chunks} stored piece(s); ${sealed.already} already were.`);
+    return;
+  }
+
+  const ifDue = args.includes("--if-due");
+  const started = Date.now();
+
+  if (ifDue) {
+    // A workspace reset that has come due, as the backup tick runs it (src/lib/workspace-reset.ts).
+    const reset = await runDueWorkspaceReset();
+    if (reset.ran) console.log(reset.ok ? `Workspace reset — done; the copy taken before is ${reset.backup}.` : `Workspace reset — failed, nothing removed: ${reset.error}`);
+    const run = await runScheduledBackup();
+    if (!run.ran) {
+      // One line, on purpose. This runs every few minutes for years; anything more and the log it
+      // writes to becomes the largest file on the disk.
+      const next = run.nextRunAt ? ` Next: ${formatTimeOfDay(run.nextRunAt.getHours(), run.nextRunAt.getMinutes())}.` : "";
+      console.log(`Skipped — ${run.reason}${next}`);
+      return;
+    }
+    console.log(`Scheduled backup — ${run.reason}`);
+    report(run.outcome, Math.round((Date.now() - started) / 1000));
+    return;
+  }
+
+  report(await runBackup(), Math.round((Date.now() - started) / 1000));
+}
+
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await db.$disconnect();
+    await closeControlDb();
+  });

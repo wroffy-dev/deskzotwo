@@ -1,0 +1,181 @@
+import type { ExpoConfig } from "expo/config";
+
+// Read by Node when Expo loads this file; the app's own types don't include Node's.
+declare const require: (id: "node:fs") => { existsSync: (file: string) => boolean };
+declare const __dirname: string;
+
+/**
+ * The Deskzo app (owner, 18 Oct 2026) — Android first, calling first.
+ *
+ * DESKZO_APP_DEV=1 makes a development build: it may talk plain HTTP, to a Deskzo running on this
+ * computer (a `*.localhost` workspace, reached from the emulator at 10.0.2.2). A release build only ever
+ * talks HTTPS to a real workspace.
+ */
+const dev = process.env.DESKZO_APP_DEV === "1";
+
+/**
+ * Notifications with the app closed (owner, 22 Oct 2026) come through Firebase Cloud Messaging: Deskzo's own Firebase
+ * project's google-services.json, kept beside this file (it holds only public identifiers). Without it the app still
+ * builds and works — it just asks nothing of Firebase, and gets no notifications while closed.
+ */
+const firebase = require("node:fs").existsSync(`${__dirname}/google-services.json`);
+
+/**
+ * Over-the-air updates (owner, 23 Oct 2026): the app's own screens — its JavaScript — come from deskzo.com when a newer
+ * one is published (`npm run app:update`, src/lib/app-updates), signed with Deskzo's key and checked against
+ * certs/certificate.pem before they run. A phone takes only an update made for its own native build (the fingerprint
+ * of its native parts), so anything native — a library, a permission — still goes out as a release to the store.
+ *
+ * DESKZO_APP_UPDATES_URL points a test build at a Deskzo on this computer (http://localhost:3000/api/app-updates/manifest,
+ * through `adb reverse tcp:3000 tcp:3000`); scripts/android.js refuses a release made with it.
+ */
+const updatesUrl = process.env.DESKZO_APP_UPDATES_URL || "https://deskzo.com/api/app-updates/manifest";
+const updatesOverHttp = updatesUrl.startsWith("http://");
+
+/**
+ * Verified Android App Links for the browser sign-in (security audit round two, 13 Nov 2026, R2-12): DESKZO_APP_LINKS=1
+ * builds the app to take the sign-in code back on https://deskzo.com/app-return/…, which Android hands only to this app
+ * once deskzo.com/.well-known/assetlinks.json names its signing certificates (ANDROID_APP_SHA256_CERT_FINGERPRINTS on
+ * the server). Off by default: turn it on only after that file answers on deskzo.com, then make a store release — a
+ * native change, which an over-the-air update can't carry.
+ */
+const appLinks = process.env.DESKZO_APP_LINKS === "1";
+
+const config: ExpoConfig = {
+  name: "Deskzo",
+  slug: "deskzo",
+  version: "0.5.0",
+  orientation: "portrait",
+  icon: "./assets/icon.png",
+  scheme: "deskzo",
+  runtimeVersion: { policy: "fingerprint" },
+  updates: {
+    enabled: !dev,
+    url: updatesUrl,
+    // Looked for at every launch, in the background: the app opens at once on what it has, and a newer version runs
+    // from the next launch (or at once, from Settings).
+    checkAutomatically: "ON_LOAD",
+    fallbackToCacheTimeout: 0,
+    codeSigningCertificate: "./certs/certificate.pem",
+    codeSigningMetadata: { keyid: "main", alg: "rsa-v1_5-sha256" },
+  },
+  userInterfaceStyle: "light",
+  android: {
+    package: "com.deskzo.app",
+    versionCode: 8,
+    // The official icon (owner, 23 Oct 2026): the blue D on white — scripts/brand-assets.js draws the images.
+    adaptiveIcon: {
+      backgroundColor: "#FFFFFF",
+      foregroundImage: "./assets/android-icon-foreground.png",
+      backgroundImage: "./assets/android-icon-background.png",
+      monochromeImage: "./assets/android-icon-monochrome.png",
+    },
+    // Calling, and where the phone is when somebody clocks in or out (asked then, only while the app is open);
+    // the camera is added by expo-camera, for scanning the pairing code.
+    permissions: [
+      "android.permission.READ_CALL_LOG",
+      "android.permission.READ_PHONE_STATE",
+      "android.permission.POST_NOTIFICATIONS",
+      "android.permission.ACCESS_COARSE_LOCATION",
+      "android.permission.ACCESS_FINE_LOCATION",
+    ],
+    // Nothing the app does: the microphone, drawing over other apps, files, and location in the background or
+    // motion (a library asks for them on its own).
+    blockedPermissions: [
+      "android.permission.RECORD_AUDIO",
+      "android.permission.SYSTEM_ALERT_WINDOW",
+      "android.permission.READ_EXTERNAL_STORAGE",
+      "android.permission.WRITE_EXTERNAL_STORAGE",
+      "android.permission.ACCESS_BACKGROUND_LOCATION",
+      "android.permission.FOREGROUND_SERVICE_LOCATION",
+      "android.permission.ACTIVITY_RECOGNITION",
+      // Asked for by expo-notifications' launcher-badge library and by an install-referrer library: the app sets no
+      // badge counts (src/lib/push.ts — shouldSetBadge: false) and tracks no installs (22 Oct 2026).
+      "com.google.android.finsky.permission.BIND_GET_INSTALL_REFERRER_SERVICE",
+      "android.permission.READ_APP_BADGE",
+      "com.android.launcher.permission.READ_SETTINGS",
+      "com.android.launcher.permission.WRITE_SETTINGS",
+      "com.android.launcher.permission.INSTALL_SHORTCUT",
+      "com.android.launcher.permission.UNINSTALL_SHORTCUT",
+      "com.sec.android.provider.badge.permission.READ",
+      "com.sec.android.provider.badge.permission.WRITE",
+      "com.htc.launcher.permission.READ_SETTINGS",
+      "com.htc.launcher.permission.UPDATE_SHORTCUT",
+      "com.sonyericsson.home.permission.BROADCAST_BADGE",
+      "com.sonymobile.home.permission.PROVIDER_INSERT_BADGE",
+      "com.anddoes.launcher.permission.UPDATE_COUNT",
+      "com.majeur.launcher.permission.UPDATE_BADGE",
+      "com.huawei.android.launcher.permission.CHANGE_BADGE",
+      "com.huawei.android.launcher.permission.READ_SETTINGS",
+      "com.huawei.android.launcher.permission.WRITE_SETTINGS",
+      "com.oppo.launcher.permission.READ_SETTINGS",
+      "com.oppo.launcher.permission.WRITE_SETTINGS",
+      "me.everything.badger.permission.BADGE_COUNT_READ",
+      "me.everything.badger.permission.BADGE_COUNT_WRITE",
+    ],
+    allowBackup: false,
+    predictiveBackGestureEnabled: false,
+    ...(appLinks
+      ? {
+          intentFilters: [
+            {
+              action: "VIEW",
+              autoVerify: true,
+              data: [{ scheme: "https", host: "deskzo.com", pathPrefix: "/app-return/" }],
+              category: ["BROWSABLE", "DEFAULT"],
+            },
+          ],
+        }
+      : {}),
+    ...(firebase ? { googleServicesFile: "./google-services.json" } : {}),
+  },
+  plugins: [
+    "expo-router",
+    ["expo-camera", { recordAudioAndroid: false, barcodeScannerEnabled: true, cameraPermission: "Deskzo uses the camera to scan the code that pairs this phone, and to take photos you send in chat." }],
+    // Photos for chat: Android's own photo picker (no permission), or the camera; never the microphone.
+    [
+      "expo-image-picker",
+      {
+        photosPermission: "Deskzo opens your photos only to send the ones you pick in chat.",
+        cameraPermission: "Deskzo uses the camera to scan the code that pairs this phone, and to take photos you send in chat.",
+        microphonePermission: false,
+      },
+    ],
+    [
+      "expo-location",
+      {
+        locationWhenInUsePermission: "Deskzo checks you are at your office, and saves where you are with your attendance, when you clock in or out. Only then — never in the background.",
+        locationAlwaysAndWhenInUsePermission: false,
+        locationAlwaysPermission: false,
+        motionUsagePermission: false,
+        locationFullAccuracyPermission: false,
+        isIosBackgroundLocationEnabled: false,
+        isAndroidBackgroundLocationEnabled: false,
+        isAndroidForegroundServiceEnabled: false,
+      },
+    ],
+    [
+      "expo-build-properties",
+      {
+        android: {
+          usesCleartextTraffic: dev || updatesOverHttp,
+          // A release is shrunk (R8). Android's background jobs (WorkManager) open their database by a constructor
+          // nothing calls directly — kept, or the app crashes on launch; the calling module, kept whole; and the
+          // pairing scanner's parts (ML Kit), which Google's component discovery makes by their constructors.
+          extraProguardRules:
+            "-keep class * extends androidx.room.RoomDatabase { <init>(); }\n-keep class com.deskzo.calls.** { *; }\n-keep class * implements com.google.firebase.components.ComponentRegistrar { <init>(); }",
+        },
+      },
+    ],
+    // Deskzo's notifications — a lead given to you, something to approve, a task, a ticket's reply (src/lib/push.ts).
+    ["expo-notifications", { icon: "./assets/android-icon-monochrome.png", color: "#0249FE", defaultChannel: "deskzo" }],
+    "./plugins/with-short-native-paths",
+    "./plugins/with-release-signing",
+  ],
+  experiments: { typedRoutes: false },
+  // appLinks only when on: with it off the config is as before, so the native fingerprint (runtimeVersion) is unchanged
+  // and over-the-air updates still reach the builds already installed.
+  extra: { dev, firebase, ...(appLinks ? { appLinks } : {}) },
+};
+
+export default config;

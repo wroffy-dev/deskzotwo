@@ -1,0 +1,200 @@
+import { createSign } from "node:crypto";
+import type { Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import { chatPreviewOnPhone, parseReminderSounds } from "@/lib/reminder-sounds";
+
+/**
+ * Pushes to the Deskzo app (owner, 18 Oct 2026), through Firebase Cloud Messaging's HTTP v1 API — plain
+ * fetch, no SDK. One Firebase project is Deskzo's, for every workspace: its service account is the
+ * platform's, in `DESKZO_APP_FCM_SERVICE_ACCOUNT` (the JSON Google gives, as it is or base64). Without it
+ * nothing is pushed, and a phone picks up what it was asked to dial the next time the app looks
+ * (/api/app/calls/requests) — at once while it is open.
+ *
+ * A push carries only an id and what the phone shows — never the record behind it.
+ */
+
+type ServiceAccount = { project_id: string; client_email: string; private_key: string };
+
+function serviceAccount(): ServiceAccount | null {
+  const raw = process.env.DESKZO_APP_FCM_SERVICE_ACCOUNT?.trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8")) as Partial<ServiceAccount>;
+    return parsed.project_id && parsed.client_email && parsed.private_key ? (parsed as ServiceAccount) : null;
+  } catch {
+    return null;
+  }
+}
+
+export const pushConfigured = () => serviceAccount() !== null;
+
+/** Google's access token for the service account — the platform's, for every workspace. */
+let accessToken: { value: string; until: number } | null = null;
+/** A stand-in for Firebase, set only by check scripts: the message, and the HTTP status Firebase would answer. */
+let testSend: ((message: unknown) => Promise<number>) | null = null;
+
+export function setTestPush(send: ((message: unknown) => Promise<number>) | null) {
+  testSend = send;
+}
+
+async function googleToken(account: ServiceAccount): Promise<string> {
+  if (accessToken && accessToken.until > Date.now() + 60_000) return accessToken.value;
+  const now = Math.floor(Date.now() / 1000);
+  const part = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const unsigned = `${part({ alg: "RS256", typ: "JWT" })}.${part({ iss: account.client_email, scope: "https://www.googleapis.com/auth/firebase.messaging", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 })}`;
+  const signer = createSign("RSA-SHA256");
+  signer.update(unsigned);
+  const assertion = `${unsigned}.${signer.sign(account.private_key).toString("base64url")}`;
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`Google answered ${res.status} for the push token`);
+  const json = (await res.json()) as { access_token: string; expires_in: number };
+  accessToken = { value: json.access_token, until: Date.now() + json.expires_in * 1000 };
+  return json.access_token;
+}
+
+/** The channel the app's notifications arrive on (mobile/src/lib/push.ts). */
+const APP_CHANNEL = "deskzo";
+
+type PushOptions = {
+  /** Dropped after this long undelivered — two minutes unless said: a ring is no use later, a notice is. */
+  ttlSeconds?: number;
+  /**
+   * What the phone shows by itself, even with the app closed (the app's `deskzo` channel); without it, a data
+   * message only the open app reads.
+   */
+  shown?: { title: string; body?: string };
+  /** One shown with the same tag replaces the last — a new ring the one before it. */
+  tag?: string;
+};
+
+/**
+ * A message to one phone, delivered at once (high priority): "sent"; "gone" when the address no longer reaches the
+ * app (uninstalled, or another Firebase project's) and should be forgotten; "failed"; or "off" when pushes aren't
+ * set up here.
+ */
+export async function pushToPhone(pushToken: string, data: Record<string, string>, options: PushOptions = {}): Promise<"sent" | "gone" | "failed" | "off"> {
+  const { ttlSeconds = 120, shown, tag } = options;
+  const message = {
+    message: {
+      token: pushToken,
+      data,
+      ...(shown ? { notification: { title: shown.title, ...(shown.body ? { body: shown.body } : {}) } } : {}),
+      android: {
+        priority: "HIGH",
+        ttl: `${ttlSeconds}s`,
+        ...(shown ? { notification: { channel_id: APP_CHANNEL, ...(tag ? { tag } : {}) } } : {}),
+      },
+    },
+  };
+  const verdict = (status: number) => (status >= 200 && status < 300 ? "sent" : status === 404 || status === 403 ? "gone" : "failed");
+  if (testSend) return verdict(await testSend(message));
+  const account = serviceAccount();
+  if (!account) return "off";
+  try {
+    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(account.project_id)}/messages:send`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${await googleToken(account)}`, "content-type": "application/json" },
+      body: JSON.stringify(message),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return verdict(res.status);
+  } catch (err) {
+    console.error("[app] push failed", err);
+    return "failed";
+  }
+}
+
+/**
+ * A Deskzo notification on the person's phones too (owner, 22 Oct 2026 — push in the native app's first phase):
+ * a lead given to them, something waiting for their decision, a task, a ticket's reply — whatever their bell
+ * says. Only its title and where it leads go, never what's behind it; the phone opens the record through
+ * /api/app as anywhere else, so the person's access still decides. To each of their approved phones with a push
+ * address; an address Firebase no longer knows is forgotten. Nothing goes while pushes aren't set up here.
+ */
+/**
+ * The phones a push may go to: a push address, the device approved, its person switched on and a member, and the
+ * phone's own sign-in not ended — what /api/app itself asks before it answers (src/lib/app/handler.ts). Security
+ * audit, 11 Nov 2026 (SEC-26): a switched-off person's phone, or one signed out with their other sign-ins (a password
+ * reset, an admin's temporary password, Security › Sign-ins' "End session"), kept getting notices and, since 9 Nov,
+ * the start of chat messages. Ending sign-ins now also clears the push addresses (src/lib/security/end-sign-ins.ts);
+ * this is the check for whatever that missed.
+ */
+const LIVE_PHONE = {
+  pushToken: { not: null },
+  device: { status: "APPROVED" },
+  user: { active: true, kind: "MEMBER" },
+} satisfies Prisma.AppDeviceWhereInput;
+
+/** The phone's latest app sign-in, as /api/app reads it: a phone whose latest is ended is signed out. */
+const LATEST_APP_SIGN_IN = {
+  signIns: { where: { provider: { in: ["app-code", "app-browser"] } }, orderBy: { at: "desc" }, take: 1, select: { endedAt: true } },
+} satisfies Prisma.UserDeviceSelect;
+
+const signedIn = (phone: { device: { signIns: { endedAt: Date | null }[] } }) => !phone.device.signIns[0]?.endedAt;
+
+/** Whether one phone may be pushed to now — for a caller that picked it itself (src/actions/phone-calls.ts). */
+export async function phoneMayBePushed(appDeviceId: string): Promise<boolean> {
+  const phone = await db.appDevice.findFirst({ where: { id: appDeviceId, ...LIVE_PHONE }, select: { device: { select: LATEST_APP_SIGN_IN } } });
+  return !!phone && signedIn(phone);
+}
+
+export async function pushNoticeToPhones(userId: string, notice: { id: string; type: string; title: string; link: string | null }): Promise<number> {
+  if (!testSend && !pushConfigured()) return 0;
+  const phones = (
+    await db.appDevice.findMany({ where: { userId, ...LIVE_PHONE }, select: { id: true, pushToken: true, device: { select: LATEST_APP_SIGN_IN } } })
+  ).filter(signedIn);
+  let sent = 0;
+  for (const phone of phones) {
+    // Shown by the phone itself, the title only; kept for a phone that's off for a while — six hours — not the two
+    // minutes a ring is.
+    const title = notice.title.slice(0, 160);
+    const verdict = await pushToPhone(phone.pushToken!, { type: "notice", notice: notice.id, kind: notice.type, title, link: notice.link ?? "" }, { ttlSeconds: 6 * 3600, shown: { title } });
+    if (verdict === "sent") sent += 1;
+    if (verdict === "gone") await db.appDevice.update({ where: { id: phone.id }, data: { pushToken: null } }).catch(() => {});
+  }
+  return sent;
+}
+
+/** How much of a message a phone's notification shows. */
+export const CHAT_PREVIEW_CHARS = 140;
+
+/** A message as a phone notification's line: its text on one line and cut short, or its files when it has no text. */
+export function chatPreviewText(body: string, fileCount: number): string {
+  const text = body.replace(/\s+/g, " ").trim();
+  if (text) return text.length > CHAT_PREVIEW_CHARS ? `${text.slice(0, CHAT_PREVIEW_CHARS - 1).trimEnd()}…` : text;
+  if (fileCount > 0) return fileCount === 1 ? "Sent a file" : `Sent ${fileCount} files`;
+  return "";
+}
+
+/**
+ * A chat message on the other members' phones (owner, 22 Oct 2026): who and where — "New message from Asha", "Asha in
+ * Sales team" — and, only for whoever turned it on under Notifications (owner, 9 Nov 2026), the start of the message as
+ * the line under it. Everybody else's phone still says who, never what; the message itself stays in the chat, and
+ * the line goes as the shown notification only, never in the data the app reads. One a chat on the phone, the latest
+ * replacing the last; kept an hour. The caller leaves out whoever muted the chat.
+ */
+export async function pushChatToPhones(userIds: string[], chat: { id: string; title: string; preview?: string }): Promise<number> {
+  if (userIds.length === 0 || (!testSend && !pushConfigured())) return 0;
+  const phones = (
+    await db.appDevice.findMany({
+      where: { userId: { in: userIds }, ...LIVE_PHONE },
+      select: { id: true, pushToken: true, user: { select: { reminderSounds: true } }, device: { select: LATEST_APP_SIGN_IN } },
+    })
+  ).filter(signedIn);
+  const title = chat.title.slice(0, 160);
+  const preview = chat.preview?.trim() ?? "";
+  const verdicts = await Promise.all(
+    phones.map(async (phone) => {
+      const body = preview && chatPreviewOnPhone(parseReminderSounds(phone.user.reminderSounds)) ? preview : undefined;
+      const verdict = await pushToPhone(phone.pushToken!, { type: "chat", chat: chat.id, title, link: `/chat?c=${chat.id}` }, { ttlSeconds: 3600, shown: { title, body }, tag: `chat-${chat.id}` });
+      if (verdict === "gone") await db.appDevice.update({ where: { id: phone.id }, data: { pushToken: null } }).catch(() => {});
+      return verdict;
+    }),
+  );
+  return verdicts.filter((v) => v === "sent").length;
+}

@@ -1,0 +1,93 @@
+import { GoogleGenAI, type Content, type Part } from "@google/genai";
+import type { Connection, ProviderAdapter, ToolCall, Turn, TurnOutcome, TurnRequest } from "@/lib/copilot/types";
+
+/**
+ * Gemini, through Google's official SDK — from Google AI Studio, or Vertex AI in one location (Mumbai
+ * keeps processing in India) as a service account: a streamed `generateContent` turn with our tools as
+ * function declarations.
+ *
+ * The model's parts are kept exactly as they came — every chunk's, in order — and replayed as they
+ * are, because Gemini attaches thought signatures to them that it needs back to carry on.
+ */
+
+export function contentsFor(history: Turn[]): Content[] {
+  const out: Content[] = [];
+  for (const turn of history) {
+    if (turn.role === "user") out.push({ role: "user", parts: [...(turn.files ?? []).map((f) => ({ inlineData: { mimeType: f.mediaType, data: f.data } })), { text: turn.text }] });
+    else if (turn.role === "note") out.push({ role: "user", parts: [{ text: `(From the app, not typed by the user) ${turn.text}` }] });
+    else if (turn.role === "tool") {
+      out.push({
+        role: "user",
+        parts: turn.results.map((r) => ({
+          functionResponse: { id: r.id, name: r.name, response: r.isError ? { error: r.output } : { output: r.output } },
+        })),
+      });
+    } else if (turn.native?.provider === "GEMINI" && Array.isArray(turn.native.content)) {
+      out.push({ role: "model", parts: turn.native.content as Part[] });
+    } else {
+      const parts: Part[] = [];
+      if (turn.text) parts.push({ text: turn.text });
+      for (const call of turn.toolCalls) parts.push({ functionCall: { id: call.id, name: call.name, args: (call.input ?? {}) as Record<string, unknown> } });
+      if (parts.length) out.push({ role: "model", parts });
+    }
+  }
+  return out;
+}
+
+const REFUSED = new Set(["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION", "IMAGE_SAFETY"]);
+
+export function geminiClient(connection: Connection): GoogleGenAI {
+  if (connection.kind === "GEMINI") return new GoogleGenAI({ apiKey: connection.apiKey });
+  if (connection.kind === "VERTEX") {
+    return new GoogleGenAI({ vertexai: true, project: connection.project, location: connection.location, googleAuthOptions: { credentials: connection.credentials } });
+  }
+  throw new Error(`A ${connection.kind} account doesn't speak Gemini's API.`);
+}
+
+async function runTurn(request: TurnRequest): Promise<TurnOutcome> {
+  const ai = geminiClient(request.connection);
+  const stream = await ai.models.generateContentStream({
+    model: request.model,
+    contents: contentsFor(request.history),
+    config: {
+      systemInstruction: request.system,
+      tools: [{ functionDeclarations: request.tools.map((t) => ({ name: t.name, description: t.description, parametersJsonSchema: t.parameters })) }],
+      maxOutputTokens: request.maxTokens ?? 16000,
+      abortSignal: request.signal,
+    },
+  });
+
+  const parts: Part[] = [];
+  let text = "";
+  let finish: string | undefined;
+  let usage = { input: 0, output: 0 };
+  for await (const chunk of stream) {
+    const candidate = chunk.candidates?.[0];
+    for (const part of candidate?.content?.parts ?? []) {
+      parts.push(part);
+      if (part.text && !part.thought) {
+        text += part.text;
+        request.onText(part.text);
+      }
+    }
+    if (candidate?.finishReason) finish = String(candidate.finishReason);
+    const u = chunk.usageMetadata;
+    if (u) {
+      const cached = u.cachedContentTokenCount ?? 0;
+      usage = {
+        input: (u.promptTokenCount ?? 0) - cached + Math.ceil(cached / 10),
+        // Thinking is billed as output.
+        output: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0),
+      };
+    }
+  }
+
+  const toolCalls: ToolCall[] = parts
+    .filter((p) => p.functionCall?.name)
+    .map((p, i) => ({ id: p.functionCall!.id || `call_${i}`, name: p.functionCall!.name!, input: p.functionCall!.args ?? {} }));
+  const stop: TurnOutcome["stop"] =
+    finish === "MAX_TOKENS" ? "truncated" : finish && REFUSED.has(finish) ? "refused" : toolCalls.length > 0 ? "tools" : "done";
+  return { text, toolCalls: stop === "tools" ? toolCalls : [], native: parts, usage, stop, model: request.model };
+}
+
+export const gemini: ProviderAdapter = { runTurn };

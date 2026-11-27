@@ -1,0 +1,685 @@
+import type { TradeDocumentType } from "@prisma/client";
+import { challanWords } from "@/lib/country-pack";
+import type { CustomFieldEntityKey } from "@/lib/custom-fields/rules";
+import { historyColumnDefinitions } from "@/lib/customers/history-columns";
+
+/**
+ * Which columns each records table has, and which of them somebody may turn off.
+ *
+ * One registry rather than a list inside each component, for the same reason the permission and
+ * dashboard-widget registries exist: the column picker, the stored preference and the table itself
+ * must agree, and three places that each know the answer separately is three places that drift.
+ *
+ * ## The invariant that matters
+ *
+ * A table's header and its body must hide the *same* columns. Hide a `<th>` and forget its `<td>`
+ * and every row below shifts one cell left — silently, with no error, and looking exactly like a
+ * data bug rather than a rendering one. `npm run check:tables` asserts that the set of column keys
+ * guarded in the header equals the set guarded in the body, for every registered table. That check
+ * is the reason this is safe to roll out across twenty screens.
+ *
+ * ## What `required` means
+ *
+ * A column nobody may hide. Reserve it for the one that identifies the row — an order without its
+ * order number is a list of anonymous rows — and for the actions cell, which is the way out of any
+ * mess the rest of the choices create. Everything else should be hideable; people's screens and
+ * jobs differ more than we can predict.
+ *
+ * ## The workspace's own fields
+ *
+ * A table that names `customFields` also offers the workspace's own fields of that record type
+ * (src/lib/custom-fields) as columns, after its own. They aren't listed here — each workspace has its
+ * own, and a person sees only the ones they may — so a person's choice about one is stored beside the
+ * column keys as `cf.<key>` (shown) or `-cf.<key>` (hidden), and a field with no choice stored is
+ * shown as the field itself says: a column by default when it is marked "a column in the list". Only
+ * the choices are stored, never the defaults, for the reason `resolveColumns` gives about `null`: a
+ * field added after somebody customised a table still arrives as its own default, not as hidden.
+ */
+
+export type ColumnDefinition = {
+  key: string;
+  label: string;
+  /** Shown to somebody who has never customised this table. */
+  default: boolean;
+  /** Cannot be switched off. Keep this list short. */
+  required?: boolean;
+  /** Why it exists, for the picker's tooltip. Worth writing where the label is terse. */
+  hint?: string;
+};
+
+export type TableDefinition = {
+  key: string;
+  /** Shown as the picker's heading. */
+  label: string;
+  columns: ColumnDefinition[];
+  /** The record type whose workspace fields the table can also show as columns, after these — see above. */
+  customFields?: CustomFieldEntityKey;
+};
+
+export const TABLE_REGISTRY: TableDefinition[] = [
+  {
+    key: "orders",
+    label: "Orders",
+    customFields: "ORDER",
+    columns: [
+      { key: "order", label: "Order", default: true, required: true, hint: "The order number. Without it a row cannot be identified or linked to." },
+      { key: "status", label: "Status", default: true },
+      {
+        key: "step",
+        label: "Step",
+        default: true,
+        hint: "Where it has got to within its status — your own steps (Settings → Pipeline). Offered once you have some.",
+      },
+      { key: "type", label: "Type", default: true, hint: "New business, renewal, or an addition to an existing subscription." },
+      { key: "customer", label: "Customer", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "The customer's account manager." },
+      { key: "caller", label: "Caller", default: true, hint: "The customer's caller." },
+      { key: "product", label: "Product", default: true },
+      { key: "qty", label: "Qty", default: true },
+      { key: "total", label: "Total", default: true, hint: "Inclusive of GST." },
+      { key: "invoice", label: "Invoice", default: true, hint: "Whether it is billed: not invoiced, part invoiced, or the invoice that billed it." },
+      { key: "vendor", label: "Vendor", default: true },
+      { key: "vendorInvoice", label: "Vendor invoice", default: true, hint: "The vendor's invoice number and what it billed before GST — red when more than quantity × purchase price." },
+      { key: "addedBy", label: "Added by", default: true },
+      { key: "orderDate", label: "Order date", default: false, hint: "When it was punched." },
+      { key: "term", label: "Term", default: false, hint: "Its start to its end." },
+      { key: "renewalManager", label: "Renewal manager", default: false, hint: "The customer's — its account manager where nobody else is given them." },
+      { key: "payment", label: "Payment", default: false, hint: "From its invoices: paid, part paid or due." },
+      { key: "endCustomer", label: "End customer", default: false, hint: "Who a reseller's order is for." },
+      { key: "actions", label: "Actions", default: true, required: true, hint: "Row actions, including the fulfilment notice." },
+    ],
+  },
+  {
+    key: "companies",
+    label: "Companies",
+    customFields: "COMPANY",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "id", label: "ID", default: true, hint: "The short reference — COM-000123. Shared across customers, vendors and commission parties, so two of them can never carry the same number." },
+      { key: "company", label: "Company", default: true, required: true },
+      { key: "status", label: "Stage", default: true, hint: "Where this company sits in the pipeline." },
+      { key: "relationship", label: "Relationship", default: true },
+      { key: "source", label: "Source", default: true },
+      { key: "contacts", label: "Contacts", default: true },
+      { key: "leads", label: "Leads", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "Who looks after the account." },
+      { key: "assigned", label: "Caller", default: true, hint: "Who works it for lead generation." },
+      { key: "renewalManager", label: "Renewal manager", default: false, hint: "Who looks after its renewals — the account manager where nobody else is given them." },
+      { key: "place", label: "City / State", default: false, hint: "Of its head office." },
+      { key: "gstin", label: "GSTIN", default: false, hint: "Of its head office." },
+      { key: "industry", label: "Industry", default: false },
+      { key: "lastActivity", label: "Last activity", default: false, hint: "Its last call, note or email." },
+      // What it uses that it didn't buy from us (owner, 2 Nov 2026 — src/lib/customers/elsewhere.ts), for finding who to win.
+      { key: "elsewhere", label: "Installed elsewhere", default: false, hint: "What it uses that it didn't buy from you, and who sold it — from its Installed elsewhere tab." },
+      { key: "elsewhereRenewal", label: "Next outside renewal", default: false, hint: "The soonest renewal of something it bought elsewhere — the next chance to win it." },
+      // Its history with us (owner, 31 Oct 2026): all off here, where most companies have bought nothing.
+      ...historyColumnDefinitions([]),
+      { key: "portal", label: "Portal", default: false, hint: "Off by default here — most of this list has never bought anything, so the answer is 'off' for nearly every row." },
+      { key: "addedBy", label: "Added by", default: false, hint: "Off by default — useful for data-quality work, noise the rest of the time." },
+      { key: "addedOn", label: "Added on", default: true },
+    ],
+  },
+  {
+    key: "customers",
+    label: "Customers",
+    customFields: "COMPANY",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "id", label: "ID", default: true, hint: "The short reference — COM-000123. Shared across customers, vendors and commission parties, so two of them can never carry the same number." },
+      { key: "company", label: "Company", default: true, required: true },
+      { key: "status", label: "Orders", default: true, hint: "How many orders are on file for this customer." },
+      { key: "relationship", label: "Relationship", default: true },
+      { key: "source", label: "Source", default: true },
+      { key: "contacts", label: "Contacts", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "Who looks after the account." },
+      { key: "assigned", label: "Caller", default: true, hint: "Who works it for lead generation." },
+      { key: "renewalManager", label: "Renewal manager", default: false, hint: "Who looks after its renewals — the account manager where nobody else is given them." },
+      { key: "place", label: "City / State", default: false, hint: "Of its head office." },
+      { key: "gstin", label: "GSTIN", default: false, hint: "Of its head office." },
+      { key: "industry", label: "Industry", default: false },
+      { key: "lastActivity", label: "Last activity", default: false, hint: "Its last call, note or email." },
+      // What it uses that it didn't buy from us (owner, 2 Nov 2026 — src/lib/customers/elsewhere.ts), for finding who to win.
+      { key: "elsewhere", label: "Installed elsewhere", default: false, hint: "What it uses that it didn't buy from you, and who sold it — from its Installed elsewhere tab." },
+      { key: "elsewhereRenewal", label: "Next outside renewal", default: false, hint: "The soonest renewal of something it bought elsewhere — the next chance to win it." },
+      // Its history with us (owner, 31 Oct 2026): the tier and the lifetime value on by default, the rest in Columns.
+      ...historyColumnDefinitions(["lifetimeValue", "loyalty"]),
+      { key: "portal", label: "Portal", default: true, hint: "Whether this customer can sign in to their own portal, and whether anybody has actually been sent a link." },
+      { key: "addedBy", label: "Added by", default: false, hint: "Off by default — useful for data-quality work, noise the rest of the time." },
+      { key: "addedOn", label: "Added on", default: true },
+    ],
+  },
+  {
+    key: "vendors",
+    label: "Vendors",
+    customFields: "COMPANY",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "id", label: "ID", default: true, hint: "The short reference — COM-000123. Shared across customers, vendors and commission parties, so two of them can never carry the same number." },
+      { key: "company", label: "Company", default: true, required: true },
+      { key: "status", label: "Onboarding status", default: true, hint: "How far through onboarding this vendor is." },
+      { key: "relationship", label: "Relationship", default: true },
+      { key: "source", label: "Source", default: true },
+      { key: "contacts", label: "Contacts", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "Who looks after the account." },
+      { key: "assigned", label: "Assigned to", default: true },
+      { key: "renewalManager", label: "Renewal manager", default: false, hint: "Who looks after its renewals — the account manager where nobody else is given them." },
+      { key: "place", label: "City / State", default: false, hint: "Of its head office." },
+      { key: "gstin", label: "GSTIN", default: false, hint: "Of its head office." },
+      { key: "industry", label: "Industry", default: false },
+      { key: "lastActivity", label: "Last activity", default: false, hint: "Its last call, note or email." },
+      { key: "addedBy", label: "Added by", default: false, hint: "Off by default — useful for data-quality work, noise the rest of the time." },
+      { key: "addedOn", label: "Added on", default: true },
+    ],
+  },
+  {
+    key: "commission-parties",
+    label: "Commission parties",
+    customFields: "COMPANY",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "id", label: "ID", default: true, hint: "The short reference — COM-000123. Shared across customers, vendors and commission parties, so two of them can never carry the same number." },
+      { key: "company", label: "Company", default: true, required: true },
+      { key: "status", label: "Onboarding status", default: true, hint: "How far through onboarding this party is." },
+      { key: "relationship", label: "Relationship", default: true },
+      { key: "source", label: "Source", default: true },
+      { key: "contacts", label: "Contacts", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "Who looks after the account." },
+      { key: "assigned", label: "Assigned to", default: true },
+      { key: "renewalManager", label: "Renewal manager", default: false, hint: "Who looks after its renewals — the account manager where nobody else is given them." },
+      { key: "place", label: "City / State", default: false, hint: "Of its head office." },
+      { key: "gstin", label: "GSTIN", default: false, hint: "Of its head office." },
+      { key: "industry", label: "Industry", default: false },
+      { key: "lastActivity", label: "Last activity", default: false, hint: "Its last call, note or email." },
+      { key: "addedBy", label: "Added by", default: false, hint: "Off by default — useful for data-quality work, noise the rest of the time." },
+      { key: "addedOn", label: "Added on", default: true },
+    ],
+  },
+  {
+    // Owner, 30 Oct 2026: the account manager and caller here as on every company list, and the extras offered there.
+    key: "resellers",
+    label: "Resellers",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "reseller", label: "Reseller", default: true, required: true },
+      { key: "onboarding", label: "Onboarding", default: true },
+      { key: "tier", label: "Tier", default: true },
+      { key: "endCustomers", label: "End customers", default: true },
+      { key: "orders", label: "Orders", default: true },
+      { key: "contacts", label: "Contacts", default: true },
+      { key: "source", label: "Source", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "Who looks after the account." },
+      { key: "assigned", label: "Caller", default: true, hint: "Who works it for lead generation." },
+      { key: "renewalManager", label: "Renewal manager", default: false, hint: "Who looks after its renewals — the account manager where nobody else is given them." },
+      { key: "place", label: "City / State", default: false, hint: "Of its head office." },
+      { key: "gstin", label: "GSTIN", default: false, hint: "Of its head office." },
+      { key: "industry", label: "Industry", default: false },
+      { key: "lastActivity", label: "Last activity", default: false, hint: "Its last call, note or email." },
+      { key: "addedOn", label: "Added on", default: true },
+    ],
+  },
+  {
+    key: "leads",
+    label: "Leads",
+    customFields: "LEAD",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "id", label: "ID", default: true, hint: "The short reference — LEAD-000123." },
+      { key: "title", label: "Title", default: true, required: true },
+      { key: "company", label: "Company", default: true },
+      { key: "email", label: "Email", default: true, hint: "The lead contact's email — only for somebody who may see contacts, and masked where it is masked for them." },
+      { key: "phone", label: "Phone", default: true, hint: "The lead contact's phone — only for somebody who may see contacts, and masked where it is masked for them." },
+      { key: "status", label: "Status", default: true },
+      { key: "score", label: "Score", default: true, hint: "Out of 100 — hot, warm or cold. Open a lead to see what it is made of." },
+      { key: "source", label: "Source", default: true, hint: "Where the enquiry came from — website, referral, a call…" },
+      { key: "owner", label: "Owner", default: true },
+      { key: "accountManager", label: "Account manager", default: true, hint: "The account manager of the lead's company." },
+      { key: "caller", label: "Caller", default: true, hint: "The caller of the lead's company." },
+      { key: "value", label: "Value", default: true, hint: "The estimated value of the deal." },
+      { key: "quote", label: "Quotation", default: true, hint: "The furthest of its proposals, proformas and invoices — and \"No quote\" on a deal at Proposal sent or past it with none. Only for somebody who may see sales documents." },
+      { key: "expectedClose", label: "Expected close", default: true },
+      { key: "updated", label: "Updated", default: true },
+      { key: "addedBy", label: "Added by", default: true, hint: "Who added the lead." },
+      { key: "addedOn", label: "Added on", default: true },
+      { key: "contact", label: "Contact", default: false, hint: "The lead contact's name." },
+      { key: "lastActivity", label: "Last activity", default: false, hint: "Its last call or note." },
+      { key: "nextFollowUp", label: "Next follow-up", default: false, hint: "Its next open task or meeting." },
+      { key: "daysInStage", label: "Days in stage", default: false, hint: "Since it last moved stage." },
+      { key: "pipeline", label: "Pipeline", default: false },
+      { key: "lostReason", label: "Lost reason", default: false, hint: "Why a lost or disqualified deal died." },
+    ],
+  },
+  {
+    key: "renewals",
+    label: "Renewals",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "orderId", label: "Order ID", default: true, required: true },
+      { key: "company", label: "Company", default: true },
+      { key: "subscription", label: "Subscription", default: true },
+      { key: "qty", label: "Qty", default: true, hint: "Includes seats added mid-term, noted separately where there are any." },
+      { key: "po", label: "PO / Invoice #", default: true },
+      { key: "startDate", label: "Start date", default: false, hint: "Off by default — the expiry is what this list is about." },
+      { key: "expiryDate", label: "Expiry date", default: true },
+      {
+        key: "nextBill",
+        label: "Next bill",
+        default: true,
+        hint: "The next day it raises an invoice by itself — its next part, or the day it renews. \"Not set\" bills only by hand; Renewals › Billing check lists those.",
+      },
+      // The renewal manager: the customer's own, else its account manager (owner, 30 Oct 2026). Key kept for saved choices.
+      // The renewal manager's column kept its key from when it was the account manager's, so saved choices survive.
+      { key: "accountManager", label: "Renewal manager", default: true },
+      { key: "companyOwner", label: "Account manager", default: true, hint: "The customer's account manager." },
+      { key: "caller", label: "Caller", default: true, hint: "The customer's caller." },
+      { key: "renewalValue", label: "Renewal value", default: false, hint: "What the next term costs at full-term prices, add-ons included." },
+      { key: "lastContacted", label: "Last contacted", default: false, hint: "Its last call or renewal reminder." },
+      { key: "daysLeft", label: "Days left", default: false, hint: "Until it expires; below zero once it has." },
+      { key: "endCustomer", label: "End customer", default: false, hint: "Whose subscription a reseller's order is." },
+      { key: "status", label: "Status", default: true, hint: "How long is left — a clock, not progress." },
+      {
+        key: "stage",
+        label: "Stage",
+        default: true,
+        hint: "How far the renewal has got. Worked out from what's happened — a call logged, a proposal raised, the order punched — and pinnable by hand for Negotiating, On hold and Lost, which nothing can infer.",
+      },
+      { key: "actions", label: "Actions", default: true, required: true, hint: "Call, send a reminder, draft a proposal, or punch the renewal." },
+    ],
+  },
+
+  /**
+   * The seven document lists.
+   *
+   * One entry per type rather than a single shared one, because two of the columns are not the
+   * same question on every screen. `einvoice` exists only on the two types the IRP takes, so a
+   * shared entry would offer five screens a toggle for a column that is never drawn — and would
+   * make `cols.count` disagree with the cells, which is the one thing the empty row's colSpan
+   * cannot survive. And the last column is the salesperson on a sales document and whoever raised
+   * it on a purchase one; a single picker label cannot say both.
+   *
+   * Written out rather than generated in a loop: `tradeDocumentTypeValues` deliberately omits
+   * DELIVERY_CHALLAN, and using the Prisma enum as a value here would pull it into the client
+   * bundle through the picker. The four near-identical company entries above set the precedent.
+   */
+  {
+    key: "documents:PROPOSAL",
+    label: "Proposals",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      { key: "owner", label: "Salesperson", default: true, hint: "Whose name is on the document." },
+    ],
+  },
+  {
+    key: "documents:PROFORMA",
+    label: "Proforma invoices",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      { key: "owner", label: "Salesperson", default: true, hint: "Whose name is on the document." },
+    ],
+  },
+  {
+    key: "documents:INVOICE",
+    label: "Tax invoices",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      {
+        key: "einvoice",
+        label: "e-Invoice",
+        default: true,
+        hint: "IRN state. Only the two types the IRP takes declare this column at all.",
+      },
+      { key: "owner", label: "Salesperson", default: true, hint: "Whose name is on the document." },
+    ],
+  },
+  {
+    key: "documents:CREDIT_NOTE",
+    label: "Credit notes",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      {
+        key: "einvoice",
+        label: "e-Invoice",
+        default: true,
+        hint: "IRN state. Only the two types the IRP takes declare this column at all.",
+      },
+      { key: "owner", label: "Salesperson", default: true, hint: "Whose name is on the document." },
+    ],
+  },
+  {
+    key: "documents:PURCHASE_ORDER",
+    label: "Purchase orders",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      { key: "owner", label: "Raised by", default: true, hint: "Who raised it." },
+    ],
+  },
+  {
+    key: "documents:BILL",
+    label: "Vendor bills",
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      { key: "owner", label: "Raised by", default: true, hint: "Who raised it." },
+    ],
+  },
+  {
+    key: "documents:DELIVERY_CHALLAN",
+    get label() {
+      return challanWords().Many;
+    },
+    columns: [
+      { key: "select", label: "Selection", default: true, required: true, hint: "The tick box for bulk actions." },
+      { key: "date", label: "Date", default: true, hint: "The issue date." },
+      {
+        key: "number",
+        label: "Number",
+        default: true,
+        required: true,
+        hint: "The document number. Without it a row cannot be identified or opened.",
+      },
+      { key: "reference", label: "Reference #", default: true, hint: "Their PO or quote reference, where one was given." },
+      { key: "party", label: "Party", default: true },
+      { key: "branch", label: "Branch", default: false, hint: "Which branch raised it — on a purchase, which one bought. Offered only when there is more than one." },
+      {
+        key: "status",
+        label: "Status",
+        default: true,
+        hint: "Carries the sign-off badge too, on a type that needs approving.",
+      },
+      {
+        key: "origin",
+        label: "Source",
+        default: true,
+        hint: "Which part of the app raised it — typed in by hand, converted from another document, or produced by the add-on calculator or the renewals list.",
+      },
+      { key: "amount", label: "Amount", default: true, hint: "Inclusive of GST, in the document's own currency." },
+      { key: "owner", label: "Salesperson", default: true, hint: "Whose name is on the document." },
+    ],
+  },
+];
+
+const BY_KEY = new Map(TABLE_REGISTRY.map((t) => [t.key, t]));
+
+export function getTableDefinition(key: string): TableDefinition | undefined {
+  return BY_KEY.get(key);
+}
+
+export const TABLE_KEYS = TABLE_REGISTRY.map((t) => t.key);
+
+/**
+ * The table key for one document list.
+ *
+ * Keyed on the Prisma enum value rather than the URL, so renaming a screen or moving its route
+ * cannot strand everybody's stored column preference.
+ */
+export function documentTableKey(docType: TradeDocumentType) {
+  return `documents:${docType}`;
+}
+
+/** One of the workspace's own fields as a column: its key, and whether it is one by default. */
+export type FieldColumn = { key: string; default: boolean };
+
+/** A stored choice about a field: `cf.` and a field key (src/lib/custom-fields/rules.ts `FIELD_KEY_PATTERN`), `-` when hidden. */
+const FIELD_CHOICE = /^-?cf\.[a-z][a-z0-9_]{0,39}$/;
+
+export function isFieldChoice(entry: unknown): entry is string {
+  return typeof entry === "string" && FIELD_CHOICE.test(entry);
+}
+
+/** The field a stored choice is about. */
+export function fieldOfChoice(entry: string): string {
+  return entry.replace(/^-?cf\./, "");
+}
+
+/** The stored choice that shows or hides one field. */
+export function fieldChoice(fieldKey: string, shown: boolean): string {
+  return `${shown ? "" : "-"}cf.${fieldKey}`;
+}
+
+/**
+ * Whether one of the workspace's own fields is a column for somebody: the choice they made — the
+ * later one, should a stored row ever hold both — or, with none, the field's own default.
+ */
+export function showsField(stored: string[] | null, fieldKey: string, byDefault: boolean): boolean {
+  if (stored === null) return byDefault;
+  for (let i = stored.length - 1; i >= 0; i -= 1) {
+    if (stored[i] === `cf.${fieldKey}`) return true;
+    if (stored[i] === `-cf.${fieldKey}`) return false;
+  }
+  return byDefault;
+}
+
+/**
+ * A column frozen at one edge of the table while the ones between scroll sideways.
+ *
+ * Stored beside the column keys, the same way a field choice is: `freeze-left:<key>` or
+ * `freeze-right:<key>`, where the key is a registry column or `cf.<field>`. Nothing stored means
+ * nothing frozen, which is also the default — so a preference saved before freezing existed reads
+ * exactly as it did. The selection tick box is never stored: it is frozen whenever it is shown.
+ */
+export type Freeze = "left" | "right";
+
+const FREEZE_CHOICE = /^freeze-(left|right):(.+)$/;
+
+export function isFreezeChoice(entry: unknown): entry is string {
+  return typeof entry === "string" && FREEZE_CHOICE.test(entry);
+}
+
+/** The stored choice that freezes one column at one edge. */
+export function freezeChoice(columnKey: string, side: Freeze): string {
+  return `freeze-${side}:${columnKey}`;
+}
+
+/** The column a stored freeze choice is about. */
+export function columnOfFreeze(entry: string): string {
+  return entry.replace(FREEZE_CHOICE, "$2");
+}
+
+/** Which columns are frozen, and at which edge — the later choice where a stored row holds two. */
+export function frozenColumns(stored: string[] | null): Map<string, Freeze> {
+  const frozen = new Map<string, Freeze>();
+  for (const entry of stored ?? []) {
+    const m = FREEZE_CHOICE.exec(entry);
+    if (m) frozen.set(m[2]!, m[1] as Freeze);
+  }
+  return frozen;
+}
+
+/**
+ * The columns somebody sees, given what they have stored. Registry order, always — then, given the
+ * fields they may see (in the workspace's order), the ones they show, as `cf.<key>`.
+ */
+export function resolveColumns(tableKey: string, stored: string[] | null, fields: FieldColumn[] = []): string[] {
+  const def = BY_KEY.get(tableKey);
+  if (!def) return [];
+  const shownFields = def.customFields ? fields.filter((f) => showsField(stored, f.key, f.default)).map((f) => fieldChoice(f.key, true)) : [];
+
+  // Never customised: the defaults. Distinct from "customised to nothing", which is a real choice
+  // and must survive — hence null rather than an empty array meaning "untouched".
+  if (stored === null) return [...def.columns.filter((c) => c.default).map((c) => c.key), ...shownFields];
+
+  const chosen = new Set(stored);
+  return [
+    ...def.columns
+      // A required column is always present regardless of what is stored, so a preference saved
+      // before a column became required cannot strand somebody with an unusable table.
+      .filter((c) => c.required || chosen.has(c.key))
+      .map((c) => c.key),
+    ...shownFields,
+  ];
+}
+
+/**
+ * What gets stored when somebody picks. Required columns are implied, so they are not written. On a
+ * table that shows the workspace's fields, a choice about one is kept too — one per field, the later
+ * where two disagree; which fields exist is the server's to check (`setTableColumns`).
+ */
+export function normaliseSelection(tableKey: string, selected: string[]): string[] {
+  const def = BY_KEY.get(tableKey);
+  if (!def) return [];
+  const chosen = new Set(selected);
+  const columns = def.columns.filter((c) => !c.required && chosen.has(c.key)).map((c) => c.key);
+  // One freeze per column, the later; a column this table has (the tick box is frozen anyway), or
+  // one of the workspace's fields on a table that shows them.
+  const freezable = new Set(def.columns.filter((c) => c.key !== "select").map((c) => c.key));
+  const freezes = [...frozenColumns(selected)]
+    .filter(([key]) => freezable.has(key) || (Boolean(def.customFields) && key.startsWith("cf.") && isFieldChoice(key)))
+    .map(([key, side]) => freezeChoice(key, side));
+  if (!def.customFields) return [...columns, ...freezes];
+  const fields = new Map<string, string>();
+  for (const entry of selected) if (isFieldChoice(entry)) fields.set(fieldOfChoice(entry), entry);
+  return [...columns, ...fields.values(), ...freezes];
+}
+
+/** Whether a stored preference still matches the defaults — drives the "Reset" affordance. */
+export function isDefaultSelection(tableKey: string, stored: string[] | null, fields: FieldColumn[] = []): boolean {
+  if (stored === null) return true;
+  const def = BY_KEY.get(tableKey);
+  if (!def) return true;
+  if (frozenColumns(stored).size > 0) return false;
+  const a = resolveColumns(tableKey, stored, fields).join(",");
+  const b = resolveColumns(tableKey, null, fields).join(",");
+  return a === b;
+}

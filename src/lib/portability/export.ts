@@ -1,0 +1,356 @@
+import ExcelJS from "exceljs";
+import { companyMasker } from "@/lib/companies/masking";
+import { leadMasker } from "@/lib/authz/fields";
+import { formatContactId, formatLeadId } from "@/lib/order-id";
+import { db } from "@/lib/db";
+import { accountScopeIds } from "@/lib/authz/company-scope";
+import {
+  companyAccess,
+  contactAccess,
+  documentAccess,
+  leadAccess,
+  orderAccess,
+  paymentAccess,
+  ticketAccess,
+  visitAccess,
+} from "@/lib/authz/access";
+import { seesResellerContactDetails } from "@/lib/authz/contact-access";
+import { sanitizeCsvCell } from "@/lib/csv";
+import { isResellerManaged, redactContactDetails } from "@/lib/reseller";
+import { getExporter } from "./exporters";
+import { contactsForExport } from "./exporters/field-export";
+import { maskLeads } from "@/lib/leads/masking";
+import { bytesOf, dataUrlOrNull, isStoredRef, StoredFileMissing } from "@/lib/storage/files";
+
+/**
+ * Turning the canonical entities into a file somebody can open.
+ *
+ * ## Two shapes, for two different jobs
+ *
+ * **One area, one sheet** — "give me every contact" — is a list, and a list is a CSV or a single
+ * worksheet. That is the routine export.
+ *
+ * **One account, everything attached** is a different thing: a workbook where each sheet is a
+ * relationship. Contacts, orders, payments, tickets, visits, documents. Flattening that into one
+ * sheet would repeat the company on every row and lose which records belong to which relationship;
+ * one sheet per relationship keeps it legible and is what a person actually wants when they ask for
+ * "everything about this customer".
+ *
+ * ## Scope is inherited, never widened
+ *
+ * Every query here runs through the same account scoping the screens use. An export returns exactly
+ * the rows the person could already see. The permission decides whether they may take those rows
+ * out of the building, which is a different question from what they may look at, and this file must
+ * never be the place the two get confused.
+ */
+
+/**
+ * A value as a spreadsheet cell.
+ *
+ * Deliberately **not** run through `sanitizeCsvCell`. That guard exists because a CSV is plain text
+ * and Excel decides for itself whether a cell starting with `=` is a formula; in an xlsx the cell
+ * carries its own type, so a string is stored as a string and there is nothing to guard against.
+ * Applying it here instead corrupted the data — a part number of `-X1` came back as `'-X1`, and
+ * re-importing the file we had just exported wrote the apostrophe into the record.
+ */
+function cell(value: unknown): string | number | boolean | Date | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value;
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function sheetFrom(workbook: ExcelJS.Workbook, name: string, rows: Record<string, unknown>[]) {
+  // Excel refuses sheet names over 31 characters or containing : \ / ? * [ ]
+  const safe = name.replace(/[:\\/?*[\]]/g, "-").slice(0, 31);
+  const sheet = workbook.addWorksheet(safe);
+  if (rows.length === 0) {
+    sheet.addRow(["(none)"]);
+    return sheet;
+  }
+  const headers = Object.keys(rows[0]!);
+  sheet.addRow(headers);
+  sheet.getRow(1).font = { bold: true };
+  for (const r of rows) sheet.addRow(headers.map((h) => cell(r[h])));
+  // Enough width to read without clicking into each cell, capped so one long note does not make a
+  // column wider than the screen.
+  sheet.columns.forEach((col) => {
+    let max = 10;
+    col.eachCell?.({ includeEmpty: false }, (c) => {
+      max = Math.min(60, Math.max(max, String(c.value ?? "").length + 2));
+    });
+    col.width = max;
+  });
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+  return sheet;
+}
+
+export async function toWorkbookBuffer(
+  sheets: { name: string; rows: Record<string, unknown>[] }[],
+  meta: { title: string; by: string; generatedAt: Date },
+): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Deskzo One";
+  wb.created = meta.generatedAt;
+
+  // A cover sheet, because an exported file outlives the conversation that produced it. Six months
+  // on, the useful questions are what this is, when it was taken, who took it, and whether it is
+  // everything or only what one person could see.
+  sheetFrom(wb, "About this export", [
+    { Field: "Export", Value: meta.title },
+    { Field: "Taken", Value: meta.generatedAt.toISOString() },
+    { Field: "By", Value: meta.by },
+    { Field: "Source", Value: "Deskzo One" },
+    {
+      Field: "Scope",
+      Value:
+        "Only the accounts the person taking this export could see. Not necessarily the whole database.",
+    },
+    { Field: "Sheets", Value: sheets.map((s) => s.name).join(", ") },
+  ]);
+
+  for (const s of sheets) sheetFrom(wb, s.name, s.rows);
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+/**
+ * The same rows as plain text.
+ *
+ * Two things differ from the workbook and both are about CSV having no types. Dates are written as
+ * ISO rather than left to `String(date)`, which would emit "Thu Jun 05 2025 05:30:00 GMT+0530" — a
+ * local-timezone string that reads back as the previous day west of here. And strings go through
+ * `sanitizeCsvCell`, because Excel opening a text file decides for itself what is a formula; the
+ * import side removes that marker again, so the round trip still holds.
+ */
+export function toCsv(rows: Record<string, unknown>[]): string {
+  if (rows.length === 0) return "";
+  const headers = Object.keys(rows[0]!);
+  const text = (v: unknown) => {
+    const c = cell(v);
+    if (c === null) return "";
+    if (c instanceof Date) return c.toISOString();
+    if (typeof c === "string") return sanitizeCsvCell(c);
+    return String(c);
+  };
+  const line = (values: unknown[]) => values.map((v) => `"${text(v).replaceAll('"', '""')}"`).join(",");
+  return [line(headers), ...rows.map((r) => line(headers.map((h) => r[h])))].join("\n");
+}
+
+// ─── The queries ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Every relationship hanging off one account, as sheets.
+ *
+ * This is the "export a customer and get everything" case. Each sheet is deliberately flat — a
+ * target system or a person with a spreadsheet can work with flat; neither can work with nesting.
+ */
+export async function accountBundle(userId: string, companyId: string) {
+  // The account, and on it each kind of record by that record's own rule (src/lib/authz/access.ts) —
+  // the same fragments the account's tabs ask, so the workbook holds what the page shows and no more.
+  const [accounts, contactRule, orderRule, paymentRule, ticketRule, visitRule, documentRule, leadRule] = await Promise.all([
+    companyAccess(userId, "view"),
+    contactAccess(userId, "view"),
+    orderAccess(userId, "view"),
+    paymentAccess(userId, "view"),
+    ticketAccess(userId, "view"),
+    visitAccess(userId, "view"),
+    documentAccess(userId, "view"),
+    leadAccess(userId, "view"),
+  ]);
+  const company = await db.company.findFirst({
+    where: { AND: [{ id: companyId }, accounts] },
+    include: {
+      owner: { select: { name: true, email: true } },
+      assignedTo: { select: { name: true } },
+      industry: { select: { name: true } },
+      managedByReseller: { select: { name: true } },
+      locations: true,
+      contacts: { where: contactRule },
+    },
+  });
+  // Null covers both "no such company" and "not yours" on purpose: telling somebody a record exists
+  // but is not theirs is itself a disclosure.
+  if (!company) return null;
+  // A reseller's end customer's contact details leave only with somebody who may see them
+  // (src/lib/authz/contact-access.ts), as on the screens.
+  const restricted = isResellerManaged(company);
+  const canViewRestricted = restricted ? await seesResellerContactDetails(userId) : true;
+  // Then field access (owner, 3 Nov 2026 — src/lib/contacts/masking.ts): a workbook is a list that leaves the building, so
+  // the list's answers with each field's export answer on top (5 Nov 2026 — Phase 3 masking fixes, audit H.4.4), not the
+  // customer's page's — a contact masked in lists but not on the page went out in the clear here.
+  const contacts = await contactsForExport(userId, company.contacts.map((c) => redactContactDetails(c, { restricted, canViewRestricted })));
+
+  const [orders, payments, tickets, visits, documents, leads] = await Promise.all([
+    db.companyProduct.findMany({
+      where: { AND: [{ companyId }, orderRule] },
+      include: { item: { select: { name: true, sku: true } }, vendor: { select: { name: true } }, addedBy: { select: { name: true } } },
+      orderBy: { orderSeq: "asc" },
+    }),
+    db.payment.findMany({ where: { AND: [{ companyId }, paymentRule] }, include: { recordedBy: { select: { name: true } } }, orderBy: { paidOn: "asc" } }),
+    db.ticket.findMany({ where: { AND: [{ companyId }, ticketRule] }, include: { assignedTo: { select: { name: true } } }, orderBy: { ticketSeq: "asc" } }),
+    db.visit.findMany({ where: { AND: [{ companyId }, visitRule] }, include: { user: { select: { name: true } } }, orderBy: { createdAt: "asc" } }),
+    db.tradeDocument.findMany({ where: { AND: [{ companyId }, documentRule] }, orderBy: { createdAt: "asc" } }),
+    db.lead.findMany({ where: { AND: [{ companyId }, leadRule] }, include: { owner: { select: { name: true } } }, orderBy: { leadSeq: "asc" } }),
+  ]);
+
+  // Leads, and the account's own fields, as a list shows them (owner, 5 Nov 2026 — Phase 3 masking fixes, audit H.4.2):
+  // a workbook is a list — the website, and each location's address and GSTIN — with each field's export answer on top
+  // (audit H.4.4). Never read back in, so a value the export alone masks goes out masked.
+  const [leadsShown, shown] = await Promise.all([leadMasker(userId, "export"), companyMasker(userId, "export")]);
+  return withFiles({
+    company,
+    sheets: [
+      {
+        name: "Account",
+        rows: [
+          {
+            Name: company.name,
+            Key: company.normalizedName,
+            Type: company.relationshipType,
+            "Managed by reseller": company.managedByReseller?.name ?? "",
+            Stage: company.stage,
+            Industry: company.industry?.name ?? "",
+            Source: company.source ?? "",
+            "Account manager": company.owner?.name ?? "",
+            "Assigned to": company.assignedTo?.name ?? "",
+            Website: shown.present("website", company.website) ?? "",
+            "Added on": company.createdAt,
+          },
+        ],
+      },
+      {
+        name: "Locations",
+        rows: company.locations.map((stored) => shown.location(stored)).map((l) => ({
+          Label: l.label,
+          Primary: l.isPrimary,
+          GSTIN: l.gstNumber ?? "",
+          "GST treatment": l.gstTreatment,
+          Address: l.address ?? "",
+          City: l.city ?? "",
+          State: l.state ?? "",
+          Pincode: l.pincode ?? "",
+        })),
+      },
+      {
+        name: "Contacts",
+        rows: contacts.map((c) => ({
+          Key: formatContactId(c.contactSeq),
+          Name: c.name,
+          Designation: c.designation,
+          Email: c.email ?? "",
+          Phone: c.phone ?? "",
+          Primary: c.isPrimary,
+          "Email status": c.detailsRedacted ? "" : c.emailStatus,
+        })),
+      },
+      {
+        name: "Orders",
+        rows: orders.map((o) => ({
+          Order: `ORD-${String(o.orderSeq).padStart(6, "0")}`,
+          Item: o.item.name,
+          SKU: o.item.sku ?? "",
+          Quantity: o.quantity,
+          "Unit price": o.unitPrice ? Number(o.unitPrice) : null,
+          "Full-term price": o.fullTermUnitPrice ? Number(o.fullTermUnitPrice) : null,
+          Status: o.orderStatus,
+          Type: o.businessType,
+          Vendor: o.vendor?.name ?? "",
+          Starts: o.startDate,
+          Expires: o.endDate,
+          "PO number": o.poNumber ?? "",
+          "Added by": o.addedBy.name,
+        })),
+      },
+      {
+        name: "Payments",
+        rows: payments.map((p) => ({
+          Payment: `PAY-${String(p.paymentSeq).padStart(6, "0")}`,
+          Amount: Number(p.amount),
+          "Paid on": p.paidOn,
+          Method: p.method,
+          Reference: p.reference ?? "",
+          "Recorded by": p.recordedBy?.name ?? "",
+        })),
+      },
+      {
+        name: "Leads",
+        // Masked as the person's field access masks a lead in a list, with the export answers: a workbook is a list.
+        rows: (await maskLeads(leadsShown, leads)).map((l) => ({
+          Lead: formatLeadId(l.leadSeq),
+          Title: l.title,
+          Status: l.status,
+          Value: l.estimatedValue ? Number(l.estimatedValue) : null,
+          Owner: l.owner?.name ?? "",
+          "Expected close": l.expectedCloseDate,
+        })),
+      },
+      {
+        name: "Tickets",
+        rows: tickets.map((t) => ({
+          Ticket: `TKT-${String(t.ticketSeq).padStart(6, "0")}`,
+          Title: t.title,
+          Status: t.status,
+          Priority: t.priority,
+          "Assigned to": t.assignedTo?.name ?? "",
+          Raised: t.createdAt,
+        })),
+      },
+      {
+        name: "Visits",
+        rows: visits.map((v) => ({
+          Visit: v.visitSeq ? `VIS-${String(v.visitSeq).padStart(6, "0")}` : "",
+          Status: v.status,
+          By: v.user?.name ?? "",
+          Planned: v.scheduledFor,
+          "Checked in": v.checkInAt,
+        })),
+      },
+      {
+        name: "Documents",
+        rows: documents.map((d) => ({
+          Number: d.docNumber ?? "(draft)",
+          Kind: d.docType,
+          Status: d.status,
+          Date: d.issueDate,
+          Total: d.total ? Number(d.total) : null,
+          IRN: d.irn ?? "",
+        })),
+      },
+    ],
+  });
+}
+
+/**
+ * The file itself wherever a cell holds a reference into the storage box (src/lib/storage/files.ts): an export
+ * leaves the server, and a reference means nothing anywhere else — nor in another workspace. No sheet carries a
+ * file column today; this is the net that keeps one added later from shipping references. A data-URL reference
+ * becomes its data URL again (empty when the box has lost it), a Bytes one its bytes. Anything else is untouched.
+ */
+export async function resolveStoredFiles(rows: Record<string, unknown>[]): Promise<Record<string, unknown>[]> {
+  const out: Record<string, unknown>[] = [];
+  for (const row of rows) {
+    let copy: Record<string, unknown> | null = null;
+    for (const [k, v] of Object.entries(row)) {
+      if (!(typeof v === "string" || v instanceof Uint8Array) || !isStoredRef(v)) continue;
+      copy ??= { ...row };
+      if (typeof v === "string") copy[k] = (await dataUrlOrNull(v)) ?? "";
+      else copy[k] = await bytesOf(v).catch((err) => (err instanceof StoredFileMissing ? null : Promise.reject(err)));
+    }
+    out.push(copy ?? row);
+  }
+  return out;
+}
+
+async function withFiles<T extends { sheets: { name: string; rows: Record<string, unknown>[] }[] }>(bundle: T): Promise<T> {
+  const sheets = [];
+  for (const s of bundle.sheets) sheets.push({ ...s, rows: await resolveStoredFiles(s.rows) });
+  return { ...bundle, sheets };
+}
+
+/** A single area as one flat list, scoped to what this person may see. */
+export async function areaRows(userId: string, area: string): Promise<Record<string, unknown>[]> {
+  const exporter = getExporter(area);
+  if (!exporter) return [];
+  return resolveStoredFiles(await exporter({ userId, ownerUserIds: await accountScopeIds(userId) }));
+}

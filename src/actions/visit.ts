@@ -1,0 +1,532 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { Prisma, type VisitStatus, type VisitPurpose } from "@prisma/client";
+import { db } from "@/lib/db";
+import { getWording } from "@/lib/terms/server";
+import { slot, upperFirst } from "@/lib/terms/dictionary";
+import { leadsInPlan, leadsSeenBy } from "@/lib/leads/shown";
+import { detailLeadMasker, listLeadMasker, maskLeadRefs, maskLeadTitle } from "@/lib/leads/masking";
+import { companyMasker, type CompanyMasker } from "@/lib/companies/masking";
+import { maskContactRows } from "@/lib/contacts/masking";
+import { requireModuleAccess, requireModuleUser } from "@/lib/modules-access";
+import { isModuleEnabled } from "@/actions/module";
+import { toPlain } from "@/lib/serialize";
+import { pageSlice } from "@/lib/pagination";
+import { workspaceClock } from "@/lib/time/workspace";
+import { canSeeCompany } from "@/lib/authz/company-scope";
+import { viewerHas } from "@/actions/permission";
+import { leadAccess, peopleReached, reachesPerson, visitAccess } from "@/lib/authz/access";
+import { notifyUser } from "@/lib/notify";
+import { recordAudit } from "@/lib/audit";
+import { formatVisitId, visitPurposeLabels } from "@/lib/visits";
+import { visitPath } from "@/lib/record-links";
+import { createVisitSchema, updateVisitSchema, completeVisitSchema, setVisitStatusSchema } from "@/lib/validation/visit";
+import { followVisitCancel, followVisitMove } from "@/lib/calendar/meetings";
+import type { ActionResult } from "@/actions/company";
+import { seqSearchTerm } from "@/lib/order-id";
+
+/**
+ * Whose visits you can see and change: the visit rule (src/lib/authz/access.ts, "visits") — your own
+ * and your team's, everyone's to see with `visits.viewAll`, until a role sets a level of its own. A
+ * field visit log is a record of where someone spent their day, so it isn't open to the whole company
+ * by default — but a manager can't run a team without seeing their team's.
+ *
+ * Changing one — planning it for somebody, checking in, completing, cancelling — is the visitor's
+ * line's, whoever may see it: "See all visits" has never widened a change.
+ */
+async function canActFor(actorId: string, targetUserId: string, action: "edit" | "delete" = "edit") {
+  return reachesPerson(actorId, "visits", action, targetUserId);
+}
+
+type VisitListParams = {
+  status?: VisitStatus;
+  purpose?: VisitPurpose;
+  userId?: string;
+  companyId?: string;
+  leadId?: string;
+  from?: string;
+  to?: string;
+  search?: string;
+};
+
+/**
+ * Whose visits, not whose accounts — and deliberately only that.
+ *
+ * The account scope in src/lib/authz/company-scope.ts governs what hangs off a *customer*: their
+ * orders, contacts, tickets. A visit hangs off a *day*. It is the record of where a person went and
+ * what they wrote up afterwards, which is why `visits.viewAll` is worded as "your own and your
+ * team's" rather than "your accounts'". Adding `company.ownerUserId` on top would hide a rep's own
+ * write-up from them the moment they called on a colleague's account — a joint visit with a sales
+ * engineer, or covering while somebody is away — and the row it hid would be one they wrote.
+ *
+ * So the two rules meet at the company's own page, which decides whether you may be there at all,
+ * and not in here. `visitFormOptions` below is the exception, and says why.
+ */
+async function visitListWhere(viewerId: string, params?: VisitListParams): Promise<Prisma.VisitWhereInput> {
+  // The workspace's days, half-open — whatever zone the server runs in.
+  const scheduledFor = (await workspaceClock()).dayRange(params?.from, params?.to);
+  return {
+    // Inside an AND, so a "visits by" filter narrows the rule and can never stand in for it.
+    AND: [await visitAccess(viewerId, "view")],
+    ...(params?.userId ? { userId: params.userId } : {}),
+    ...(params?.status ? { status: params.status } : {}),
+    ...(params?.purpose ? { purpose: params.purpose } : {}),
+    ...(params?.companyId ? { companyId: params.companyId } : {}),
+    ...(params?.leadId ? { leadId: params.leadId } : {}),
+    ...(scheduledFor ? { scheduledFor } : {}),
+    ...(params?.search
+      ? {
+          OR: [
+            { agenda: { contains: params.search, mode: "insensitive" as const } },
+            { outcome: { contains: params.search, mode: "insensitive" as const } },
+            { company: { name: { contains: params.search, mode: "insensitive" as const } } },
+            // Its number, as the list shows it — "VIS-000123", "123" (owner, 1 Nov 2026).
+            ...seqSearchTerm(params.search, "visitSeq"),
+          ],
+        }
+      : {}),
+  };
+}
+
+/**
+ * The visit's own address, as the companies policy shows a site's (owner, 5 Nov 2026 — Phase 3 masking fixes, audit
+ * H.4.1; src/lib/companies/masking.ts): planned at one of the company's sites, it is that site's address copied — the
+ * form fills it in — so whoever sees addresses masked sees this masked too. One typed for a visit with no site on file
+ * is the visit's own, and stays as it is. A list's answers: a visit is not the company's page.
+ */
+function visitAddressAsSeen<T extends { address: string | null; locationId: string | null }>(places: CompanyMasker, visit: T): T {
+  if (!places.flags.address || !visit.locationId || !visit.address) return visit;
+  return { ...visit, address: places.present("address", visit.address) };
+}
+
+/**
+ * What a saved visit's address is to be (owner, 5 Nov 2026 — Phase 3 masking fixes): as typed — unless it is what this
+ * person was shown in place of the real one, the stored address or the chosen site's as the form filled it in masked,
+ * which keeps the real one. Saving a form that showed stars never writes the stars.
+ */
+async function addressToStore(userId: string, sent: string | null | undefined, locationId: string | null | undefined, stored: string | null): Promise<string | null> {
+  const typed = sent?.trim() || null;
+  if (!typed) return null;
+  const places = await companyMasker(userId, "list");
+  if (!places.flags.address) return typed;
+  if (stored && typed === places.present("address", stored)) return stored;
+  if (locationId) {
+    const site = await db.companyLocation.findUnique({ where: { id: locationId }, select: { address: true, city: true, state: true, pincode: true } });
+    // The line the form builds from the site's parts (src/components/visits/visit-form.tsx).
+    const line = (l: { address: string | null; city: string | null; state: string | null; pincode: string | null }) => [l.address, l.city, l.state, l.pincode].filter(Boolean).join(", ");
+    if (site && typed === line(places.location(site))) return line(site) || null;
+  }
+  return typed;
+}
+
+const visitListInclude = {
+  company: { select: { id: true, name: true, companySeq: true } },
+  contact: { select: { id: true, name: true } },
+  lead: { select: { id: true, title: true } },
+  user: { select: { id: true, name: true } },
+  _count: { select: { expenses: true } },
+} as const;
+
+export async function listVisitsPaged(params: VisitListParams & { page: number; pageSize: number }) {
+  const user = await requireModuleUser("visits");
+  if (!(await viewerHas("visits.view"))) return { rows: [], total: 0, openCount: 0 };
+  const where = await visitListWhere(user.id, params);
+  const [rows, total, openCount] = await Promise.all([
+    db.visit.findMany({
+      where,
+      orderBy: { scheduledFor: "desc" },
+      include: visitListInclude,
+      ...pageSlice(params.page, params.pageSize),
+    }),
+    db.visit.count({ where }),
+    db.visit.count({ where: { ...where, status: { in: ["PLANNED", "CHECKED_IN"] } } }),
+  ]);
+  const places = await companyMasker(user.id, "list");
+  return { rows: toPlain((await leadsSeenBy(user.id, rows)).map((v) => visitAddressAsSeen(places, v))), total, openCount };
+}
+
+/** A company's visits, for its 360 view — scoped the same way as the list. */
+export async function listCompanyVisits(companyId: string) {
+  const user = await requireModuleUser("visits");
+  if (!(await viewerHas("visits.view"))) return [];
+  const where = await visitListWhere(user.id, { companyId });
+  const rows = await db.visit.findMany({ where, orderBy: { scheduledFor: "desc" }, include: visitListInclude });
+  const places = await companyMasker(user.id, "list");
+  return toPlain((await leadsSeenBy(user.id, rows)).map((v) => visitAddressAsSeen(places, v)));
+}
+
+/**
+ * The visits made for one deal, for the lead's own page.
+ *
+ * Scoped through the same `visitListWhere` as every other visit query, so a lead page can't become
+ * a way around the "your own and your team's" rule that applies everywhere else.
+ */
+export async function listLeadVisits(leadId: string) {
+  const user = await requireModuleUser("visits");
+  if (!(await viewerHas("visits.view"))) return [];
+  const where = await visitListWhere(user.id, { leadId });
+  const rows = await db.visit.findMany({ where, orderBy: { scheduledFor: "desc" }, include: visitListInclude });
+  // Each names the lead as the lead's own page does (owner, 5 Nov 2026 — Phase 3 masking fixes, audit H.4.3): the
+  // detail answers, today's "Show" honoured (src/lib/leads/masking.ts). It named it in full beside the masked header.
+  const places = await companyMasker(user.id, "list");
+  return toPlain(maskLeadRefs(await detailLeadMasker(user.id, leadId), rows).map((v) => visitAddressAsSeen(places, v)));
+}
+
+export async function getVisit(id: string) {
+  const user = await requireModuleUser("visits");
+  if (!(await viewerHas("visits.view"))) return null;
+  const visit = await db.visit.findFirst({
+    where: { AND: [{ id }, await visitAccess(user.id, "view")] },
+    include: {
+      company: { select: { id: true, companySeq: true, name: true, relationshipType: true } },
+      contact: {
+        select: {
+          id: true, name: true, email: true, phone: true,
+          emailStatus: true, emailCheckedValue: true, emailCheckedAt: true,
+          emailCheckMethod: true, emailCheckDetail: true,
+        },
+      },
+      lead: { select: { id: true, leadSeq: true, title: true, status: true } },
+      location: true,
+      user: { select: { id: true, name: true } },
+      expenses: {
+        orderBy: { spentOn: "desc" },
+        include: { user: { select: { id: true, name: true } } },
+        // Its claims' receipts stay on the claims' own pages — never in this page's props.
+        omit: { receiptDataUrl: true },
+      },
+    },
+  });
+  if (!visit) return null;
+  const seen = (await leadsSeenBy(user.id, [visit]))[0]!;
+  // Its contact and the place it was at, as the field policies show them in a list — a visit's page is neither the
+  // contact's nor the company's (owner, 5 Nov 2026 — Phase 3 masking fixes, audit H.4.1/H.4.3; src/lib/contacts/masking.ts,
+  // src/lib/companies/masking.ts): the contact's email and phone and the site's address went out in full.
+  const [contact] = seen.contact ? await maskContactRows(user.id, "list", [seen.contact]) : [null];
+  const places = await companyMasker(user.id, "list");
+  return toPlain({ ...visitAddressAsSeen(places, seen), contact: contact ?? null, location: seen.location ? places.location(seen.location) : null });
+}
+
+export async function createVisit(input: unknown): Promise<ActionResult<{ id: string; visitSeq: number }>> {
+  const user = await requireModuleUser("visits");
+  // Only somebody who may open Field Visits: the Create menu and the form are hidden otherwise, and this
+  // is the same rule for a caller who posts anyway (decideModuleAccess, src/lib/navigation.ts).
+  if (!(await isModuleEnabled("visits"))) return { ok: false, error: "You don't have access to Field Visits." };
+  const parsed = createVisitSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+  const data = parsed.data;
+  const ownerId = data.userId || user.id;
+
+  if (!(await canActFor(user.id, ownerId))) {
+    return { ok: false, error: "You can only plan visits for yourself or someone on your team." };
+  }
+
+  // Only an account the person may see (security review, 23 Oct 2026): planning a visit read back any company's name,
+  // and its people through the visit's meeting form.
+  const company = await db.company.findUnique({ where: { id: data.companyId }, select: { id: true, name: true, ownerUserId: true, relationshipType: true } });
+  if (!company || !(await canSeeCompany(user.id, company))) return { ok: false, error: "That company no longer exists." };
+
+  const parts = await partsOfCompany(data.companyId, data);
+  if (parts) return { ok: false, error: parts };
+
+  // The form's "10:00" is 10:00 on the workspace's clock, wherever the server is — not the server's own 10:00.
+  const scheduledFor = (await workspaceClock()).parseInput(data.scheduledFor);
+  if (!scheduledFor) return { ok: false, error: "Pick a date and time." };
+
+  const visit = await db.visit.create({
+    data: {
+      companyId: data.companyId,
+      contactId: data.contactId || null,
+      leadId: data.leadId || null,
+      locationId: data.locationId || null,
+      purpose: data.purpose,
+      agenda: data.agenda || null,
+      scheduledFor,
+      address: await addressToStore(user.id, data.address, data.locationId, null),
+      distanceKm: data.distanceKm !== undefined ? new Prisma.Decimal(data.distanceKm) : null,
+      userId: ownerId,
+    },
+    select: { id: true, visitSeq: true },
+  });
+
+  if (ownerId !== user.id) {
+    await notifyUser({
+      userId: ownerId,
+      type: "VISIT_SCHEDULED",
+      title: upperFirst(slot(await getWording(), "A visit was scheduled for you", "visit", "{a} was scheduled for you")),
+      message: `${visitPurposeLabels[data.purpose]} at ${company.name}`,
+      link: visitPath(visit.visitSeq),
+    });
+  }
+  await recordAudit({
+    userId: user.id,
+    action: "CREATE",
+    entityType: "Visit",
+    entityId: visit.id,
+    entityLabel: `${formatVisitId(visit.visitSeq)} — ${company.name}`,
+  });
+
+  revalidatePath("/visits");
+  revalidatePath(`/companies/${data.companyId}`);
+  return { ok: true, data: { id: visit.id, visitSeq: visit.visitSeq } };
+}
+
+/** Why a visit's contact, location or lead isn't its company's own, or null when they are (or aren't given). */
+async function partsOfCompany(companyId: string, data: { contactId?: string | null; locationId?: string | null; leadId?: string | null }): Promise<string | null> {
+  if (data.contactId) {
+    const contact = await db.contact.findUnique({ where: { id: data.contactId }, select: { companyId: true } });
+    if (!contact || contact.companyId !== companyId) return "That contact doesn't belong to this company.";
+  }
+  if (data.locationId) {
+    const location = await db.companyLocation.findUnique({ where: { id: data.locationId }, select: { companyId: true } });
+    if (!location || location.companyId !== companyId) return "That location doesn't belong to this company.";
+  }
+  if (data.leadId) {
+    const lead = await db.lead.findUnique({ where: { id: data.leadId }, select: { companyId: true } });
+    if (!lead || lead.companyId !== companyId) return "That lead doesn't belong to this company.";
+  }
+  return null;
+}
+
+export async function updateVisit(input: unknown): Promise<ActionResult<{ id: string; visitSeq: number }>> {
+  const user = await requireModuleAccess("visits");
+  const parsed = updateVisitSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+  const { id, ...data } = parsed.data;
+
+  const existing = await db.visit.findUnique({ where: { id }, select: { userId: true, companyId: true, visitSeq: true, address: true } });
+  if (!existing) return { ok: false, error: "That visit no longer exists." };
+  if (!(await canActFor(user.id, existing.userId))) {
+    return { ok: false, error: "You can only edit your own visits, or your team's." };
+  }
+  // The same checks as planning it (security review, 23 Oct 2026): any contact's id here read their details back.
+  const parts = await partsOfCompany(existing.companyId, data);
+  if (parts) return { ok: false, error: parts };
+
+  const scheduledFor = (await workspaceClock()).parseInput(data.scheduledFor);
+  if (!scheduledFor) return { ok: false, error: "Pick a date and time." };
+
+  await db.visit.update({
+    where: { id },
+    data: {
+      contactId: data.contactId || null,
+      leadId: data.leadId || null,
+      locationId: data.locationId || null,
+      purpose: data.purpose,
+      agenda: data.agenda || null,
+      scheduledFor,
+      address: await addressToStore(user.id, data.address, data.locationId, existing.address),
+      distanceKm: data.distanceKm !== undefined ? new Prisma.Decimal(data.distanceKm) : null,
+    },
+  });
+
+  // Its event in the calendar of whoever is making it moves too (src/lib/calendar/meetings.ts).
+  const unfollowed = await followVisitMove(existing.userId, id, scheduledFor).catch((err: unknown) => String(err));
+  if (unfollowed) console.error("visit moved without its calendar event", id, unfollowed);
+
+  revalidatePath("/visits");
+  revalidatePath(`/visits/${id}`);
+  revalidatePath(`/companies/${existing.companyId}`);
+  return { ok: true, data: { id, visitSeq: existing.visitSeq } };
+}
+
+/** A visit that can still happen: written up, cancelled or marked a no-show from here, and from nowhere else (SEC-53). */
+const OPEN_VISIT = ["PLANNED", "CHECKED_IN"] as const;
+
+function visitClosedWords(status: string) {
+  return status === "COMPLETED"
+    ? "This visit is already completed."
+    : status === "CANCELLED"
+      ? "This visit was cancelled."
+      : status === "NO_SHOW"
+        ? "This visit is marked a no-show."
+        : "This visit can't be changed now.";
+}
+
+/** Stamps arrival. Kept separate from the write-up so it can be tapped on a phone at the door. */
+export async function checkInVisit(id: string): Promise<ActionResult<{ id: string }>> {
+  const user = await requireModuleUser("visits");
+  const visit = await db.visit.findUnique({ where: { id }, select: { userId: true, status: true } });
+  if (!visit) return { ok: false, error: "That visit no longer exists." };
+  if (!(await canActFor(user.id, visit.userId))) return { ok: false, error: "That isn't your visit." };
+  if (visit.status !== "PLANNED") return { ok: false, error: "This visit isn't waiting to be checked into." };
+
+  // SEC-53: only while still planned — not over a cancellation landing at the same moment.
+  const checked = await db.visit.updateMany({ where: { id, status: "PLANNED" }, data: { status: "CHECKED_IN", checkInAt: new Date() } });
+  if (checked.count === 0) return { ok: false, error: "This visit isn't waiting to be checked into." };
+  revalidatePath("/visits");
+  revalidatePath(`/visits/${id}`);
+  return { ok: true, data: { id } };
+}
+
+export async function completeVisit(input: unknown): Promise<ActionResult<{ id: string }>> {
+  const user = await requireModuleUser("visits");
+  const parsed = completeVisitSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+  const { id, outcome, checkInAt, checkOutAt, distanceKm } = parsed.data;
+
+  const visit = await db.visit.findUnique({ where: { id }, select: { userId: true, companyId: true, checkInAt: true, status: true } });
+  if (!visit) return { ok: false, error: "That visit no longer exists." };
+  if (!(await canActFor(user.id, visit.userId))) return { ok: false, error: "That isn't your visit." };
+  // Security audit, 11 Nov 2026 (SEC-53): a cancelled or no-show visit could be completed afterwards, and a completed
+  // one completed again with new times. Only a visit still open is written up.
+  if (!(OPEN_VISIT as readonly string[]).includes(visit.status)) return { ok: false, error: visitClosedWords(visit.status) };
+
+  // A form's time is the workspace's time; a timestamp that says its zone is taken as it says.
+  const clock = await workspaceClock();
+  const resolvedIn = checkInAt ? clock.parseTyped(checkInAt) : visit.checkInAt;
+  const resolvedOut = checkOutAt ? clock.parseTyped(checkOutAt) : new Date();
+  if (checkInAt && !resolvedIn) return { ok: false, error: "That check-in time isn't a date and time." };
+  if (!resolvedOut) return { ok: false, error: "That check-out time isn't a date and time." };
+  if (resolvedIn && resolvedOut < resolvedIn) {
+    return { ok: false, error: "Check-out can't be before check-in." };
+  }
+
+  // Only while still open, so a cancellation landing at the same moment isn't written over.
+  const completed = await db.visit.updateMany({
+    where: { id, status: { in: [...OPEN_VISIT] } },
+    data: {
+      status: "COMPLETED",
+      outcome,
+      checkInAt: resolvedIn,
+      checkOutAt: resolvedOut,
+      ...(distanceKm !== undefined ? { distanceKm: new Prisma.Decimal(distanceKm) } : {}),
+    },
+  });
+  if (completed.count === 0) return { ok: false, error: "This visit changed a moment ago — refresh and look again." };
+
+  revalidatePath("/visits");
+  revalidatePath(`/visits/${id}`);
+  revalidatePath(`/companies/${visit.companyId}`);
+  return { ok: true, data: { id } };
+}
+
+export async function setVisitStatus(input: unknown): Promise<ActionResult<{ id: string }>> {
+  const user = await requireModuleUser("visits");
+  const parsed = setVisitStatusSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+  const { id, status, note } = parsed.data;
+
+  const visit = await db.visit.findUnique({ where: { id }, select: { userId: true, companyId: true, outcome: true, status: true } });
+  if (!visit) return { ok: false, error: "That visit no longer exists." };
+  if (!(await canActFor(user.id, visit.userId))) return { ok: false, error: "That isn't your visit." };
+  if (status === "COMPLETED") {
+    return { ok: false, error: "Completing a visit needs a write-up — use Complete visit." };
+  }
+  // Security audit, 11 Nov 2026 (SEC-53): a completed visit could be cancelled — its write-up replaced by the note — and
+  // any visit set back to planned or checked in. Here a visit still open is called off: cancelled, or a no-show.
+  if (status !== "CANCELLED" && status !== "NO_SHOW") {
+    return { ok: false, error: status === "CHECKED_IN" ? "Check in from the visit itself." : "A visit can't be set back to planned." };
+  }
+  if (!(OPEN_VISIT as readonly string[]).includes(visit.status)) return { ok: false, error: visitClosedWords(visit.status) };
+  if (!note) {
+    return { ok: false, error: "Add a note saying why." };
+  }
+
+  const moved = await db.visit.updateMany({
+    where: { id, status: { in: [...OPEN_VISIT] } },
+    data: { status, outcome: note },
+  });
+  if (moved.count === 0) return { ok: false, error: "This visit changed a moment ago — refresh and look again." };
+  if (status === "CANCELLED") {
+    // Everybody invited to it is told it's off.
+    const unfollowed = await followVisitCancel(visit.userId, id).catch((err: unknown) => String(err));
+    if (unfollowed) console.error("visit cancelled without its calendar event", id, unfollowed);
+  }
+
+  revalidatePath("/visits");
+  revalidatePath(`/visits/${id}`);
+  revalidatePath(`/companies/${visit.companyId}`);
+  return { ok: true, data: { id } };
+}
+
+export async function deleteVisit(id: string): Promise<ActionResult<{ id: string }>> {
+  const user = await requireModuleAccess("visits");
+  const visit = await db.visit.findUnique({
+    where: { id },
+    select: { userId: true, companyId: true, status: true, _count: { select: { expenses: true } } },
+  });
+  if (!visit) return { ok: false, error: "That visit no longer exists." };
+  if (!(await canActFor(user.id, visit.userId, "delete"))) return { ok: false, error: "That isn't your visit." };
+  if (visit.status === "COMPLETED") {
+    return { ok: false, error: "A completed visit is a record — cancel it instead of deleting it." };
+  }
+  if (visit._count.expenses > 0) {
+    return { ok: false, error: "Expenses are claimed against this visit. Remove them first." };
+  }
+
+  // A planned visit taken away takes its calendar event with it.
+  if (visit.status === "PLANNED") await followVisitCancel(visit.userId, id).catch(() => null);
+  await db.visit.delete({ where: { id } });
+  revalidatePath("/visits");
+  revalidatePath(`/companies/${visit.companyId}`);
+  return { ok: true, data: { id } };
+}
+
+/** People somebody can plan visits for: whose visits they may change — themselves and their line, by default. */
+export async function listVisitAssignees() {
+  const user = await requireModuleAccess("visits");
+  const ids = await peopleReached(user.id, "visits", "edit");
+  return db.user.findMany({
+    where: { ...(ids === null ? {} : { id: { in: ids } }), active: true },
+    orderBy: { name: "asc" },
+    select: { id: true, name: true, role: true },
+  });
+}
+
+/** Contacts, locations and open leads for one company — the dependent pickers on the visit form. */
+export async function visitFormOptions(companyId: string) {
+  const user = await requireModuleUser("visits");
+
+  /**
+   * The one place in this file the *account* scope applies, because nothing it returns is a visit.
+   *
+   * Contacts, site addresses and open deals are the company's, and `companies.viewAll` already says
+   * those follow their account manager. The id comes straight from the caller, so there is nothing
+   * to filter — refuse instead, with the same empty shape the form already renders while it waits.
+   * The picker that feeds it is scoped already (`listCompanyOptions`), so this turns nobody away
+   * who reached the form the ordinary way; it closes the id-in-a-request-body route.
+   */
+  const company = await db.company.findUnique({ where: { id: companyId }, select: { ownerUserId: true, relationshipType: true } });
+  if (!company || !(await canSeeCompany(user.id, company))) {
+    return { contacts: [], locations: [], leads: [] };
+  }
+
+  // A visit is made against an open deal only where the plan has leads.
+  const leadsHere = await leadsInPlan();
+  const [contacts, locations, leads] = await Promise.all([
+    db.contact.findMany({
+      where: { companyId },
+      orderBy: [{ isPrimary: "desc" }, { name: "asc" }],
+      select: { id: true, name: true, designation: true },
+    }),
+    db.companyLocation.findMany({
+      where: { companyId },
+      orderBy: [{ isPrimary: "desc" }, { createdAt: "asc" }],
+      select: { id: true, label: true, address: true, city: true, state: true, pincode: true },
+    }),
+    // The company's open deals that this person reaches, by the lead rule — as every other lead picker.
+    leadsHere
+      ? leadAccess(user.id, "view").then((reach) =>
+          db.lead.findMany({
+            where: { AND: [{ companyId, status: { notIn: ["WON", "LOST", "DISQUALIFIED"] } }, reach] },
+            orderBy: { updatedAt: "desc" },
+            select: { id: true, title: true },
+          }),
+        )
+      : [],
+  ]);
+  const masker = await listLeadMasker(user.id);
+  // The sites by their label, their address parts as a list shows them (src/lib/companies/masking.ts).
+  const places = await companyMasker(user.id, "list");
+  return { contacts, locations: locations.map((l) => places.location(l)), leads: leads.map((l) => ({ ...l, title: maskLeadTitle(masker, l.title) })) };
+}

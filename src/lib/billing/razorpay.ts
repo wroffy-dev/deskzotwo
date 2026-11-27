@@ -1,0 +1,215 @@
+import { GATEWAY_TIMEOUT_MS, GatewayError, GatewayNotConfigured, hmacHex, sameHex } from "@/lib/billing/gateway";
+import { getSecret } from "@/lib/platform/settings";
+
+/**
+ * Razorpay, over its REST API with plain fetch — no SDK. For workspaces in India, in rupees.
+ *
+ *   · One Razorpay subscription per plan a workspace is on (Razorpay's subscriptions carry a single
+ *     plan), each authorised by the customer on Razorpay's hosted page. An add-on bought later starts
+ *     where the edition's current period ends, so they renew together.
+ *   · A Razorpay plan is made for each price here, and never changed: a new price is a new plan.
+ *   · Webhooks are signed: `X-Razorpay-Signature`, an HMAC-SHA256 of the raw body with the webhook
+ *     secret; each delivery's id comes in `X-Razorpay-Event-Id`.
+ */
+
+const API = "https://api.razorpay.com/v1";
+/** How many cycles a subscription runs before Razorpay considers it finished — ten years. */
+export const TOTAL_COUNT = { MONTH: 120, YEAR: 10 } as const;
+
+async function call<T>(method: "GET" | "POST" | "PATCH", path: string, body?: Record<string, unknown>): Promise<T> {
+  const [keyId, keySecret] = await Promise.all([getSecret("razorpay.keyId"), getSecret("razorpay.keySecret")]);
+  if (!keyId || !keySecret) throw new GatewayNotConfigured("Razorpay");
+  let res: Response;
+  try {
+    res = await fetch(`${API}${path}`, {
+      method,
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString("base64")}`,
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new GatewayError(`Razorpay could not be reached: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const json = (await res.json().catch(() => null)) as { error?: { description?: string } } | null;
+  if (!res.ok) throw new GatewayError(json?.error?.description ?? `Razorpay answered ${res.status}.`, res.status);
+  return json as T;
+}
+
+// ─── What is read from Razorpay ───────────────────────────────────────────────────────────────
+
+export type RazorpaySubscription = {
+  id: string;
+  entity: "subscription";
+  plan_id: string;
+  status: string;
+  quantity?: number;
+  customer_id?: string | null;
+  current_start?: number | null;
+  current_end?: number | null;
+  charge_at?: number | null;
+  ended_at?: number | null;
+  start_at?: number | null;
+  /** How many charges have been taken — nought until the first payment arrives (R2-06). */
+  paid_count?: number | null;
+  short_url?: string | null;
+  notes?: Record<string, string> | unknown[];
+};
+
+export type RazorpayPayment = {
+  id: string;
+  entity: "payment";
+  amount: number;
+  currency: string;
+  status: string;
+  invoice_id?: string | null;
+  tax?: number | null;
+  created_at: number;
+  /** Everything refunded on it so far; `refund_status` null, "partial" or "full". */
+  amount_refunded?: number;
+  refund_status?: string | null;
+};
+
+/** A one-off payment page — what a Deskzo AI credit pack is bought through (src/lib/ai/packs.ts). */
+export type RazorpayPaymentLink = {
+  id: string;
+  entity?: "payment_link";
+  status: string;
+  amount: number;
+  amount_paid?: number;
+  currency: string;
+  short_url?: string | null;
+  reference_id?: string | null;
+  notes?: Record<string, string> | unknown[];
+};
+
+export type RazorpayEvent = {
+  entity: "event";
+  event: string;
+  created_at?: number;
+  payload: {
+    subscription?: { entity: RazorpaySubscription };
+    payment_link?: { entity: RazorpayPaymentLink };
+    payment?: { entity: RazorpayPayment };
+    /** One refund (`refund.processed`): its own amount, not the payment's total refunded. */
+    refund?: { entity: { id: string; payment_id: string; amount: number } };
+  };
+};
+
+/** Razorpay sends `notes` as an object, or as an empty array when there are none. */
+export const noteOf = (notes: RazorpaySubscription["notes"] | RazorpayPaymentLink["notes"], key: string): string | null =>
+  notes && !Array.isArray(notes) && typeof notes[key] === "string" ? notes[key] : null;
+
+/**
+ * Our status for a Razorpay subscription.
+ *
+ * Security audit round two, 13 Nov 2026 (R2-06): "authenticated" used to count as ACTIVE, but it means
+ * only that the customer set up the mandate — no money has arrived. A mandate alone then ended a trial
+ * and lifted a billing hold. The rule now:
+ *
+ *   · authenticated, starting now (no future `start_at`): INCOMPLETE until its first charge — Razorpay's
+ *     `paid_count` above nought, or a `subscription.charged` event with a captured payment;
+ *   · authenticated, starting later (a change from the next renewal, src/lib/billing/checkout.ts): ACTIVE
+ *     as before, because it is remembered with its `startsAt` and counts for nothing until that day
+ *     (src/lib/billing/sync.ts) — it ends no trial and gives no seats; on the day Razorpay charges it and
+ *     it turns "active";
+ *   · active: ACTIVE, unless Razorpay says outright that nothing has been paid (`paid_count` 0) and this
+ *     isn't the charge itself.
+ */
+export function razorpayStatus(
+  status: string,
+  facts: { paidCount?: number | null; startsLater?: boolean; charged?: boolean } = {},
+): "INCOMPLETE" | "ACTIVE" | "PAST_DUE" | "CANCELLED" {
+  const paid = !!facts.charged || (typeof facts.paidCount === "number" && facts.paidCount > 0);
+  switch (status) {
+    case "created":
+      return "INCOMPLETE";
+    case "authenticated":
+      return paid || facts.startsLater ? "ACTIVE" : "INCOMPLETE";
+    case "active":
+      return paid || facts.paidCount !== 0 || facts.startsLater ? "ACTIVE" : "INCOMPLETE";
+    // A charge failed and is being retried, or the retries ran out, or it was paused.
+    case "pending":
+    case "halted":
+    case "paused":
+      return "PAST_DUE";
+    default:
+      // cancelled, completed, expired
+      return "CANCELLED";
+  }
+}
+
+// ─── Calls ─────────────────────────────────────────────────────────────────────────────────────
+
+export function createRazorpayPlan(input: { planKey: string; name: string; amount: number; currency: string; interval: "MONTH" | "YEAR" }) {
+  return call<{ id: string }>("POST", "/plans", {
+    period: input.interval === "YEAR" ? "yearly" : "monthly",
+    interval: 1,
+    item: { name: input.name, amount: input.amount, currency: input.currency.toUpperCase(), description: input.planKey },
+    notes: { planKey: input.planKey },
+  });
+}
+
+/** A subscription waiting to be authorised on Razorpay's page — `short_url` is where the customer goes. */
+export function createRazorpaySubscription(input: { planId: string; quantity: number; tenantId: string; interval: "MONTH" | "YEAR"; startAt?: Date | null }) {
+  return call<RazorpaySubscription>("POST", "/subscriptions", {
+    plan_id: input.planId,
+    quantity: input.quantity,
+    total_count: TOTAL_COUNT[input.interval],
+    customer_notify: 1,
+    ...(input.startAt ? { start_at: Math.floor(input.startAt.getTime() / 1000) } : {}),
+    notes: { tenantId: input.tenantId },
+  });
+}
+
+export function getRazorpaySubscription(id: string) {
+  return call<RazorpaySubscription>("GET", `/subscriptions/${encodeURIComponent(id)}`);
+}
+
+/** At the end of the period it is in, or now. */
+export function cancelRazorpaySubscription(id: string, atCycleEnd: boolean) {
+  return call<RazorpaySubscription>("POST", `/subscriptions/${encodeURIComponent(id)}/cancel`, { cancel_at_cycle_end: atCycleEnd ? 1 : 0 });
+}
+
+/**
+ * A page that takes one payment of `amount` (paise, GST included) — `short_url` is where the customer goes,
+ * and they come back to `callbackUrl`. Razorpay mails and texts nobody: the customer is sent there from here.
+ */
+export function createRazorpayPaymentLink(input: { amount: number; description: string; reference: string; customer: { name: string; email: string | null }; notes: Record<string, string>; callbackUrl: string; expiresAt: Date }) {
+  return call<RazorpayPaymentLink>("POST", "/payment_links", {
+    amount: input.amount,
+    currency: "INR",
+    accept_partial: false,
+    description: input.description,
+    reference_id: input.reference,
+    customer: { name: input.customer.name, ...(input.customer.email ? { email: input.customer.email } : {}) },
+    notify: { sms: false, email: false },
+    reminder_enable: false,
+    notes: input.notes,
+    callback_url: input.callbackUrl,
+    callback_method: "get",
+    expire_by: Math.floor(input.expiresAt.getTime() / 1000),
+  });
+}
+
+/** Money back on a payment: `amount` in paise, some or all of what's left of it. */
+export function createRazorpayRefund(paymentId: string, amount: number, notes: Record<string, string>) {
+  return call<{ id: string; amount: number; status?: string }>("POST", `/payments/${encodeURIComponent(paymentId)}/refund`, { amount, notes });
+}
+
+/** A subscription's invoice, which names the payment that paid it. */
+export function getRazorpayInvoice(id: string) {
+  return call<{ id: string; payment_id?: string | null }>("GET", `/invoices/${encodeURIComponent(id)}`);
+}
+
+export function getRazorpayPaymentLink(id: string) {
+  return call<RazorpayPaymentLink>("GET", `/payment_links/${encodeURIComponent(id)}`);
+}
+
+// ─── Webhooks ──────────────────────────────────────────────────────────────────────────────────
+
+export function verifyRazorpaySignature(rawBody: string, signature: string | null, secret: string): boolean {
+  return !!signature && sameHex(signature, hmacHex(secret, rawBody));
+}

@@ -1,0 +1,310 @@
+import Link from "next/link";
+import { customerStatement } from "@/actions/receivable";
+import { Badge, Card, CardContent, CardHeader } from "@/components/ui/card";
+import { formatCurrency } from "@/lib/utils";
+import { formatMoney } from "@/lib/currency";
+import { formatCalendarDay } from "@/lib/time/zone";
+import { AGING_BUCKETS } from "@/lib/receivables";
+import { FollowUpHistory } from "@/components/collections/follow-up-history";
+import { LogFollowUpButton } from "@/components/collections/log-follow-up-button";
+
+type Statement = NonNullable<Awaited<ReturnType<typeof customerStatement>>>;
+
+const KIND_TONE = {
+  INVOICE: "blue",
+  PAYMENT: "green",
+  CREDIT_NOTE: "amber",
+  EXCHANGE: "default",
+  JOURNAL: "brand",
+  OPENING: "default",
+} as const;
+
+const KIND_LABEL = {
+  INVOICE: "Invoice",
+  PAYMENT: "Payment",
+  CREDIT_NOTE: "Credit note",
+  EXCHANGE: "Exchange difference",
+  JOURNAL: "Journal",
+  OPENING: "Brought forward",
+} as const;
+
+/** A rupee figure, with what a foreign line was written for under it. */
+function Money({ value, foreign }: { value: number; foreign?: { currency: string; amount: number } | null }) {
+  return (
+    <>
+      {formatCurrency(value)}
+      {foreign && <div className="text-xs text-subtle">{formatMoney(foreign.amount, foreign.currency)}</div>}
+    </>
+  );
+}
+
+/**
+ * A statement of account: every invoice, payment, credit note, exchange difference and journal in date
+ * order with a running balance, the aging of what's still open, and the invoices making it up — in rupees,
+ * each line at its own rate with a foreign one's own amount under it, and what is open in each other
+ * currency below the figures (owner, 21 Oct 2026).
+ */
+export function CompanyStatement({ statement }: { statement: Statement }) {
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 gap-3 @2xl:grid-cols-4">
+        <Figure label="Invoiced" value={formatCurrency(statement.invoiced)} hint="issued tax invoices" />
+        <Figure
+          label="Received"
+          value={formatCurrency(statement.received)}
+          tone="success"
+          hint={statement.unappliedPayments > 0 ? `${formatCurrency(statement.unappliedPayments)} unapplied` : "all applied"}
+        />
+        <Figure
+          label="Credit notes"
+          value={formatCurrency(statement.credited)}
+          tone="warning"
+          hint={statement.unappliedCredits > 0 ? `${formatCurrency(statement.unappliedCredits)} unapplied` : "all applied"}
+        />
+        <Figure
+          label="Outstanding"
+          value={formatCurrency(statement.outstanding)}
+          tone={statement.outstanding > 0 ? "danger" : "success"}
+          hint="still owed on invoices"
+        />
+      </div>
+
+      {/* Two different questions — what's owed on invoices, and what's sitting on account — so the
+          net is spelled out rather than leaving the reader to reconcile them. */}
+      {(statement.unappliedPayments > 0 || statement.unappliedCredits > 0 || statement.journals !== 0) && (
+        <Card
+          className={`px-4 py-3 text-sm ${
+            statement.netPosition < 0 ? "border-warning/40 bg-warning-bg text-warning" : "text-muted"
+          }`}
+        >
+          {statement.netPosition < 0 ? (
+            <>
+              <span className="font-medium">
+                {formatCurrency(Math.abs(statement.netPosition))} in credit on this account
+              </span>{" "}
+              — {formatCurrency(statement.unappliedPayments)} in unapplied payments and{" "}
+              {formatCurrency(statement.unappliedCredits)} in unapplied credit notes, against{" "}
+              {formatCurrency(statement.outstanding)} still owed
+              {statement.journals !== 0 && <> and {formatCurrency(statement.journals)} in opening balances and journals</>}. Apply it to an invoice to
+              clear it down.
+            </>
+          ) : (
+            <>
+              <span className="font-medium">{formatCurrency(statement.netPosition)} net owed</span>
+              {statement.unappliedPayments + statement.unappliedCredits > 0 && (
+                <> after {formatCurrency(statement.unappliedPayments + statement.unappliedCredits)} of unapplied payments and credit notes</>
+              )}
+              {statement.journals !== 0 && <>, with {formatCurrency(statement.journals)} in opening balances and journals</>}.
+            </>
+          )}
+        </Card>
+      )}
+
+      {statement.currencies.length > 0 && (
+        <Card>
+          <CardHeader className="text-sm font-medium text-text">
+            In other currencies
+            <span className="ml-2 text-xs font-normal text-subtle">What is open in each, as the invoices and payments are written — the rupee figures above include it at each one&apos;s own rate.</span>
+          </CardHeader>
+          <CardContent className="p-0">
+            <table className="w-full text-sm">
+              <thead className="border-y border-line bg-surface-sunken text-left text-xs uppercase tracking-wide text-muted">
+                <tr>
+                  <th className="px-5 py-2">Currency</th>
+                  <th className="px-3 py-2 text-right">Open on invoices</th>
+                  <th className="px-3 py-2 text-right">On account</th>
+                  <th className="px-5 py-2 text-right">Balance</th>
+                </tr>
+              </thead>
+              <tbody>
+                {statement.currencies.map((c) => (
+                  <tr key={c.currency} className="border-b border-line last:border-0">
+                    <td className="px-5 py-2 font-medium text-text">{c.currency}</td>
+                    <td className="px-3 py-2 text-right text-muted">{c.open ? formatMoney(c.open, c.currency) : "—"}</td>
+                    <td className="px-3 py-2 text-right text-muted">{c.unused ? formatMoney(c.unused, c.currency) : "—"}</td>
+                    <td className="px-5 py-2 text-right font-medium text-text">{formatMoney(c.balance, c.currency)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader className="text-sm font-medium text-text">Aging</CardHeader>
+        <CardContent>
+          {statement.outstanding === 0 ? (
+            <p className="text-sm text-subtle">Nothing outstanding — every issued invoice is settled.</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-3 @3xl:grid-cols-5">
+              {AGING_BUCKETS.map((bucket) => (
+                <div key={bucket.key} className="rounded-lg border border-line bg-surface-sunken px-3 py-2">
+                  <div className="text-xs uppercase tracking-wide text-subtle">{bucket.label}</div>
+                  <div
+                    className={`mt-0.5 text-sm font-semibold ${
+                      statement.aging[bucket.key] > 0 && bucket.key !== "current" ? "text-danger" : "text-text"
+                    }`}
+                  >
+                    {formatCurrency(statement.aging[bucket.key])}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {statement.openInvoices.length > 0 && (
+        <Card>
+          <CardHeader className="text-sm font-medium text-text">Open invoices</CardHeader>
+          <CardContent className="p-0">
+            <table className="w-full text-sm">
+              <thead className="border-y border-line bg-surface-sunken text-left text-xs uppercase tracking-wide text-muted">
+                <tr>
+                  <th className="px-5 py-2">Invoice</th>
+                  <th className="px-3 py-2">Issued</th>
+                  <th className="px-3 py-2">Due</th>
+                  <th className="px-3 py-2">Age</th>
+                  <th className="px-3 py-2 text-right">Balance</th>
+                  {statement.canLogFollowUps && (
+                    <th className="px-5 py-2 text-right">
+                      <span className="sr-only">Follow up</span>
+                    </th>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {statement.openInvoices.map((invoice) => (
+                  <tr key={invoice.id} className="border-b border-line last:border-0">
+                    <td className="px-5 py-2">
+                      <Link href={`/documents/${invoice.id}`} className="font-mono text-xs text-text hover:underline">
+                        {invoice.docNumber}
+                      </Link>
+                    </td>
+                    <td className="px-3 py-2 text-muted">{formatCalendarDay(invoice.issueDate)}</td>
+                    <td className="px-3 py-2 text-muted">{formatCalendarDay(invoice.dueDate)}</td>
+                    <td className="px-3 py-2">
+                      {invoice.daysOverdue > 0 ? (
+                        <Badge tone={invoice.daysOverdue > 90 ? "red" : "amber"}>{invoice.daysOverdue}d overdue</Badge>
+                      ) : (
+                        <Badge tone="default">Not due</Badge>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-right font-medium text-text">
+                      {formatCurrency(invoice.balance, invoice.currency)}
+                      {invoice.currency !== "INR" && <div className="text-xs font-normal text-subtle">{formatCurrency(invoice.rupees)}</div>}
+                    </td>
+                    {statement.canLogFollowUps && (
+                      <td className="px-5 py-2 text-right">
+                        <LogFollowUpButton
+                          label="Follow up"
+                          variant="ghost"
+                          target={{ documentId: invoice.id, label: invoice.docNumber, companyName: "", balance: invoice.balance, currency: invoice.currency }}
+                        />
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* One history for sales and accounts: every follow-up on this account's invoices and orders. */}
+      {(statement.followUps.length > 0 || statement.canLogFollowUps) && (
+        <Card>
+          <CardHeader className="text-sm font-medium text-text">
+            Payment follow-ups
+            <span className="ml-2 text-xs font-normal text-subtle">What the customer said about paying, and what they promised.</span>
+          </CardHeader>
+          <CardContent>
+            <FollowUpHistory
+              history={statement.followUps}
+              showTarget
+              emptyText="Nobody has followed up a payment on this account yet. Use Follow up beside an open invoice."
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader className="text-sm font-medium text-text">
+          Statement of account
+          <span className="ml-2 text-xs font-normal text-subtle">
+            In rupees, each line at its own rate — a negative balance means they&apos;re in credit with us.
+          </span>
+        </CardHeader>
+        <CardContent className={statement.ledger.length === 0 ? undefined : "p-0"}>
+          {statement.ledger.length === 0 ? (
+            <p className="text-sm text-subtle">
+              Nothing on this account yet. Invoices, payments and credit notes appear here in date order.
+            </p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="border-y border-line bg-surface-sunken text-left text-xs uppercase tracking-wide text-muted">
+                <tr>
+                  <th className="px-5 py-2">Date</th>
+                  <th className="px-3 py-2">Type</th>
+                  <th className="px-3 py-2">Reference</th>
+                  <th className="px-3 py-2 text-right">Debit</th>
+                  <th className="px-3 py-2 text-right">Credit</th>
+                  <th className="px-3 py-2 text-right">Balance</th>
+                </tr>
+              </thead>
+              <tbody>
+                {statement.ledger.map((entry) => (
+                  <tr key={`${entry.kind}-${entry.id}`} className="border-b border-line last:border-0">
+                    <td className="px-5 py-2 text-muted">{formatCalendarDay(entry.date)}</td>
+                    <td className="px-3 py-2">
+                      <Badge tone={KIND_TONE[entry.kind]}>{KIND_LABEL[entry.kind]}</Badge>
+                    </td>
+                    <td className="px-3 py-2">
+                      {entry.href ? (
+                        <Link href={entry.href} className="font-mono text-xs text-text hover:underline">
+                          {entry.reference}
+                        </Link>
+                      ) : (
+                        <span className="text-muted">{entry.reference}</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-right text-muted">
+                      {entry.debit > 0 ? <Money value={entry.debit} foreign={entry.foreign} /> : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-right text-muted">
+                      {entry.credit > 0 ? <Money value={entry.credit} foreign={entry.foreign} /> : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-right font-medium text-text">{formatCurrency(entry.balance)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function Figure({
+  label,
+  value,
+  tone,
+  hint,
+}: {
+  label: string;
+  value: string;
+  tone?: "danger" | "success" | "warning";
+  hint?: string;
+}) {
+  const toneClass =
+    tone === "danger" ? "text-danger" : tone === "success" ? "text-success" : tone === "warning" ? "text-warning" : "text-text";
+  return (
+    <Card className="px-4 py-3">
+      <div className="text-xs uppercase tracking-wide text-subtle">{label}</div>
+      <div className={`mt-1 text-lg font-semibold ${toneClass}`}>{value}</div>
+      {hint && <div className="mt-0.5 text-xs text-muted">{hint}</div>}
+    </Card>
+  );
+}

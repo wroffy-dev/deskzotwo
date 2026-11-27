@@ -1,0 +1,35 @@
+import type { Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import { settleInvoice } from "@/lib/receivables";
+import { isReceivable } from "@/lib/trade-documents";
+import { writeOffsFor } from "@/lib/receivables/write-off";
+
+/** The caller's transaction where there is one: the write-offs are read on it too, never on a second connection. */
+type Client = Pick<typeof db, "tradeDocument" | "invoiceWriteOff">;
+
+/** What a sum of rows comes to. */
+const sum = (rows: { amount: Prisma.Decimal | number }[]) => rows.reduce((t, r) => t + Number(r.amount), 0);
+
+/**
+ * What's still to pay on an invoice — or a debit note, owed the same way — as Receivables settles it
+ * (src/lib/receivables.ts): its total, less payments applied, credit notes applied, what was written off and what it had settled
+ * before Deskzo. Null for anything that isn't an issued, uncancelled invoice or debit note.
+ */
+export async function invoiceBalance(invoiceId: string, client: Client = db): Promise<{ balance: number; currency: string; total: number } | null> {
+  const invoice = await client.tradeDocument.findUnique({
+    where: { id: invoiceId },
+    select: {
+      docType: true,
+      status: true,
+      total: true,
+      currency: true,
+      paidBefore: true,
+      payments: { select: { amount: true } },
+      creditsReceived: { select: { amount: true } },
+    },
+  });
+  if (!invoice || !isReceivable(invoice.docType) || invoice.status === "DRAFT" || invoice.status === "CANCELLED") return null;
+  const writtenOff = (await writeOffsFor([invoiceId], client)).get(invoiceId) ?? 0;
+  const settled = settleInvoice(Number(invoice.total), sum(invoice.payments), sum(invoice.creditsReceived) + writtenOff, Number(invoice.paidBefore));
+  return { balance: settled.balance, currency: invoice.currency, total: Number(invoice.total) };
+}

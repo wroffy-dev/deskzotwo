@@ -1,0 +1,166 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import type { z } from "zod";
+import { useForm, type UseFormRegister, type FieldValues } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useRouter } from "next/navigation";
+import { updateItemSchema, type UpdateItemInput } from "@/lib/validation/item";
+import { updateItem } from "@/actions/item";
+import { Button } from "@/components/ui/button";
+import {
+  CurrencyPricesCard,
+  currencyPriceDrafts,
+  currencyPricesForSave,
+  ItemDetailFields,
+  type BrandOption,
+  type CurrencyPriceDraft,
+} from "@/components/items/item-fields";
+import type { ItemCurrencyPrice } from "@/lib/items/own-price";
+import type { Item } from "@prisma/client";
+import { itemPath } from "@/lib/record-links";
+import { HSN_REQUIRED_MESSAGE } from "@/lib/hsn";
+
+type FormValues = z.input<typeof updateItemSchema>;
+
+/** Money columns reach the client as plain numbers — see the Decimal extension in src/lib/db.ts. */
+type ItemWithPlainPrices = Omit<Item, "costPrice" | "sellingPrice" | "taxRatePercent" | "stockQuantity" | "reorderQuantity"> & {
+  costPrice: number | null;
+  sellingPrice: number;
+  taxRatePercent: number | null;
+  stockQuantity: number;
+  reorderQuantity?: number | null;
+};
+
+export function EditItemForm({
+  item,
+  brands,
+  showRevenuePattern = false,
+  hsnRequired = false,
+  categories = [],
+  subscriptions = false,
+  currencyPrices: storedPrices = [],
+}: {
+  item: ItemWithPlainPrices;
+  /** Its own prices in other currencies (src/lib/items/currency-prices.ts). */
+  currencyPrices?: ItemCurrencyPrice[];
+  brands: BrandOption[];
+  /** Revenue & Close is available, so the form asks how this item's revenue is recognised. */
+  showRevenuePattern?: boolean;
+  /** An Indian workspace: HSN/SAC is required, and checked against the GST portal's directory. */
+  hsnRequired?: boolean;
+  /** The workspace's item categories, to pick from. */
+  categories?: { id: string; name: string }[];
+  /** Renewals is available, so a service may be managed as a subscription. */
+  subscriptions?: boolean;
+}) {
+  const router = useRouter();
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [currencyPrices, setCurrencyPrices] = useState<CurrencyPriceDraft[]>(() => currencyPriceDrafts(storedPrices));
+  const {
+    register,
+    handleSubmit,
+    watch,
+    setValue,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm<FormValues, unknown, UpdateItemInput>({
+    resolver: zodResolver(updateItemSchema),
+    defaultValues: {
+      id: item.id,
+      name: item.name,
+      sku: item.sku,
+      type: item.type === "PERPETUAL" ? "SERVICE" : item.type,
+      category: item.category ?? "",
+      hsnCode: item.hsnCode ?? "",
+      vendor: item.vendor ?? "",
+      brandId: item.brandId ?? "",
+      productFamilyId: item.productFamilyId ?? "",
+      unit: item.unit ?? "",
+      costPrice: item.costPrice ? Number(item.costPrice) : undefined,
+      sellingPrice: Number(item.sellingPrice),
+      taxRatePercent: item.taxRatePercent ? Number(item.taxRatePercent) : undefined,
+      taxCategory: item.taxCategory ?? "",
+      description: item.description ?? "",
+      trackInventory: item.trackInventory,
+      reorderLevel: item.reorderLevel ?? undefined,
+      active: item.active,
+      revenuePattern: item.revenuePattern ?? "",
+    },
+  });
+
+  // Typed as the schema reads it (a retired PERPETUAL is read as SERVICE), so narrowed here.
+  const itemType = String(watch("type") ?? "GOOD");
+  const brandId = watch("brandId");
+  const hsnCode = watch("hsnCode");
+  const category = watch("category");
+  const trackInventory = watch("trackInventory");
+
+  useEffect(() => {
+    if (itemType !== "GOOD") setValue("trackInventory", false);
+  }, [itemType, setValue]);
+
+  // Clear the family when the brand changes — but not on first render, or editing an item would
+  // wipe the family it already has.
+  const initialBrandId = useRef(item.brandId ?? "");
+  useEffect(() => {
+    if (brandId === initialBrandId.current) return;
+    initialBrandId.current = brandId ?? "";
+    setValue("productFamilyId", "");
+  }, [brandId, setValue]);
+
+  async function onSubmit(values: UpdateItemInput) {
+    setServerError(null);
+    if (hsnRequired && !values.hsnCode) {
+      setError("hsnCode", { message: HSN_REQUIRED_MESSAGE }, { shouldFocus: true });
+      return;
+    }
+    const prices = currencyPricesForSave(currencyPrices);
+    if (!prices.ok) return setServerError(prices.error);
+    const result = await updateItem({ ...values, currencyPrices: prices.rows });
+    if (!result.ok) {
+      // What the GST directory said about the code belongs under the code.
+      if (/\b(HSN|SAC)\b/.test(result.error)) setError("hsnCode", { message: result.error }, { shouldFocus: true });
+      else setServerError(result.error);
+      return;
+    }
+    router.push(itemPath(item.itemSeq));
+  }
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      {serverError && <div className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{serverError}</div>}
+
+      <ItemDetailFields
+        register={register as unknown as UseFormRegister<FieldValues>}
+        errors={errors}
+        itemType={itemType}
+        brands={brands}
+        brandId={brandId}
+        onBrandChange={(id) => setValue("brandId", id, { shouldDirty: true })}
+        hsnCode={typeof hsnCode === "string" ? hsnCode : ""}
+        taxRate={watch("taxRatePercent")}
+        onHsnChange={(code) => setValue("hsnCode", code, { shouldDirty: true, shouldValidate: !!errors.hsnCode })}
+        onTypeChange={(type) => setValue("type", type, { shouldDirty: true })}
+        categories={categories}
+        category={typeof category === "string" ? category : ""}
+        onCategoryChange={(name) => setValue("category", name, { shouldDirty: true })}
+        subscriptions={subscriptions}
+        trackInventory={!!trackInventory}
+        showRevenuePattern={showRevenuePattern}
+        hsnRequired={hsnRequired}
+      />
+
+      <CurrencyPricesCard value={currencyPrices} onChange={setCurrencyPrices} />
+
+      <div className="flex justify-end gap-3">
+        <Button type="button" variant="secondary" onClick={() => router.back()}>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={isSubmitting}>
+          {isSubmitting ? "Saving…" : "Save changes"}
+        </Button>
+      </div>
+    </form>
+  );
+}

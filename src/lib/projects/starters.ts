@@ -1,0 +1,166 @@
+import type { Question, QuestionType } from "@/lib/projects/questionnaire";
+
+/**
+ * Ready examples to start a project type from (owner, 16 Nov 2026: "start phase 1 with starter examples"). Picking one
+ * copies its stages and questions into the workspace as an ordinary project type — renamed, reordered or deleted like
+ * any other. Nothing here is read again after that.
+ */
+
+type Step = { name: string; dayOffset: number; note?: string };
+export type ProjectStarter = { key: string; name: string; blurb: string; steps: Step[]; questions: Question[] };
+
+const q = (key: string, label: string, type: QuestionType, extra: { required?: boolean; options?: string[]; help?: string } = {}): Question => ({
+  key,
+  label,
+  type,
+  required: extra.required ?? false,
+  options: extra.options ?? [],
+  help: extra.help ?? null,
+});
+const h = (key: string, label: string, help?: string) => q(key, label, "HEADING", { help });
+
+const contact = [
+  h("you", "About you"),
+  q("contact_name", "Your name", "TEXT", { required: true }),
+  q("contact_role", "Your role", "TEXT"),
+  q("contact_phone", "Phone", "PHONE"),
+];
+
+export const PROJECT_STARTERS: ProjectStarter[] = [
+  {
+    key: "website",
+    name: "Website design & development",
+    blurb: "Brief, sitemap, design, build, content, testing and go-live.",
+    steps: [
+      { name: "Brief received", dayOffset: 0 },
+      { name: "Sitemap approved", dayOffset: 5 },
+      { name: "Design approved", dayOffset: 15 },
+      { name: "Development", dayOffset: 30 },
+      { name: "Content added", dayOffset: 38 },
+      { name: "Testing on staging", dayOffset: 42 },
+      { name: "Go live", dayOffset: 45 },
+      { name: "Support period ends", dayOffset: 75 },
+    ],
+    questions: [
+      ...contact,
+      h("business", "Your business"),
+      q("business_about", "What does your business do, and who is the website for?", "TEXTAREA", { required: true }),
+      q("current_site", "Your current website, if any", "TEXT"),
+      q("sites_liked", "Websites you like, and what you like about them", "TEXTAREA"),
+      h("site", "The website"),
+      q("pages", "Pages you need", "MULTISELECT", { required: true, options: ["Home", "About us", "Services / Products", "Portfolio / Gallery", "Blog", "Careers", "Contact", "Privacy policy and terms"] }),
+      q("features", "Features", "MULTISELECT", { options: ["Enquiry form", "WhatsApp chat", "Online payments", "Product catalogue", "Booking or appointments", "Several languages", "Login for customers"] }),
+      q("languages", "Languages", "TEXT", { help: "e.g. English and Hindi" }),
+      h("brand", "Brand and content"),
+      q("logo", "Your logo", "FILE", { help: "The best copy you have — a PDF or a large picture." }),
+      q("brand_colours", "Brand colours", "TEXT"),
+      q("content_ready", "Is the text and photography ready?", "RADIO", { options: ["Yes, all of it", "Some of it", "No — we need help writing it"] }),
+      q("content_files", "Content you already have", "FILE"),
+      h("hosting", "Domain and hosting"),
+      q("domain", "Your domain name", "TEXT", { help: "e.g. example.com" }),
+      q("domain_access", "Can you log in to where the domain is registered?", "RADIO", { options: ["Yes", "No", "Not sure"] }),
+      h("plan", "Timeline and budget"),
+      q("deadline", "When does it need to be live?", "DATE"),
+      q("budget", "Budget", "SELECT", { options: ["Under ₹50,000", "₹50,000–₹1.5 lakh", "₹1.5–5 lakh", "Over ₹5 lakh", "Not decided"] }),
+    ],
+  },
+  {
+    key: "software",
+    name: "Software / app development",
+    blurb: "Requirements, design, sprints, testing, release and warranty.",
+    steps: [
+      { name: "Requirements signed off", dayOffset: 0 },
+      { name: "Design and prototype approved", dayOffset: 14 },
+      { name: "Sprint 1", dayOffset: 28 },
+      { name: "Sprint 2", dayOffset: 42 },
+      { name: "Sprint 3", dayOffset: 56 },
+      { name: "User acceptance testing", dayOffset: 66 },
+      { name: "Release", dayOffset: 70 },
+      { name: "Warranty ends", dayOffset: 160 },
+    ],
+    questions: [
+      ...contact,
+      h("problem", "The problem"),
+      q("problem", "What should the software solve?", "TEXTAREA", { required: true }),
+      q("users", "Who will use it, and how many?", "TEXTAREA", { required: true, help: "Roles — staff, managers, customers — and rough numbers." }),
+      h("scope", "What it must do"),
+      q("must_have", "Must-have features", "TEXTAREA", { required: true }),
+      q("nice_to_have", "Nice to have, later", "TEXTAREA"),
+      q("platforms", "Where it should run", "MULTISELECT", { required: true, options: ["Web browser", "Android", "iPhone", "Windows desktop", "Inside an existing system"] }),
+      q("integrations", "Systems it must talk to", "TEXTAREA", { help: "e.g. Tally, Zoho, a payment gateway, WhatsApp, an existing database." }),
+      q("data_migration", "Is there existing data to bring across?", "RADIO", { options: ["Yes", "No", "Not sure"] }),
+      q("documents", "Anything written already", "FILE", { help: "A scope note, screenshots, a sample report, a spreadsheet you use today." }),
+      h("plan", "Timeline and budget"),
+      q("deadline", "When do you need the first version?", "DATE"),
+      q("budget", "Budget", "SELECT", { options: ["Under ₹2 lakh", "₹2–10 lakh", "₹10–25 lakh", "Over ₹25 lakh", "Not decided"] }),
+      q("sign_off", "Who signs off the work?", "TEXT"),
+    ],
+  },
+  {
+    key: "gws-to-m365",
+    name: "Google Workspace → Microsoft 365 migration",
+    blurb: "Assessment, tenant set-up, test move, main move, switch-over and support.",
+    steps: [
+      { name: "Assessment received", dayOffset: 0 },
+      { name: "Proposal approved", dayOffset: 3 },
+      { name: "Microsoft 365 set up and domain verified", dayOffset: 7 },
+      { name: "Test move (a few users)", dayOffset: 10 },
+      { name: "Main move", dayOffset: 17 },
+      { name: "Switch-over (mail arrives in Microsoft 365)", dayOffset: 20 },
+      { name: "Final catch-up and go-live", dayOffset: 21 },
+      { name: "Support period ends", dayOffset: 35 },
+    ],
+    questions: [
+      ...contact,
+      q("it_contact", "Technical contact (name, email, phone)", "TEXTAREA", { help: "Whoever we work with on the day — if not you." }),
+      h("google", "Google Workspace today"),
+      q("gws_edition", "Google Workspace edition", "SELECT", { required: true, options: ["Business Starter", "Business Standard", "Business Plus", "Enterprise", "Education", "Not sure"] }),
+      q("users_count", "How many users?", "NUMBER", { required: true }),
+      q("shared_mailboxes", "Shared mailboxes or group addresses (sales@, info@…)", "TEXTAREA"),
+      q("shared_drives", "Do you use Shared Drives?", "RADIO", { options: ["Yes", "No", "Not sure"] }),
+      q("data_size", "Roughly how much mail and Drive data in all?", "SELECT", { options: ["Under 100 GB", "100–500 GB", "500 GB–2 TB", "Over 2 TB", "Not sure"] }),
+      q("vault", "Google Vault or retention rules in use?", "RADIO", { options: ["Yes", "No", "Not sure"] }),
+      q("google_apps", "Other apps that sign in with Google", "TEXTAREA", { help: "e.g. a CRM, HR or accounting app — these need moving too." }),
+      h("domains", "Domains"),
+      q("domains", "Domains and aliases you use for email", "TEXTAREA", { required: true }),
+      q("dns_host", "Where is your DNS managed?", "SELECT", { options: ["GoDaddy", "Cloudflare", "Google Domains / Squarespace", "Hosting provider", "Not sure"] }),
+      q("dns_access", "Can you change DNS records yourselves?", "RADIO", { required: true, options: ["Yes", "No — someone else does", "Not sure"] }),
+      h("microsoft", "Microsoft 365"),
+      q("tenant_exists", "Do you already have a Microsoft 365 tenant?", "RADIO", { options: ["Yes", "No", "Not sure"] }),
+      q("licence_plan", "Licence plan wanted", "SELECT", { options: ["Business Basic", "Business Standard", "Business Premium", "E3", "Not decided — advise us"] }),
+      q("devices", "Devices to set up", "MULTISELECT", { options: ["Windows laptops", "Macs", "Phones", "None — mail and files only"] }),
+      h("move", "How to move"),
+      q("approach", "All at once, or in batches?", "RADIO", { options: ["All at once over a weekend", "In batches", "Advise us"] }),
+      q("history", "How much history to bring", "SELECT", { options: ["Everything", "Last 5 years", "Last 2 years", "Last 1 year"] }),
+      q("cutover_date", "Preferred switch-over date", "DATE"),
+      q("blackout", "Dates to avoid", "TEXT", { help: "Month-end close, an audit, a launch…" }),
+      q("user_list", "List of users", "FILE", { help: "A spreadsheet of names and email addresses — Google's admin console can export one." }),
+    ],
+  },
+  {
+    key: "amc-onboarding",
+    name: "Equipment install / AMC onboarding",
+    blurb: "Site survey, delivery, installation, training and AMC start.",
+    steps: [
+      { name: "Site survey", dayOffset: 0 },
+      { name: "Delivery", dayOffset: 7 },
+      { name: "Installation", dayOffset: 10 },
+      { name: "Training", dayOffset: 12 },
+      { name: "AMC active", dayOffset: 14 },
+    ],
+    questions: [
+      ...contact,
+      h("site", "The site"),
+      q("site_address", "Site address", "TEXTAREA", { required: true }),
+      q("site_contact", "Person on site (name and phone)", "TEXT", { required: true }),
+      q("access_hours", "When can our engineers come?", "TEXT", { help: "Days and hours, and any gate pass or permit needed." }),
+      h("equipment", "Equipment"),
+      q("equipment", "Equipment to install or cover", "TEXTAREA", { required: true, help: "Make, model and quantity." }),
+      q("serials", "Serial numbers, or the invoice", "FILE"),
+      q("power_network", "Are power points and network ready where it goes?", "RADIO", { options: ["Yes", "No", "Not sure"] }),
+      h("service", "Service"),
+      q("visit_frequency", "Preventive visits wanted", "SELECT", { options: ["Monthly", "Quarterly", "Half-yearly", "Yearly"] }),
+      q("training_people", "How many people need training?", "NUMBER"),
+    ],
+  },
+];

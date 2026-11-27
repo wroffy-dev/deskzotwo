@@ -1,0 +1,757 @@
+import type { NotificationType, Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import { getWording } from "@/lib/terms/server";
+import { slot } from "@/lib/terms/dictionary";
+import { SLA_HOURS, getTicketSlaStatus, formatTicketId } from "@/lib/tickets";
+import { addDays } from "@/lib/date-range-presets";
+import {
+  EXPIRY_NOTICE_EVERY_DAYS,
+  EXPIRY_NOTICE_WINDOW_DAYS,
+  daysUntilExpiry,
+  expiryNoticeBucket,
+} from "@/lib/vault/policy";
+import { sendEmailNotification } from "@/lib/email";
+import { wants } from "@/lib/notifications/catalogue";
+import { moduleAvailableForTenant } from "@/lib/modules-access";
+import { workspaceClock } from "@/lib/time/workspace";
+import type { Clock } from "@/lib/time/zone";
+import { companyPath, personPath, ticketPath } from "@/lib/record-links";
+import { notMigratedYet } from "@/lib/custom-fields/server";
+import { nextReminder } from "@/lib/tasks/rules";
+import { lapsedWhere } from "@/lib/renewal-lapse-rules";
+import {
+  AT_RISK_DAYS,
+  DEFAULT_WATCH,
+  QUIET_DAYS,
+  goneQuietWhere,
+  ladderStep,
+  noEndDateWhere,
+  nobodysWhere,
+  notStartedWhere,
+  quietSince,
+  recipientWhere,
+  reminderKey,
+  teamWhere,
+  upForRenewalWhere,
+  type RenewalWatch,
+} from "@/lib/renewal-watch-rules";
+import { renewalManagersHere, renewalManagersOf } from "@/lib/companies/renewal-manager";
+import { teamReminderCopies } from "@/lib/renewal-team-copies";
+import { unwatchedServices } from "@/lib/renewals-unwatched-rules";
+import { pushNoticeToPhones } from "@/lib/app/push";
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Server-only helpers for creating notifications — deliberately NOT exported from a "use server"
+ * action file, since every export there becomes a client-callable RPC endpoint and this lets any
+ * signed-in user create arbitrary notifications for arbitrary other users. Import these directly
+ * into other action files instead (same pattern `computeOrderFinancials` uses in payment.ts).
+ */
+
+export async function notifyUser(input: { userId: string; type: NotificationType; title: string; message?: string; link?: string }) {
+  try {
+    /**
+     * What this person has asked not to be told about.
+     *
+     * Enforced here rather than by filtering the list, so a muted type is never *created* — a row
+     * that exists and is hidden is one that still turns up in a count, an export or the next
+     * screen somebody writes against this table. Always-on types ignore the row entirely; see
+     * `wants`.
+     */
+    const preference = await db.notificationPreference.findUnique({
+      where: { userId_type: { userId: input.userId, type: input.type } },
+      select: { inApp: true, email: true },
+    });
+
+    const notification = wants(input.type, "inApp", preference)
+      ? await db.notification.create({
+          data: {
+            userId: input.userId,
+            type: input.type,
+            title: input.title,
+            message: input.message ?? null,
+            link: input.link ?? null,
+          },
+        })
+      : null;
+    /**
+     * The email is the workspace's choice, not the person's (src/lib/notifications/email-settings.ts):
+     * an admin's switch for everyone, so it goes whether or not they've muted the kind in their bell.
+     * Awaited, so it goes before the request ends; it never throws.
+     */
+    await sendEmailNotification({ userId: input.userId, type: input.type, subject: input.title, body: input.message ?? "", link: input.link });
+    /**
+     * And on their phones (src/lib/app/push.ts): what the bell shows, as the bell shows it — so only when it rang,
+     * never for a kind they muted. Its title and link, nothing more. Never throws.
+     */
+    if (notification) {
+      await pushNoticeToPhones(input.userId, { id: notification.id, type: input.type, title: input.title, link: input.link ?? null }).catch((err) => console.error("[app] notice push failed", err));
+    }
+    return notification;
+  } catch (err) {
+    // A notification is a side effect of the action that triggered it — it should never fail the action itself.
+    console.error("notifyUser failed", err);
+    return null;
+  }
+}
+
+/**
+ * Lazily reconciles system-generated alerts (overdue tasks, SLA-breached tickets, renewals
+ * entering their expiry window) for one user, run every time that user fetches their
+ * notifications — there's no background job runner in this app, so "on next fetch" stands in for
+ * a cron. Idempotent via each candidate's `dedupeKey` + `createMany({ skipDuplicates: true })`.
+ */
+/** How long before a meeting it is said to be about to start. */
+const MEETING_NOTICE_MS = 10 * 60 * 1000;
+
+/**
+ * One notice the sweep raises. `at`: when it fell due — the moment a task went overdue, a callback came
+ * due, a meeting came within ten minutes — so the scheduled sweep emails only what fell due after its
+ * kind was switched on (src/lib/notifications/reminder-emails.ts). Null for the notices about other
+ * people and the calendar, which aren't emailed.
+ */
+export type SystemCandidate = {
+  userId: string;
+  type: NotificationType;
+  title: string;
+  message: string | null;
+  link: string | null;
+  dedupeKey: string;
+  at: Date | null;
+  /**
+   * Copied on its email (owner, 23 Nov 2026 — Settings › Renewals' copies, src/lib/renewal-team-copies.ts): once a
+   * reminder, however many people it goes to (src/lib/notifications/reminder-emails.ts). The bell ignores it.
+   */
+  cc?: string[];
+};
+
+/**
+ * A meeting in this person's calendar starting within ten minutes (owner, 8 Oct 2026) — as the bell
+ * asks, every 45 seconds while Deskzo is open. Once per start time: a meeting moved is reminded again.
+ * Their own calendar only, not all-day events, nothing cancelled.
+ */
+async function meetingCandidates(userId: string, now: Date, clock: Awaited<ReturnType<typeof workspaceClock>>): Promise<SystemCandidate[]> {
+  const soon = await db.calendarEvent
+    .findMany({
+      where: { userId, allDay: false, status: { not: "CANCELLED" }, startsAt: { gt: now, lte: new Date(now.getTime() + MEETING_NOTICE_MS) } },
+      select: { id: true, title: true, startsAt: true, location: true, joinUrl: true },
+      take: 10,
+    })
+    .catch(() => []);
+  return soon.map((m) => ({
+    userId,
+    type: "MEETING_SOON" as NotificationType,
+    title: `Starting at ${clock.time(m.startsAt)}: ${m.title}`,
+    message: m.joinUrl ? "Online — join from your calendar." : m.location,
+    link: "/calendar",
+    dedupeKey: `meeting-soon:${m.id}:${m.startsAt.toISOString()}`,
+    at: new Date(m.startsAt.getTime() - MEETING_NOTICE_MS),
+  }));
+}
+
+/**
+ * Also run every five minutes for everyone by the scheduled sweep (src/lib/notifications/reminder-emails.ts),
+ * asked only for the kinds the workspace emails (`kinds`). Gives back what it raised — the notices muted
+ * in the person's bell included, as the email is the workspace's choice, not theirs.
+ */
+export async function syncSystemNotifications(
+  userId: string,
+  options: { kinds?: ReadonlySet<NotificationType>; now?: Date } = {},
+): Promise<SystemCandidate[]> {
+  const now = options.now ?? new Date();
+  const wanted = (...types: NotificationType[]) => !options.kinds || types.some((t) => options.kinds!.has(t));
+  /**
+   * Today on the workspace's calendar, held as a day column holds it (midnight UTC) — a task's due
+   * date and a renewal's end are typed days kept that way, and a holiday is a `@db.Date`. It was the
+   * server's own midnight: on a server in UTC, India's tasks fell due at 05:30.
+   */
+  const clock = await workspaceClock();
+  const today = clock.calendarDate(now);
+  const tomorrow = new Date(today.getTime() + DAY_MS);
+  /** The instant a typed day (midnight UTC) starts on the workspace's clock. */
+  const dayStart = (day: Date) => clock.startOfDay(day.toISOString().slice(0, 10)) ?? day;
+
+  const [tasks, tickets, callbacks, noteReminders, expiringLogins, lapsed] = await Promise.all([
+    !wanted("TASK_OVERDUE", "TASK_DUE")
+      ? []
+      : db.task.findMany({
+          where: { assignedToUserId: userId, done: false, dueDate: { not: null }, callFollowUp: null },
+          select: { id: true, title: true, dueDate: true },
+        }),
+    !wanted("TICKET_SLA_OVERDUE")
+      ? []
+      : db.ticket.findMany({
+          where: { assignedToUserId: userId, status: { notIn: ["RESOLVED", "CLOSED"] } },
+          select: { id: true, ticketSeq: true, title: true, priority: true, status: true, createdAt: true },
+        }),
+    // A promised callback, owed by whoever promised it, now due. Unlike the task sweep above this
+    // works to the minute rather than the day — a callback agreed for 3pm is late at 3pm, not at
+    // midnight.
+    !wanted("CALLBACK_DUE")
+      ? []
+      : db.callLog.findMany({
+          where: { userId, followUpDone: false, followUpAt: { not: null, lte: now } },
+          select: {
+            id: true,
+            followUpAt: true,
+            phoneNumber: true,
+            company: { select: { id: true, name: true } },
+            contact: { select: { name: true } },
+          },
+        }),
+    // A note the author asked to be shown again. Only their own: the reminder belongs to whoever
+    // set it rather than to everyone who can read the note — see the schema comment on remindAt.
+    // Archived notes are excluded, because clearing a note off the board is also the ordinary way
+    // somebody says they are done with it.
+    !wanted("NOTE_REMINDER")
+      ? []
+      : db.stickyNote.findMany({
+          where: { ownerUserId: userId, archivedAt: null, remindAt: { not: null, lte: now } },
+          select: { id: true, title: true, body: true, remindAt: true },
+        }),
+    /**
+     * Stored logins whose billing is about to lapse.
+     *
+     * The owner only, not everybody the record is shared with. Five people told about one
+     * renewal is five people who learn that this category of notification is somebody else's
+     * job, and the owner is the one who can actually pay the invoice.
+     *
+     * Lapsed ones are included rather than dropped: a domain that expired last week is more
+     * urgent than one expiring next week, and going quiet on the day it mattered would be the
+     * worst possible moment to stop talking.
+     */
+    !wanted("RENEWAL_EXPIRING")
+      ? []
+      : db.vaultCredential.findMany({
+          where: {
+            ownerId: userId,
+            billingExpiry: { not: null, lte: addDays(now, EXPIRY_NOTICE_WINDOW_DAYS) },
+          },
+          select: { id: true, loginName: true, billingExpiry: true },
+        }),
+    /**
+     * Subscriptions on their accounts that ended in the last month and weren't renewed, nor marked (owner,
+     * 26 Oct 2026 — src/lib/renewal-lapse.ts): told the day after it ended, once, while there's still time.
+     */
+    !wanted("RENEWAL_EXPIRING")
+      ? []
+      : db.companyProduct.findMany({
+          // Whoever its renewals land with — the customer's renewal manager, else its account manager (owner, 11 Nov
+          // 2026): it went to the account manager alone, so a renewal manager was reminded up to the last day and then
+          // never told it had lapsed.
+          where: { AND: [lapsedWhere(today), { endDate: { gte: new Date(today.getTime() - 30 * DAY_MS) } }, { company: recipientWhere(userId, await renewalManagersHere()) }] },
+          select: { id: true, endDate: true, item: { select: { name: true } }, company: { select: { id: true, companySeq: true, name: true } } },
+        }),
+  ]);
+
+  const candidates: SystemCandidate[] = [];
+
+  for (const task of tasks) {
+    if (!task.dueDate) continue;
+    if (task.dueDate < today) {
+      candidates.push({
+        userId,
+        type: "TASK_OVERDUE",
+        title: "Task overdue",
+        message: task.title,
+        link: "/tasks",
+        dedupeKey: `task-overdue:${task.id}`,
+        // Overdue from the start of the day after it was due.
+        at: dayStart(new Date(task.dueDate.getTime() + DAY_MS)),
+      });
+    } else if (task.dueDate < tomorrow) {
+      candidates.push({
+        userId,
+        type: "TASK_DUE",
+        title: "Task due today",
+        message: task.title,
+        link: "/tasks",
+        dedupeKey: `task-due:${task.id}`,
+        at: dayStart(task.dueDate),
+      });
+    }
+  }
+
+  const wording = tickets.length ? await getWording() : null;
+  for (const ticket of tickets) {
+    const sla = getTicketSlaStatus(ticket.priority, ticket.status, ticket.createdAt, clock, now);
+    if (sla.key === "overdue") {
+      candidates.push({
+        userId,
+        type: "TICKET_SLA_OVERDUE",
+        title: slot(wording!, "Ticket past its SLA", "ticket", "{one} past its SLA"),
+        message: `${formatTicketId(ticket.ticketSeq)} — ${ticket.title}`,
+        link: ticketPath(ticket.ticketSeq),
+        dedupeKey: `ticket-sla:${ticket.id}`,
+        at: new Date(ticket.createdAt.getTime() + SLA_HOURS[ticket.priority] * 3_600_000),
+      });
+    }
+  }
+
+  // Renewals coming up: the ladder, who's told when nothing has happened, and Monday's list (src/lib/renewal-watch-rules.ts).
+  if (wanted("RENEWAL_EXPIRING")) candidates.push(...(await renewalWatchCandidates(userId, now, today, clock, dayStart)));
+
+  for (const r of lapsed) {
+    candidates.push({
+      userId,
+      type: "RENEWAL_EXPIRING",
+      title: "Subscription lapsed — not renewed",
+      message: `${r.company.name} — ${r.item.name}`,
+      link: `${companyPath(r.company.companySeq)}?tab=renewals`,
+      dedupeKey: `renewal-lapsed:${r.id}`,
+      // The day after it ended.
+      at: dayStart(new Date(r.endDate!.getTime() + DAY_MS)),
+    });
+  }
+  for (const login of expiringLogins) {
+    const daysLeft = daysUntilExpiry(login.billingExpiry, now);
+    /**
+     * The bucket is the whole schedule.
+     *
+     * It changes once every five days as the date approaches, and it goes into `dedupeKey` — so
+     * running this twice in a day writes nothing, running it five days later writes one more,
+     * and a reminder missed because nobody opened the app is sent late rather than lost. No job
+     * state, no "last reminded" column, nothing to get out of step.
+     */
+    const bucket = expiryNoticeBucket(daysLeft);
+    if (!bucket) continue;
+    candidates.push({
+      userId,
+      type: "RENEWAL_EXPIRING",
+      title:
+        daysLeft !== null && daysLeft < 0
+          ? "A stored login has lapsed"
+          : "A stored login expires soon",
+      message:
+        daysLeft === null
+          ? login.loginName
+          : daysLeft < 0
+            ? `${login.loginName} — billing expired ${Math.abs(daysLeft)} days ago`
+            : `${login.loginName} — billing expires in ${daysLeft} days`,
+      link: "/vault",
+      dedupeKey: `vault-expiry:${login.id}:${bucket}`,
+      // Into this bucket: lapsed at the expiry; bucket n once n × 5 days or fewer are left.
+      at:
+        bucket === "lapsed"
+          ? login.billingExpiry!
+          : new Date(login.billingExpiry!.getTime() - (Number(bucket) * EXPIRY_NOTICE_EVERY_DAYS + 1) * DAY_MS),
+    });
+  }
+
+  for (const call of callbacks) {
+    candidates.push({
+      userId,
+      type: "CALLBACK_DUE",
+      title: "Callback due",
+      message: `${call.contact?.name ?? call.phoneNumber} at ${call.company.name}`,
+      link: "/calls?view=due",
+      // Keyed on the call, so the reminder fires once however many times this sweep runs.
+      dedupeKey: `callback-due:${call.id}`,
+      at: call.followUpAt!,
+    });
+  }
+
+  for (const note of noteReminders) {
+    candidates.push({
+      userId,
+      type: "NOTE_REMINDER",
+      title: "Sticky note reminder",
+      // The title if there is one, otherwise the note itself — a reminder that says only
+      // "you wanted to see a note" is a reminder you have to go and look up.
+      message: note.title ?? note.body.slice(0, 120),
+      link: "/notes",
+      // The time is part of the key, so moving a reminder re-arms it rather than being swallowed
+      // as a duplicate of the one that already fired.
+      dedupeKey: `note-reminder:${note.id}:${note.remindAt!.toISOString()}`,
+      at: note.remindAt!,
+    });
+  }
+
+  if (wanted("TASK_REMINDER")) candidates.push(...(await taskReminderCandidates(userId, now)));
+  if (wanted("BIRTHDAY_TODAY", "WORK_ANNIVERSARY", "HOLIDAY_UPCOMING")) candidates.push(...(await peopleCandidates(userId, now, clock)));
+  if (wanted("MEETING_SOON")) candidates.push(...(await meetingCandidates(userId, now, clock)));
+  // UAE document expiries, for whoever runs payroll there (owner, 15 Nov 2026 — src/lib/uae/reminders.ts).
+  if (wanted("RENEWAL_EXPIRING")) {
+    const { uaeExpiryCandidates } = await import("@/lib/uae/reminders");
+    for (const c of await uaeExpiryCandidates(userId, now, clock)) candidates.push({ userId, type: "RENEWAL_EXPIRING", ...c });
+  }
+
+  // A query asked for more than one kind (a task: due or overdue) — only the kinds asked for.
+  const raised = options.kinds ? candidates.filter((c) => options.kinds!.has(c.type)) : candidates;
+  if (raised.length === 0) return raised;
+
+  /**
+   * The same preferences `notifyUser` applies, applied here too.
+   *
+   * This path writes with `createMany` rather than going through `notifyUser`, so it would
+   * otherwise ignore every mute — and these are precisely the types somebody would want to mute:
+   * the renewal window, the overdue task, the birthday. Read once for the whole sweep rather than
+   * per candidate, since this runs on every notification fetch.
+   */
+  const preferences = await db.notificationPreference.findMany({
+    where: { userId },
+    select: { type: true, inApp: true, email: true },
+  });
+  const byType = new Map(preferences.map((p) => [p.type, p]));
+  const allowed = raised.filter((c) => wants(c.type, "inApp", byType.get(c.type)));
+
+  if (allowed.length > 0) {
+    await db.notification.createMany({
+      data: allowed.map((c) => ({ userId: c.userId, type: c.type, title: c.title, message: c.message, link: c.link, dedupeKey: c.dedupeKey })),
+      skipDuplicates: true,
+    });
+  }
+  return raised;
+}
+
+/**
+ * Reminders somebody set on a task for themselves (owner, 17 Oct 2026), come round. Each fires once and
+ * is moved to its next hour, day or week — or gone, for a one-off. One missed while nobody had Deskzo
+ * open fires once, not once a step. A closed task's reminder is taken off instead of firing. The time is
+ * in the key, as a note reminder's is, so two sweeps at once raise it once. A workspace still waiting for
+ * 20261110170000_task_reminders has none.
+ */
+async function taskReminderCandidates(userId: string, now: Date): Promise<SystemCandidate[]> {
+  const due = await db.taskReminder
+    .findMany({
+      where: { userId, nextAt: { lte: now } },
+      select: { id: true, nextAt: true, repeat: true, task: { select: { id: true, title: true, done: true } } },
+    })
+    .catch((err) => {
+      if (notMigratedYet(err)) return [];
+      throw err;
+    });
+  const out: Awaited<ReturnType<typeof taskReminderCandidates>> = [];
+  for (const r of due) {
+    // Another sweep may have moved or removed it already: that's the same reminder, handled.
+    const next = r.task.done ? null : nextReminder(r.nextAt, r.repeat, now);
+    if (next) await db.taskReminder.update({ where: { id: r.id }, data: { nextAt: next } }).catch(() => {});
+    else await db.taskReminder.delete({ where: { id: r.id } }).catch(() => {});
+    if (r.task.done) continue;
+    out.push({
+      userId,
+      type: "TASK_REMINDER",
+      title: "Task reminder",
+      message: r.task.title,
+      link: `/tasks?task=${r.task.id}`,
+      dedupeKey: `task-reminder:${r.id}:${r.nextAt.toISOString()}`,
+      at: r.nextAt,
+    });
+  }
+  return out;
+}
+
+/** Who is told about a renewal nobody looks after; empty (every admin) before 20261130170000_renewal_nobody_recipients. */
+async function nobodyRecipientIds(): Promise<string[]> {
+  try {
+    return (await db.renewalSettings.findUnique({ where: { id: "default" }, select: { nobodyRecipientIds: true } }))?.nobodyRecipientIds ?? [];
+  } catch (err) {
+    if (notMigratedYet(err)) return [];
+    throw err;
+  }
+}
+
+/** Settings › Renewals' reminders, read here rather than through src/lib/renewal-lapse.ts, which imports this file. */
+async function renewalWatchSettings(): Promise<RenewalWatch> {
+  try {
+    const row = await db.renewalSettings.findUnique({
+      where: { id: "default" },
+      select: { reminderDays: true, escalateManagerDays: true, escalateAdminDays: true, taskLeadDays: true, weeklyList: true },
+    });
+    return row ?? DEFAULT_WATCH;
+  } catch (err) {
+    // Before 20261130150000_renewal_watch: the defaults.
+    if (notMigratedYet(err)) return DEFAULT_WATCH;
+    throw err;
+  }
+}
+
+const RENEWAL_NOTICE_SELECT = {
+  id: true,
+  endDate: true,
+  item: { select: { name: true } },
+  company: { select: { id: true, companySeq: true, name: true, owner: { select: { id: true, name: true } } } },
+} as const;
+
+/**
+ * Renewals coming up, for one person (owner, 30 Oct 2026 — src/lib/renewal-watch-rules.ts):
+ *
+ *   · the ladder — each of Settings › Renewals' days before its end, for the renewal manager it lands with; the people
+ *     Settings › Renewals names for them (else every admin) also get the ones that land with nobody still here, saying so;
+ *   · not started with `escalateManagerDays` left — told to the renewal manager's manager; `escalateAdminDays`, to
+ *     every admin;
+ *   · Mondays, the week's list: theirs due in thirty days, how many not started, lapsed this month, and their team's
+ *     not started.
+ *
+ * Each step's key is its own, so each goes once; `at` is the day it fell due, so the scheduled sweep emails only a
+ * fresh one (src/lib/notifications/reminder-emails.ts).
+ */
+async function renewalWatchCandidates(userId: string, now: Date, today: Date, clock: Clock, dayStart: (day: Date) => Date): Promise<SystemCandidate[]> {
+  if (!(await moduleAvailableForTenant("renewals"))) return [];
+  const [watch, managersHere, me, reports, nobodyIds, copies] = await Promise.all([
+    renewalWatchSettings(),
+    renewalManagersHere(),
+    db.user.findUnique({ where: { id: userId }, select: { role: true, active: true } }),
+    db.user.count({ where: { managerId: userId, active: true } }),
+    nobodyRecipientIds(),
+    teamReminderCopies(),
+  ]);
+  // Copied on each step of the ladder's email (owner, 23 Nov 2026 — src/lib/renewal-team-copies.ts).
+  const ladderCc = copies.emails.length ? { cc: copies.emails } : {};
+  if (!me?.active) return [];
+  // The role, not a key (kept in Phase 2, audit L-7): who is told — "every admin", as Settings › Renewals says — not what
+  // they may do; no key names that audience, and the escalation below reads every account's renewals.
+  const isAdmin = me.role === "ADMIN";
+  // A renewal nobody looks after goes to the people Settings › Renewals names (owner, 30 Oct 2026), else every admin.
+  const toldNobodys = nobodyIds.length > 0 ? nobodyIds.includes(userId) : isAdmin;
+  const out: SystemCandidate[] = [];
+  const until = (days: number) => new Date(today.getTime() + days * DAY_MS);
+  const daysLeft = (end: Date) => Math.round((end.getTime() - today.getTime()) / DAY_MS);
+  const ends = (n: number) => (n === 0 ? "ends today" : n === 1 ? "ends tomorrow" : `ends in ${n} days`);
+  const notice = (
+    r: { id: string; endDate: Date | null; item: { name: string }; company: { companySeq: number; name: string } },
+    fields: { title: string; message?: string; dedupeKey: string; daysBefore: number; /** When it fell due, where that isn't a day before the end. */ at?: Date; cc?: string[] },
+  ) =>
+    out.push({
+      userId,
+      type: "RENEWAL_EXPIRING",
+      title: fields.title,
+      message: fields.message ?? `${r.company.name} — ${r.item.name}`,
+      link: `${companyPath(r.company.companySeq)}?tab=renewals`,
+      dedupeKey: fields.dedupeKey,
+      at: fields.at ?? dayStart(new Date(r.endDate!.getTime() - fields.daysBefore * DAY_MS)),
+      ...(fields.cc ? { cc: fields.cc } : {}),
+    });
+  const mine = recipientWhere(userId, managersHere);
+
+  if (watch.reminderDays.length > 0) {
+    const furthest = Math.max(...watch.reminderDays);
+    const [own, nobodys] = await Promise.all([
+      db.companyProduct.findMany({
+        where: { AND: [upForRenewalWhere(today, until(furthest)), { company: mine }] },
+        select: RENEWAL_NOTICE_SELECT,
+        orderBy: { endDate: "asc" },
+        take: 200,
+      }),
+      toldNobodys
+        ? db.companyProduct.findMany({
+            where: { AND: [upForRenewalWhere(today, until(furthest)), { company: nobodysWhere(managersHere) }] },
+            select: RENEWAL_NOTICE_SELECT,
+            orderBy: { endDate: "asc" },
+            take: 200,
+          })
+        : [],
+    ]);
+    for (const r of own) {
+      const left = daysLeft(r.endDate!);
+      const step = ladderStep(left, watch.reminderDays);
+      if (step !== null) notice(r, { title: `Subscription ${ends(left)}`, dedupeKey: reminderKey(r.id, step), daysBefore: step, ...ladderCc });
+    }
+    for (const r of nobodys) {
+      const left = daysLeft(r.endDate!);
+      const step = ladderStep(left, watch.reminderDays);
+      if (step === null) continue;
+      notice(r, {
+        title: `Subscription ${ends(left)} — nobody looks after it`,
+        message: `${r.company.name} — ${r.item.name}: no renewal manager or account manager still here. Give the customer one.`,
+        dedupeKey: `renewal-nobody:${r.id}:${step}`,
+        daysBefore: step,
+        ...ladderCc,
+      });
+    }
+  }
+
+  /** Not started with `days` left, among `company`'s — each named with whose it is. */
+  const notStarted = async (days: number, company: Prisma.CompanyWhereInput | null) => {
+    const rows = await db.companyProduct.findMany({
+      where: { AND: [upForRenewalWhere(today, until(days)), notStartedWhere(), ...(company ? [{ company }] : [])] },
+      select: RENEWAL_NOTICE_SELECT,
+      orderBy: { endDate: "asc" },
+      take: 200,
+    });
+    const managers = await renewalManagersOf(rows.map((r) => r.company));
+    return rows.map((r) => ({ ...r, who: managers.get(r.company.id)?.name ?? null }));
+  };
+  const escalate = (r: Awaited<ReturnType<typeof notStarted>>[number], days: number, key: string) =>
+    notice(r, {
+      title: `Renewal not started — ${ends(daysLeft(r.endDate!))}`,
+      message: `${r.company.name} — ${r.item.name}: ${r.who ?? "nobody"} hasn't called, quoted or renewed it yet.`,
+      dedupeKey: `${key}:${r.id}`,
+      daysBefore: days,
+    });
+  if (watch.escalateManagerDays !== null && reports > 0) {
+    for (const r of await notStarted(watch.escalateManagerDays, teamWhere(userId, managersHere))) escalate(r, watch.escalateManagerDays, "renewal-escalate");
+  }
+  if (watch.escalateAdminDays !== null && isAdmin) {
+    for (const r of await notStarted(watch.escalateAdminDays, null)) escalate(r, watch.escalateAdminDays, "renewal-escalate-admin");
+  }
+
+  // Gone quiet (owner, 11 Nov 2026): started, then nothing for a week — to the same people, on the same days. One call
+  // used to end the escalation for good. It falls due the day it's found quiet, not a day counted from the end, so the
+  // scheduled sweep still emails one that went quiet late.
+  const quiet = async (days: number, company: Prisma.CompanyWhereInput | null) => {
+    const rows = await db.companyProduct.findMany({
+      where: { AND: [upForRenewalWhere(today, until(days)), goneQuietWhere(quietSince(now)), ...(company ? [{ company }] : [])] },
+      select: RENEWAL_NOTICE_SELECT,
+      orderBy: { endDate: "asc" },
+      take: 200,
+    });
+    const managers = await renewalManagersOf(rows.map((r) => r.company));
+    return rows.map((r) => ({ ...r, who: managers.get(r.company.id)?.name ?? null }));
+  };
+  const nudge = (r: Awaited<ReturnType<typeof quiet>>[number], days: number, key: string) =>
+    notice(r, {
+      title: `Renewal gone quiet — ${ends(daysLeft(r.endDate!))}`,
+      message: `${r.company.name} — ${r.item.name}: ${r.who ?? "somebody"} started it, but nothing has happened in ${QUIET_DAYS} days.`,
+      dedupeKey: `${key}:${r.id}`,
+      daysBefore: days,
+      at: dayStart(today),
+    });
+  if (watch.escalateManagerDays !== null && reports > 0) {
+    for (const r of await quiet(watch.escalateManagerDays, teamWhere(userId, managersHere))) nudge(r, watch.escalateManagerDays, "renewal-quiet");
+  }
+  if (watch.escalateAdminDays !== null && isAdmin) {
+    for (const r of await quiet(watch.escalateAdminDays, null)) nudge(r, watch.escalateAdminDays, "renewal-quiet-admin");
+  }
+
+  // Monday, on the workspace's calendar.
+  if (watch.weeklyList && clock.parts(now).weekday === 1) {
+    const soon = upForRenewalWhere(today, until(AT_RISK_DAYS));
+    const [due, idle, lapsed, team, stalled, undated, undatedNobodys] = await Promise.all([
+      db.companyProduct.count({ where: { AND: [soon, { company: mine }] } }),
+      db.companyProduct.count({ where: { AND: [soon, notStartedWhere(), { company: mine }] } }),
+      db.companyProduct.count({ where: { AND: [lapsedWhere(today), { endDate: { gte: until(-30) } }, { company: mine }] } }),
+      reports > 0 ? db.companyProduct.count({ where: { AND: [soon, notStartedWhere(), { company: teamWhere(userId, managersHere) }] } }) : 0,
+      db.companyProduct.count({ where: { AND: [soon, goneQuietWhere(quietSince(now)), { company: mine }] } }),
+      // No end date: nothing above can see them, so the list is the one place they're counted (owner, 11 Nov 2026).
+      db.companyProduct.count({ where: { AND: [noEndDateWhere(), { company: mine }] } }),
+      toldNobodys ? db.companyProduct.count({ where: noEndDateWhere() }) : 0,
+    ]);
+    if (undatedNobodys > 0) {
+      out.push({
+        userId,
+        type: "RENEWAL_EXPIRING",
+        title: `${undatedNobodys} subscription${undatedNobodys === 1 ? " has" : "s have"} no end date`,
+        message: "Nothing can remind anybody to renew them until the end date is entered.",
+        link: "/renewals/no-end-date",
+        dedupeKey: `renewal-undated:${today.toISOString().slice(0, 10)}`,
+        at: dayStart(today),
+      });
+    }
+    // Services that look as if they renew and aren't watched, an AMC say (owner, 11 Nov 2026): told with the others
+    // nobody looks after, until each is answered on Items › Services that renew.
+    const unwatched = toldNobodys ? (await unwatchedServices(today)).length : 0;
+    if (unwatched > 0) {
+      out.push({
+        userId,
+        type: "RENEWAL_EXPIRING",
+        title: `${unwatched} service${unwatched === 1 ? " looks" : "s look"} as if ${unwatched === 1 ? "it renews" : "they renew"}, and ${unwatched === 1 ? "isn't" : "aren't"} watched`,
+        message: "An AMC or a yearly contract entered as a plain service gets no renewal reminder. Say which of them renew.",
+        link: "/items/renewing-services",
+        dedupeKey: `renewal-unwatched:${today.toISOString().slice(0, 10)}`,
+        at: dayStart(today),
+      });
+    }
+    if (due + lapsed + team + undated > 0) {
+      const parts = [`${due} due in the next ${AT_RISK_DAYS} days, ${idle} not started yet${stalled > 0 ? `, ${stalled} gone quiet` : ""}`];
+      if (undated > 0) parts.push(`${undated} with no end date, so nothing reminds you`);
+      if (lapsed > 0) parts.push(`${lapsed} lapsed this month`);
+      if (team > 0) parts.push(`your team: ${team} not started`);
+      out.push({
+        userId,
+        type: "RENEWAL_EXPIRING",
+        title: "This week's renewals",
+        message: `${parts.join("; ")}.`,
+        link: idle > 0 || stalled > 0 || team > 0 ? `/renewals?window=atrisk${team > 0 ? "" : `&manager=${userId}`}` : `/renewals?window=30&manager=${userId}`,
+        dedupeKey: `renewal-week:${today.toISOString().slice(0, 10)}`,
+        at: dayStart(today),
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * The HR reminders: whose birthday it is, who has an anniversary, and the next company holiday.
+ *
+ * These differ from every other candidate above in one way worth being explicit about — they are
+ * about *other people*, not about work owed by the person being notified. So they are deliberately
+ * quiet: no work anniversary under a year, no holiday reminder more than three days out, and the
+ * dedupe key carries the date so each one fires once a year rather than once ever.
+ *
+ * Only raised for people who have a birthday on file, which means somebody who left the field blank
+ * is simply not announced rather than announced as unknown.
+ */
+async function peopleCandidates(userId: string, now: Date, clock: Clock): Promise<SystemCandidate[]> {
+  if (!(await moduleAvailableForTenant("hr"))) return [];
+
+  const out: Awaited<ReturnType<typeof peopleCandidates>> = [];
+  // Today on the workspace's calendar; a birthday and a joining date are `@db.Date` days, read as UTC.
+  const { year: yearKey, month, day: todayDay } = clock.parts(now);
+  const todayMonth = month + 1;
+  const startOfToday = clock.calendarDate(now);
+
+  const colleagues = await db.employeeProfile.findMany({
+    where: { exitedOn: null, user: { active: true } },
+    select: { dateOfBirth: true, joinedOn: true, designation: true, user: { select: { id: true, userSeq: true, name: true } } },
+  });
+
+  for (const c of colleagues) {
+    if (c.dateOfBirth) {
+      const dob = c.dateOfBirth;
+      if (dob.getUTCMonth() + 1 === todayMonth && dob.getUTCDate() === todayDay) {
+        out.push({
+          userId,
+          type: "BIRTHDAY_TODAY",
+          title: c.user.id === userId ? "Happy birthday!" : `It's ${c.user.name}'s birthday`,
+          message: c.user.id === userId ? "From everyone at the company." : c.designation,
+          link: personPath(c.user.userSeq),
+          dedupeKey: `birthday:${c.user.id}:${yearKey}`,
+          at: null,
+        });
+      }
+    }
+
+    // Anniversaries only for somebody who has actually completed a year — telling a person they
+    // have been here "0 years" on their first-day anniversary is worse than saying nothing.
+    if (c.joinedOn && c.user.id !== userId) {
+      const joined = c.joinedOn;
+      const years = yearKey - joined.getUTCFullYear();
+      if (years >= 1 && joined.getUTCMonth() + 1 === todayMonth && joined.getUTCDate() === todayDay) {
+        out.push({
+          userId,
+          type: "WORK_ANNIVERSARY",
+          title: `${c.user.name} — ${years} year${years === 1 ? "" : "s"} today`,
+          message: c.designation,
+          link: personPath(c.user.userSeq),
+          dedupeKey: `anniversary:${c.user.id}:${yearKey}`,
+          at: null,
+        });
+      }
+    }
+  }
+
+  // The next company holiday, announced three days out. Restricted holidays are excluded: the
+  // office is open on those, so "the office is closed on Friday" would simply be untrue.
+  const soon = new Date(startOfToday.getTime() + 3 * 24 * 60 * 60 * 1000);
+  const holiday = await db.holiday.findFirst({
+    where: { optional: false, date: { gte: startOfToday, lte: soon } },
+    orderBy: { date: "asc" },
+    select: { id: true, name: true, date: true },
+  });
+  if (holiday) {
+    const days = Math.round((holiday.date.getTime() - startOfToday.getTime()) / 86400000);
+    out.push({
+      userId,
+      type: "HOLIDAY_UPCOMING",
+      title: days === 0 ? `${holiday.name} — the office is closed today` : `${holiday.name} in ${days} day${days === 1 ? "" : "s"}`,
+      message: holiday.date.toISOString().slice(0, 10),
+      link: "/people/holidays",
+      dedupeKey: `holiday:${holiday.id}`,
+      at: null,
+    });
+  }
+
+  return out;
+}

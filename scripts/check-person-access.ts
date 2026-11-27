@@ -1,0 +1,379 @@
+/**
+ * One person's access, and a role's life, end to end — the actions behind a person's page and the
+ * role header (src/actions/person-access.ts, src/actions/role.ts) and the guard every new account
+ * passes (src/lib/authz/guards.ts `assertMayStartInRole`).
+ *
+ *   1. Exceptions: Allow, Deny and Use role default, with a reason and an end date; an ended one
+ *      answers nothing; nobody changes their own, the super admin's, or hands out what they don't hold
+ *      — and a refusal on one change writes none of them.
+ *   2. A person's own reach: within the giver's own, and never an edit wider than the view.
+ *   3. Reset to role defaults: every kind of exception removed, recorded once; refused where removing
+ *      a denial would hand out what the giver doesn't hold.
+ *   4. The permission preview: a role's, and one person's with their exceptions.
+ *   5. Switching a role off: not a built-in one, not one somebody holds; and a role switched off
+ *      underneath somebody grants them nothing.
+ *   6. Duplicating a role: everything it grants, reaches and masks, nobody moved — and refused, with
+ *      nothing left behind, where the copy would hold more than the copier.
+ *   7. A new account starts in a role only if its creator holds everything that role grants.
+ *   8. Nobody writes or extends their own exception, allow or deny (audit M-2).
+ *   9. A preset leaves its role holding exactly what it lists, as its preview says — a key switched off
+ *      for the role stays off, whoever applies it (audit M-3).
+ *
+ * On a scratch database built from the migrations and dropped at the end; the real workspace is not
+ * touched.
+ *
+ *   npm run check:person-access
+ */
+import "dotenv/config";
+import Module from "node:module";
+import { execSync } from "node:child_process";
+import type { PrismaClient } from "@prisma/client";
+import { directClient } from "../src/lib/tenancy/direct-client";
+
+let failures = 0;
+let passes = 0;
+const ok = (label: string, pass: boolean, detail: unknown = "") => {
+  console.log(`${pass ? "  ok  " : " FAIL "} ${label}${detail !== "" ? ` — ${typeof detail === "string" ? detail : JSON.stringify(detail)}` : ""}`);
+  if (pass) passes += 1;
+  else failures += 1;
+};
+const section = (title: string) => console.log(`\n— ${title} —\n`);
+function withDatabase(url: string, database: string): string {
+  const u = new URL(url);
+  u.pathname = `/${database}`;
+  return u.toString();
+}
+
+// ── Stand-ins: who is calling; no mail and no control plane ─────────────────────────────────────
+type Actor = { id: string; name: string; email: string; role: string };
+let actor: Actor | null = null;
+const internals = Module as unknown as { _load(request: string, parent: unknown, isMain: boolean): unknown };
+const session = {
+  requireUser: async () => {
+    if (!actor) throw new Error("The check called an action without saying who was calling it.");
+    return actor;
+  },
+  currentUser: async () => actor,
+  viewAsContext: async () => null,
+  refuseWhileViewingAs: async () => null,
+};
+const realLoad = internals._load;
+internals._load = function (this: unknown, request: string, parent: unknown, isMain: boolean) {
+  if (request === "next/cache") return { revalidatePath: () => {}, revalidateTag: () => {}, unstable_cache: <T,>(fn: T) => fn };
+  if (request === "@/lib/session" || request.endsWith("lib/session")) return session;
+  if (request === "@/lib/platform/account-hooks" || request.endsWith("lib/platform/account-hooks")) return { accountsChanged: async () => {} };
+  return realLoad.call(this, request, parent, isMain);
+} as typeof realLoad;
+
+async function run(db: PrismaClient) {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const person = require("../src/actions/person-access") as typeof import("../src/actions/person-access");
+  const roles = require("../src/actions/role") as typeof import("../src/actions/role");
+  const users = require("../src/actions/user") as typeof import("../src/actions/user");
+  const perms = require("../src/actions/permission") as typeof import("../src/actions/permission");
+  const levels = require("../src/actions/access-levels") as typeof import("../src/actions/access-levels");
+  const fields = require("../src/actions/field-access") as typeof import("../src/actions/field-access");
+  const { can } = require("../src/lib/authz/resolve") as typeof import("../src/lib/authz/resolve");
+  const { roleGrants, roleDefault } = require("../src/lib/authz/role-permission") as typeof import("../src/lib/authz/role-permission");
+  const access = require("../src/actions/access") as typeof import("../src/actions/access");
+  const { ROLE_PRESETS } = require("../src/lib/authz/presets") as typeof import("../src/lib/authz/presets");
+  const { PERMISSIONS } = require("../src/lib/permissions") as typeof import("../src/lib/permissions");
+  const mailer = require("../src/lib/platform/mailer") as typeof import("../src/lib/platform/mailer");
+  const { permissionsOfModule, ACCESS_MODULES, actionRowsOf, REACH_KEYS, FOLDED_KEYS } = require("../src/lib/staff/access-modules") as typeof import("../src/lib/staff/access-modules");
+  const { ACCESS_RECORDS } = require("../src/lib/authz/access") as typeof import("../src/lib/authz/access");
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  mailer.setTestPlatformMailer(async () => {});
+
+  // ── People ──────────────────────────────────────────────────────────────────────────────────────
+  const LEAD_ROLE = "ZZ_TEAM_LEAD";
+  await db.role.create({ data: { key: LEAD_ROLE, name: "Team lead" } });
+  // A team lead may change permissions, but holds only a little: leads, contacts, the access screens.
+  for (const permission of ["permissions.view", "permissions.manage", "users.manage", "leads.view", "contacts.view"]) {
+    await db.rolePermission.create({ data: { role: LEAD_ROLE, permission, allowed: true } });
+  }
+  const make = (key: string, role: string, extra: object = {}) =>
+    db.user.create({ data: { name: `Zz ${key}`, email: `${key.toLowerCase()}@zz-person.invalid`, role, passwordHash: "x".repeat(60), ...extra } });
+  const superAdmin = await make("Owner", "ADMIN", { isSuperAdmin: true });
+  const admin = await make("Admin", "ADMIN");
+  const lead = await make("Lead", LEAD_ROLE);
+  const rep = await make("Rep", "SALES");
+  const as = (u: { id: string; name: string; email: string; role: string }) => {
+    actor = { id: u.id, name: u.name, email: u.email, role: u.role };
+  };
+  const history = (where: object) => db.permissionChange.count({ where });
+
+  section("1. Exceptions: Allow, Deny and Use role default");
+  as(admin);
+  const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+  const allowed = await person.setPersonPermissions(rep.id, [{ key: "payments.record", state: "allow" }], { reason: "Covering collections this week", expiresAt: tomorrow });
+  ok("an admin allows the rep to record payments, with a reason and an end date", allowed.ok && (await can(rep.id, "payments.record")), allowed);
+  const row = await db.userPermission.findUnique({ where: { user_permission: { userId: rep.id, permission: "payments.record" } } });
+  ok("  stored with its reason, ending at the end of that day", row?.reason === "Covering collections this week" && row?.expiresAt !== null && row!.expiresAt!.getTime() > Date.now());
+  ok("  and in the permission history", (await history({ subjectUserId: rep.id, permission: "payments.record", changeKind: "GRANT" })) === 1);
+  const denied = await person.setPersonPermissions(rep.id, [{ key: "leads.view", state: "deny" }]);
+  ok("a deny beats the role: the rep no longer sees leads", denied.ok && !(await can(rep.id, "leads.view")));
+  const back = await person.setPersonPermissions(rep.id, [
+    { key: "payments.record", state: "inherit" },
+    { key: "leads.view", state: "inherit" },
+  ]);
+  ok("Use role default removes both exceptions", back.ok && back.data.changed === 2 && (await db.userPermission.count({ where: { userId: rep.id } })) === 0);
+  ok("  and the rep holds what Sales holds again", (await can(rep.id, "leads.view")) && !(await can(rep.id, "payments.record")));
+  await db.userPermission.create({ data: { userId: rep.id, permission: "payments.record", allowed: true, expiresAt: new Date(Date.now() - 60_000) } });
+  ok("an exception that has ended answers nothing", !(await can(rep.id, "payments.record")));
+  await db.userPermission.deleteMany({ where: { userId: rep.id } });
+
+  as(lead);
+  const before = await db.userPermission.count({ where: { userId: rep.id } });
+  const tooMuch = await person.setPersonPermissions(rep.id, [
+    { key: "contacts.view", state: "deny" },
+    { key: "payments.record", state: "allow" },
+  ]);
+  ok("a team lead can't hand out what they don't hold", !tooMuch.ok && /don't hold/i.test(tooMuch.ok ? "" : tooMuch.error), tooMuch);
+  ok("  and the change before it wasn't written either", (await db.userPermission.count({ where: { userId: rep.id } })) === before);
+  const own = await person.setPersonPermissions(lead.id, [{ key: "leads.view", state: "deny" }]);
+  ok("nobody changes their own", !own.ok && /your own/i.test(own.ok ? "" : own.error), own);
+  const onOwner = await person.setPersonPermissions(superAdmin.id, [{ key: "leads.view", state: "deny" }]);
+  ok("nor the super admin's", !onOwner.ok, onOwner);
+  as(admin);
+  const superOnly = await person.setPersonPermissions(rep.id, [{ key: "impersonation.use", state: "allow" }]);
+  ok("an ordinary admin can't grant what only a super admin grants", !superOnly.ok && !(await can(rep.id, "impersonation.use")), superOnly);
+  const unknown = await person.setPersonPermissions(rep.id, [{ key: "payroll.everything", state: "allow" }]);
+  ok("an unknown permission is refused", !unknown.ok);
+  const sneaky = await person.setPersonPermissions(rep.id, [{ key: "leads.view", state: "sideways" as "allow" }]);
+  ok("and so is a state that isn't one", !sneaky.ok);
+
+  section("2. A person's own reach");
+  const grid = (await person.personAccessGrid(rep.id))!;
+  const leads = grid.find((r) => r.key === "leads")!;
+  ok("the grid shows the rep's reach on leads as their role's", leads.cells.view.own === null && leads.cells.view.effective === leads.cells.view.role, leads.cells.view);
+  const widened = await person.setPersonAccessLevels(rep.id, [{ record: "leads", action: "view", level: "ALL" }], { reason: "Covering the region" });
+  const after = (await person.personAccessGrid(rep.id))!.find((r) => r.key === "leads")!;
+  ok("an admin gives the rep every lead to look at", widened.ok && after.cells.view.own?.level === "ALL" && after.cells.view.effective === "ALL", widened);
+  const wider = await person.setPersonAccessLevels(rep.id, [
+    { record: "companies", action: "view", level: "OWN" },
+    { record: "companies", action: "edit", level: "ALL" },
+  ]);
+  ok("an edit wider than the view is refused", !wider.ok && /wider than/i.test(wider.ok ? "" : wider.error), wider);
+  as(lead);
+  const beyond = await person.setPersonAccessLevels(rep.id, [{ record: "companies", action: "view", level: "ALL" }]);
+  ok("a team lead can't give a reach wider than their own", !beyond.ok && /yourself/i.test(beyond.ok ? "" : beyond.error), beyond);
+
+  section("3. Reset to role defaults");
+  as(superAdmin);
+  // An allow, and a deny on something Sales holds that the team lead doesn't: removing that deny would
+  // hand it back, which is handing it out.
+  await person.setPersonPermissions(rep.id, [
+    { key: "payments.record", state: "allow" },
+    { key: "products.edit", state: "deny" },
+  ], { reason: "probe" });
+  await fields.setPersonFieldAccess(rep.id, [{ field: "email", policy: { view: true, maskInList: true, maskInDetail: true, unmask: false, format: "email", export: null } }], { reason: "probe" });
+  await fields.setPersonUnmaskLimit(rep.id, { limited: true, dailyLimit: 5 }, { reason: "probe" });
+  const counts = async () => ({
+    permissions: await db.userPermission.count({ where: { userId: rep.id } }),
+    levels: await db.userAccessLevel.count({ where: { userId: rep.id } }),
+    fields: await db.userFieldPolicy.count({ where: { userId: rep.id } }),
+    limit: await db.userUnmaskLimit.count({ where: { userId: rep.id } }),
+  });
+  const had = await counts();
+  ok("the rep has an exception of every kind", had.permissions > 0 && had.levels > 0 && had.fields > 0 && had.limit > 0, had);
+  as(lead);
+  const leadReset = await person.resetPersonToRole(rep.id);
+  ok("a team lead can't reset away a denial of something they don't hold", !leadReset.ok && /Can't reset/.test(leadReset.ok ? "" : leadReset.error), leadReset);
+  ok("  and nothing was removed", JSON.stringify(await counts()) === JSON.stringify(had));
+  as(admin);
+  const reset = await person.resetPersonToRole(rep.id);
+  const left = await counts();
+  ok("an admin's reset removes every one of them", reset.ok && reset.data.removed === had.permissions + had.levels + had.fields + had.limit && Object.values(left).every((n) => n === 0), { reset, left });
+  ok("  recorded as a reset", (await history({ subjectUserId: rep.id, changeKind: "RESET_TO_DEFAULT" })) >= 1);
+  ok("  and the rep holds exactly their role again", !(await can(rep.id, "payments.record")) && (await can(rep.id, "products.edit")) && (await can(rep.id, "leads.view")));
+  ok("  their role untouched", (await db.user.findUnique({ where: { id: rep.id }, select: { role: true } }))?.role === "SALES");
+
+  section("4. The permission preview");
+  const salesPreview = (await person.accessPreview({ role: "SALES" }))!;
+  ok("a role's preview gives every module a standing", salesPreview.length > 5 && salesPreview.every((m) => ["full", "limited", "none"].includes(m.standing)));
+  // A module Sales has nothing in, and one permission in it an admin may hand out.
+  const repBefore = (await person.accessPreview({ userId: rep.id }))!;
+  const closed = repBefore.find((m) => m.standing === "none" && permissionsOfModule(m.key).some((d) => !d.superAdminOnly));
+  const key = closed ? permissionsOfModule(closed.key).find((d) => !d.superAdminOnly)!.key : "";
+  ok("the rep has a module with no access at all", !!closed, repBefore.map((m) => `${m.key}:${m.standing}`));
+  const opened = await person.setPersonPermissions(rep.id, [{ key, state: "allow" }]);
+  const repAfter = (await person.accessPreview({ userId: rep.id }))!;
+  const standing = repAfter.find((m) => m.key === closed?.key)?.standing;
+  ok("a person's preview counts their exceptions: one granted in it, and it isn't No access any more", opened.ok && standing !== "none" && standing !== undefined, { module: closed?.key, key, standing });
+  await person.setPersonPermissions(rep.id, [{ key, state: "inherit" }]);
+  as(rep);
+  ok("somebody who may not review access gets no preview", (await person.accessPreview({ role: "ADMIN" })) === null);
+
+  section("4b. Every permission has one place on Module Access");
+  // The role and person screens show permissions module by module (src/lib/staff/access-modules.ts):
+  // one that is in no module can't be granted from them at all, and one in two is two switches for one key.
+  const sectionKeys = PERMISSIONS.filter((d) => d.key.startsWith("section.")).map((d) => d.key);
+  const homesOf = (key: string) => ACCESS_MODULES.filter((m) => m.sections.includes(key)).map((m) => m.key);
+  const sectionStrays = sectionKeys.filter((k) => homesOf(k).length !== 1);
+  ok("every menu section belongs to exactly one module", sectionStrays.length === 0, sectionStrays.map((k) => `${k}: ${homesOf(k).join("+") || "none"}`));
+  const unknownSections = ACCESS_MODULES.flatMap((m) => m.sections).filter((k) => !sectionKeys.includes(k));
+  ok("  and every section a module names exists", unknownSections.length === 0, unknownSections);
+  const recordRows = ACCESS_RECORDS.map((r) => ({ key: r.key, label: r.label, actions: [...r.actions] }));
+  const allRows = ACCESS_MODULES.flatMap((m) => actionRowsOf(m.key, recordRows));
+  const keyRows = allRows.flatMap((r) => (r.kind === "key" ? [r.key] : []));
+  const viewRows = allRows.flatMap((r) => (r.kind === "record" && r.viewKey ? [r.viewKey] : []));
+  const placed = new Set([...keyRows, ...viewRows, ...REACH_KEYS, ...FOLDED_KEYS]);
+  const unplaced = PERMISSIONS.filter((d) => !d.key.startsWith("section.") && !placed.has(d.key)).map((d) => d.key);
+  ok("every other permission is a row on some module's Actions, or a record's view, reach or Delete row", unplaced.length === 0, unplaced);
+  const twice = [...new Set([...keyRows, ...viewRows].filter((k, i, all) => all.indexOf(k) !== i))];
+  ok("  and none is a row twice", twice.length === 0, twice);
+  // Phase 2 permission fixes (owner, 3 Nov 2026 — audit B.4-2): the two menu switches no module had, each where its screen
+  // is. The folded keys stay folded (owner, 1 Nov 2026 — "two delete tasks?"): "Delete any task" and "Delete payments" are
+  // their records' Delete rows, which must be there to carry them; "Delete tickets" decides nothing (audit L-3).
+  const deleteRowHome = (record: string) => ACCESS_MODULES.find((m) => actionRowsOf(m.key, recordRows).some((r) => r.kind === "record" && r.record === record && r.action === "delete"))?.key;
+  const homes = { "payments.delete": deleteRowHome("payments"), "tasks.delete": deleteRowHome("tasks"), "section.inbox": homesOf("section.inbox").join(), "section.automate": homesOf("section.automate").join() };
+  ok("  Delete payments and Delete any task on their records' Delete rows (Finance, My work), no key row of their own or for Delete tickets; the Customer inbox's switch on Support, Automate's on Settings", JSON.stringify(homes) === JSON.stringify({ "payments.delete": "finance", "tasks.delete": "work", "section.inbox": "support", "section.automate": "admin" }) && [...FOLDED_KEYS].every((k) => !keyRows.includes(k)), homes);
+  const moduleRecords = new Set(ACCESS_MODULES.flatMap((m) => [...m.records]));
+  const reachWithoutRecord = [...REACH_KEYS].filter((k) => !moduleRecords.has(k.split(".")[0] as never));
+  ok("  a record's reach (\"view all\") is that record's scope, in the module that has it", reachWithoutRecord.length === 0, reachWithoutRecord);
+
+  section("5. Switching a role off");
+  as(admin);
+  const builtIn = await roles.setRoleActive("SALES", false);
+  ok("a built-in role stays on", !builtIn.ok && (await can(rep.id, "leads.view")), builtIn);
+  const held = await roles.setRoleActive(LEAD_ROLE, false);
+  ok("a role somebody holds can't be switched off", !held.ok && /Move them/i.test(held.ok ? "" : held.error), held);
+  const spare = await roles.createRole({ name: "Zz Spare" });
+  const off = spare.ok ? await roles.setRoleActive(spare.data.key, false) : spare;
+  // `active` is read by name, as the app reads it: a column added since some workspaces last migrated.
+  ok("a custom role nobody holds is switched off", off.ok && (await db.role.findUnique({ where: { key: spare.ok ? spare.data.key : "" }, select: { active: true } }))?.active === false, off);
+  ok("  and that is in the history", (await history({ subjectRole: spare.ok ? spare.data.key : "", changeKind: "ROLE_DEACTIVATED" })) === 1);
+  const newcomer = spare.ok ? await users.createUser({ name: "Zz Newcomer", email: "newcomer@zz-person.invalid", role: spare.data.key }) : spare;
+  ok("nobody new starts in a switched-off role", !newcomer.ok, newcomer);
+  const on = spare.ok ? await roles.setRoleActive(spare.data.key, true) : spare;
+  ok("and it can be switched on again", on.ok && (await history({ subjectRole: spare.ok ? spare.data.key : "", changeKind: "ROLE_ACTIVATED" })) === 1, on);
+  // The backstop: a role switched off underneath somebody, as an import or a hand edit could leave it.
+  await db.role.update({ where: { key: LEAD_ROLE }, data: { active: false } });
+  ok("a role switched off underneath somebody grants them nothing", !(await can(lead.id, "leads.view")) && !(await can(lead.id, "permissions.manage")));
+  await db.role.update({ where: { key: LEAD_ROLE }, data: { active: true } });
+  ok("  until it is switched on again", await can(lead.id, "permissions.manage"));
+
+  section("6. Duplicating a role");
+  as(superAdmin);
+  await levels.setRoleAccessLevels("SALES", [{ record: "leads", action: "view", level: "TEAM" }]);
+  await fields.setRoleFieldAccess("SALES", [{ field: "phone", policy: { view: true, maskInList: true, maskInDetail: true, unmask: true, format: "phone_last4", export: null } }]);
+  await fields.setRoleUnmaskLimit("SALES", 25);
+  as(admin);
+  const copy = await roles.duplicateRole({ from: "SALES", name: "Zz Sales copy" });
+  ok("an admin duplicates Sales", copy.ok, copy);
+  if (copy.ok) {
+    const [a, b] = await Promise.all([roleGrants("SALES"), roleGrants(copy.data.key)]);
+    const differ = PERMISSIONS.filter((p) => a(p.key) !== b(p.key)).map((p) => p.key);
+    ok("  the copy grants exactly what Sales grants", differ.length === 0, differ);
+    const reach = await db.roleAccessLevel.findMany({ where: { role: copy.data.key }, select: { record: true, action: true, level: true } });
+    ok("  reaches as Sales does", reach.some((r) => r.record === "leads" && r.action === "view" && r.level === "TEAM"), reach);
+    const masked = await db.roleFieldPolicy.findUnique({ where: { role_entity_field: { role: copy.data.key, entity: "leads", field: "phone" } } });
+    ok("  masks as Sales does", masked?.maskInList === true && masked?.format === "phone_last4");
+    ok("  with Sales's daily limit", (await db.roleUnmaskLimit.findUnique({ where: { role: copy.data.key } }))?.dailyLimit === 25);
+    ok("  and nobody moved to it", (await db.user.count({ where: { role: copy.data.key } })) === 0);
+  }
+  as(lead);
+  const rolesBefore = await db.role.count();
+  const leadCopy = await roles.duplicateRole({ from: "SALES", name: "Zz Lead's copy" });
+  ok("a team lead can't copy a role that holds more than they do", !leadCopy.ok, leadCopy);
+  ok("  and nothing is left behind", (await db.role.count()) === rolesBefore);
+
+  section("7. A new account's role");
+  as(lead);
+  const salesAccount = await users.createUser({ name: "Zz Seller", email: "seller@zz-person.invalid", role: "SALES" });
+  ok("a team lead can't start somebody in a role that holds more than they do", !salesAccount.ok && /only start people as an Employee/i.test(salesAccount.ok ? "" : salesAccount.error), salesAccount);
+  // Their own role neither, since 4 Nov 2026: adding people doesn't decide what they can do (`startsEmployeesOnly`).
+  const peer = await users.createUser({ name: "Zz Peer", email: "peer@zz-person.invalid", role: LEAD_ROLE });
+  ok("  nor in their own", !peer.ok, peer);
+  const joiner = await users.createUser({ name: "Zz Joiner", email: "joiner@zz-person.invalid", role: "EMPLOYEE" });
+  ok("  but can as an Employee", joiner.ok, joiner);
+  as(admin);
+  const custom = copy.ok ? await users.createUser({ name: "Zz Custom", email: "custom@zz-person.invalid", role: copy.data.key }) : copy;
+  ok("an admin starts somebody in a custom role", custom.ok, custom);
+  if (custom.ok && copy.ok) ok("  who holds what it grants", (await can(custom.data.id, "leads.view")) === (await roleGrants(copy.data.key))("leads.view"));
+
+  section("8. Nobody makes their own exception, nor lasts it");
+  // Audit M-2 (2 Nov 2026): the single actions behind the exceptions list refused self only for a deny, so the
+  // holder of a temporary grant could make it permanent, and anybody could write themselves an allow.
+  as(superAdmin);
+  const cover = await access.setUserPermission({ userId: lead.id, permission: "products.edit", allowed: true, reason: "Covering this week", expiresAt: tomorrow });
+  ok("the super admin gives the team lead a grant until tomorrow", cover.ok && (await can(lead.id, "products.edit")), cover);
+  as(lead);
+  const lasted = await access.extendUserPermission({ userId: lead.id, permission: "products.edit", expiresAt: null });
+  const coverRow = await db.userPermission.findUnique({ where: { user_permission: { userId: lead.id, permission: "products.edit" } } });
+  ok("the team lead can't make their own grant permanent", !lasted.ok && /your own/i.test(lasted.ok ? "" : lasted.error) && coverRow?.expiresAt !== null, lasted);
+  const selfAllow = await access.setUserPermission({ userId: lead.id, permission: "leads.view", allowed: true, reason: "keep it whatever the role says" });
+  ok("  nor write themselves an allow, even of something they hold", !selfAllow.ok && (await db.userPermission.count({ where: { userId: lead.id, permission: "leads.view" } })) === 0, selfAllow);
+  as(superAdmin);
+  const extended = await access.extendUserPermission({ userId: lead.id, permission: "products.edit", expiresAt: null });
+  ok("  while somebody else may extend it", extended.ok && (await db.userPermission.findUnique({ where: { user_permission: { userId: lead.id, permission: "products.edit" } } }))?.expiresAt === null, extended);
+
+  section("9. A preset leaves a role holding what it lists, as its preview says");
+  // Audit M-3 (2 Nov 2026): a key the preset leaves out used to be cleared, so a role's own default brought back a
+  // key somebody had switched off for it — applied by somebody who didn't hold it, while the preview said "taken
+  // away". A preset, its role, and a key that role holds by default but the preset doesn't list.
+  const pair = ROLE_PRESETS.filter((p) => p.role !== "ADMIN" && p.role !== LEAD_ROLE)
+    .flatMap((p) => PERMISSIONS.filter((d) => !d.everyone && !d.superAdminOnly && roleDefault(d, p.role) && !(p.permissions as readonly string[]).includes(d.key)).map((d) => ({ preset: p, key: d.key })))[0];
+  ok("a preset that leaves out something its role holds by default", !!pair, pair ? `${pair.preset.key}: ${pair.key}` : "none found");
+  if (pair) {
+    const { preset, key: offKey } = pair;
+    // Switched off for the role by the super admin; and the admin who applies the preset is denied it personally.
+    as(superAdmin);
+    const switchedOff = await perms.setRolePermission(preset.role, offKey, false);
+    const denyAdmin = await access.setUserPermission({ userId: admin.id, permission: offKey, allowed: false, reason: "probe" });
+    ok(`  ${offKey} switched off for ${preset.role}, and denied to the admin`, switchedOff.ok && denyAdmin.ok && !(await can(admin.id, offKey)), { switchedOff, denyAdmin });
+    as(admin);
+    const preview = await access.previewPreset(preset.key);
+    ok("  the preview doesn't count it as taken away — it is off already, and stays off", !!preview && !preview.willRevoke.includes(offKey as never) && !preview.willGrant.includes(offKey as never), preview?.willRevoke);
+    const applied = await access.applyPreset(preset.key);
+    const grants = await roleGrants(preset.role);
+    ok("  the admin applies it", applied.ok, applied);
+    ok("  and the key they don't hold stays switched off for the role — the default doesn't bring it back", !grants(offKey), offKey);
+    const listed = new Set<string>(preset.permissions);
+    const differs = PERMISSIONS.filter((d) => !d.everyone && grants(d.key) !== listed.has(d.key)).map((d) => d.key);
+    ok("  the role holds exactly what the preset lists, menu sections aside", differs.length === 0, differs);
+    ok("  so everything the preview said would be taken away is, and everything it would grant is held", !!preview && preview.willRevoke.every((k) => !grants(k)) && preview.willGrant.every((k) => grants(k)), preview ? { revoke: preview.willRevoke.length, grant: preview.willGrant.length } : null);
+  }
+  void perms;
+}
+
+async function main() {
+  const realUrl = process.env.DATABASE_URL;
+  if (!realUrl) throw new Error("DATABASE_URL is not set.");
+  const host = new URL(realUrl).hostname;
+  const realName = new URL(realUrl).pathname.slice(1);
+  section("A scratch workspace");
+  const local = ["localhost", "127.0.0.1", "::1", "host.docker.internal"].includes(host);
+  ok("the database is a local one, so a scratch database may be made beside it", local, host);
+  if (!local) throw new Error("not a local database");
+  const scratchName = `${realName}_personaccess`;
+  const scratchUrl = withDatabase(realUrl, scratchName);
+  const admin = directClient(withDatabase(realUrl, "postgres"), { max: 1 });
+  let closeAll: (() => Promise<void>) | null = null;
+  try {
+    await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${scratchName}" WITH (FORCE)`);
+    await admin.$executeRawUnsafe(`CREATE DATABASE "${scratchName}"`);
+    const started = Date.now();
+    execSync("npx prisma migrate deploy", { stdio: "pipe", env: { ...process.env, DATABASE_URL: scratchUrl }, timeout: 10 * 60 * 1000 });
+    ok("built from the migrations", true, `${Math.round((Date.now() - started) / 1000)} s`);
+    process.env.DATABASE_URL = scratchUrl;
+    process.env.CONTROL_DATABASE_URL = "";
+    /* eslint-disable-next-line @typescript-eslint/no-require-imports */
+    const { db } = require("../src/lib/db") as typeof import("../src/lib/db");
+    closeAll = () => db.$disconnect();
+    await run(db as unknown as PrismaClient);
+  } finally {
+    await closeAll?.().catch(() => {});
+    await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${scratchName}" WITH (FORCE)`).catch(() => {});
+    const gone = await admin.$queryRawUnsafe<{ n: bigint }[]>(`select count(*)::bigint as n from pg_database where datname = '${scratchName}'`);
+    ok("the scratch database is dropped", Number(gone[0]?.n ?? 1) === 0);
+    await admin.$disconnect();
+  }
+  console.log(failures === 0 ? `\nAll ${passes} person and role access checks passed.\n` : `\n${failures} check(s) FAILED (${passes} passed).\n`);
+  process.exit(failures === 0 ? 0 : 1);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

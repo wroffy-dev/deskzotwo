@@ -1,0 +1,78 @@
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { getBranding } from "@/actions/branding";
+import { brandingCss } from "@/lib/branding";
+import { deskzoFavicons } from "@/lib/pwa";
+import { ClockProvider } from "@/components/time/clock-provider";
+import { workspaceZone } from "@/lib/time/workspace";
+import { currentTenantOrNull } from "@/lib/tenancy/resolve";
+import { WorkspaceCountry } from "@/components/layout/workspace-country";
+import { ConfirmHost } from "@/components/ui/confirm";
+import { ToastHost } from "@/components/ui/toast";
+
+const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
+const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
+
+export async function generateMetadata(): Promise<Metadata> {
+  const branding = await getBranding();
+  return {
+    title: branding.appName,
+    description: branding.tagline ?? "Internal ERP — CRM, inventory, and the modules that follow.",
+    // Deskzo's icon in the tab on every address; a company's own logo shows inside the app (owner, 23 Oct 2026).
+    icons: deskzoFavicons(),
+  };
+}
+
+/**
+ * Applies the saved theme before first paint. Without this the page renders light and then flips,
+ * which is far more jarring than a fraction of a second of nothing.
+ */
+const themeScript = `(function(){try{var s=localStorage.getItem("theme");var d=document.documentElement.dataset.defaultTheme;var t=s||d||"system";var dark=t==="dark"||(t==="system"&&window.matchMedia("(prefers-color-scheme: dark)").matches);document.documentElement.classList.toggle("dark",dark);}catch(e){}})();`;
+
+/**
+ * Every page renders per request, never once at build time.
+ *
+ * One server answers for every workspace, told apart by the host it was reached on — and Next's
+ * Full Route Cache is keyed by path, not host. A page that could be prerendered (one whose data
+ * lookups happen to fall back quietly, like branding's) would be rendered once and then served to
+ * every workspace alike, with the first one's name and data in it. See src/lib/tenancy.
+ */
+export const dynamic = "force-dynamic";
+
+/**
+ * Marks the page when it is open inside the Deskzo phone app (mobile/src/app/web.tsx) — an Android web view says
+ * "; wv)" in its user agent, an iPhone one leaves out "Safari" — so CSS can drop what a small screen can't afford,
+ * frozen table columns first (src/app/globals.css). Before paint, like the theme.
+ */
+const appViewScript = `(function(){try{var u=navigator.userAgent;if(u.indexOf("; wv)")>-1||(/iPhone|iPad|iPod/.test(u)&&u.indexOf("AppleWebKit")>-1&&u.indexOf("Safari")<0))document.documentElement.setAttribute("data-app-view","");}catch(e){}})();`;
+
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  // The workspace's clock on its own addresses — sign-in, public, print and TV pages included — and India's
+  // elsewhere; the console, partner and CMS layouts hand down the console's instead (src/lib/time).
+  const [branding, zone, tenant] = await Promise.all([getBranding(), workspaceZone(), currentTenantOrNull()]);
+
+  return (
+    <html
+      lang="en"
+      data-default-theme={branding.defaultTheme}
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      suppressHydrationWarning
+    >
+      <head>
+        <style dangerouslySetInnerHTML={{ __html: brandingCss(branding) }} />
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        <script dangerouslySetInnerHTML={{ __html: appViewScript }} />
+      </head>
+      <body className="flex min-h-full flex-col bg-bg text-text">
+        {/* Its country pack, for amounts and forms in the browser (src/lib/country-pack.ts); India's elsewhere. */}
+        <WorkspaceCountry country={tenant?.country ?? "IN"} defaultTaxRate={tenant?.defaultTaxRate ?? null}>
+          <ClockProvider zone={zone}>{children}</ClockProvider>
+        </WorkspaceCountry>
+        {/* "Are you sure?" and what happened, for every page — asked and told from anywhere (src/components/ui/confirm.tsx, toast.tsx). */}
+        <ConfirmHost />
+        <ToastHost />
+      </body>
+    </html>
+  );
+}

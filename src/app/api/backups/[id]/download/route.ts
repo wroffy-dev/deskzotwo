@@ -1,0 +1,319 @@
+import path from "node:path";
+import { rm, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { currentUser, refuseWhileViewingAs } from "@/lib/session";
+import { can } from "@/lib/authz/resolve";
+import { logActivity } from "@/lib/activity";
+import { archiveKeyMaterial, currentKeys } from "@/lib/tenancy/keys";
+import { currentTenant } from "@/lib/tenancy/resolve";
+import { readSidecar } from "@/lib/backup/sidecar";
+import { MissingChunkError, readManifest, reassemble } from "@/lib/backup/chunks";
+import { isSealedFile, openBackupFileTo, SealedBackupError } from "@/lib/backup/at-rest";
+import { backupFilePath, backupRoot, ensureRestoreDir, restoreDir } from "@/lib/backup/maintenance";
+import { confirmIdentity } from "@/lib/security/confirm-identity";
+import { sameOrigin } from "@/lib/http/same-origin";
+import { notifyUser } from "@/lib/notify";
+import { ARCHIVE_EXTENSION, PassphraseError, passphraseProblem, sealToStream } from "@/lib/backup/archive";
+import { fetchFromOffsite, OffsiteFetchFailed } from "@/lib/offsite/fetch";
+
+/**
+ * Hands one backup to the person who asked for it, sealed.
+ *
+ * ## Why this is a POST, and why the passphrase is in the body
+ *
+ * A GET would put this behind a URL, and a URL is the one place a secret must never be: it is typed
+ * into address bars, kept in history, written to every proxy log between here and the browser, and
+ * handed to whatever a page links to next in a `Referer`. It would also make the download something
+ * any page on the internet could trigger in a logged-in admin's browser simply by pointing an
+ * `<img>` at it. A POST with the passphrase in the body is neither of those things.
+ *
+ * The response is streamed rather than buffered. These files are the whole database, and reading
+ * one into memory to send it would put the application one large backup away from an OOM. `sealToStream`
+ * gives an exact length up front — AES-GCM is a counter mode, so the ciphertext is the same size as
+ * the dump — which is what lets the browser draw a real progress bar instead of a spinner.
+ *
+ * ## What is recorded
+ *
+ * An activity row at WARNING, the same way a CSV export is recorded and for the same reason —
+ * except this is the largest one there is: one request, and a complete copy of every customer,
+ * order, payslip and password hash leaves the building. "Who took a copy, and when" has to be
+ * answerable afterwards, from the log rather than from memory.
+ *
+ * Not an audit row. `AuditAction` is CREATE, UPDATE and DELETE — it records changes to records, and
+ * nothing here changes. Filing a read under a mutation verb would make the audit trail say
+ * something that did not happen.
+ */
+async function notifySuperAdminOfDownload(user: { id: string; name: string }, outName: string): Promise<void> {
+  const owners = await db.user.findMany({ where: { isSuperAdmin: true, active: true, id: { not: user.id } }, select: { id: true } });
+  for (const owner of owners) {
+    await notifyUser({
+      userId: owner.id,
+      type: "SECURITY_ALERT",
+      title: `${user.name} downloaded a complete backup`,
+      message: `${outName} — every record and the workspace's keys, sealed with a passphrase they chose. If this wasn't expected, take their backup access away and ask them about it.`,
+      link: "/settings/backups",
+    });
+  }
+}
+
+export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+  // Security audit, 11 Nov 2026 (SEC-60): only from a page of this app — another site's form can't start one.
+  if (!sameOrigin(request)) return NextResponse.json({ error: "Downloads are only started from this app." }, { status: 403 });
+  const user = await currentUser();
+  if (!user) return NextResponse.json({ error: "Sign in first." }, { status: 401 });
+  if (!(await can(user.id, "backups.download"))) {
+    return NextResponse.json({ error: "You don't have access to download backups." }, { status: 403 });
+  }
+  const viewingAs = await refuseWhileViewingAs();
+  if (viewingAs) return NextResponse.json({ error: viewingAs }, { status: 403 });
+
+  const { id } = await context.params;
+  const form = await request.formData().catch(() => null);
+  const field = (name: string) => (typeof form?.get(name) === "string" ? String(form.get(name)) : "");
+  const passphrase = field("passphrase");
+
+  const problem = passphraseProblem(passphrase);
+  if (problem) return NextResponse.json({ error: problem }, { status: 400 });
+
+  /**
+   * Security audit, 11 Nov 2026 (SEC-24): the file carries the workspace's keys, so an open session alone is not
+   * enough — the person's own password (or a fresh Microsoft / Google sign-in) and their two-factor code, as a
+   * restore asks (src/app/api/backups/restore/route.ts). The dialog checks it first (`checkBackupDownloadIdentity`
+   * in src/actions/backup.ts) so a mistake is said there rather than lost in the download's hidden frame.
+   */
+  const proved = await confirmIdentity(user.id, { password: field("password"), code: field("code") }, "a backup download");
+  if (!proved.ok) return NextResponse.json({ error: proved.error, needsCode: proved.needsCode ?? false }, { status: 400 });
+
+  const row = await db.backup.findUnique({ where: { id } });
+  if (!row || row.status !== "SUCCEEDED") {
+    // A backup that never finished is not a backup. Same answer as a made-up id, so a guessed one
+    // learns nothing about what exists.
+    return NextResponse.json({ error: "There is no completed backup with that id." }, { status: 404 });
+  }
+
+  const root = await backupRoot();
+
+  /** The plaintext dump this request seals. For a chunked backup it does not exist yet. */
+  let dumpPath: string;
+  /**
+   * Set only when this request built the file itself, and therefore owes its deletion.
+   *
+   * A reassembled dump is a complete, unencrypted copy of the entire business — every order, every
+   * payslip, every password hash — and the only reason it is on disk is that the bytes have to come
+   * from somewhere to be sealed. Leaving one behind would hand anybody with filesystem access
+   * exactly what the passphrase on this download exists to keep from them, and it would do it once
+   * per download, at the size of the database.
+   */
+  let rebuilt: string | null = null;
+
+  /**
+   * A backup whose copy here went once it was off-site (src/lib/offsite/backups.ts trimLocalCopies): fetched back,
+   * as a plain dump in `.restore/` under an id of its own, exactly where a rebuilt one goes — so everything below,
+   * and the clean-up, treats it as it treats a rebuilt one. Null when there's no copy off-site either.
+   */
+  const fromOffsite = async (): Promise<NextResponse | string | null> => {
+    await ensureRestoreDir();
+    const target = path.join(await restoreDir(), `.rebuilt-${randomUUID()}.dump`);
+    try {
+      const fetched = await fetchFromOffsite((await currentTenant()).id, row, target, await restoreDir());
+      return fetched ? target : null;
+    } catch (err) {
+      if (err instanceof OffsiteFetchFailed) return NextResponse.json({ error: err.message }, { status: 502 });
+      throw err;
+    }
+  };
+
+  if (row.kind === "INCREMENTAL" && !(await readManifest(root, row.id))) {
+    const fetched = await fromOffsite();
+    if (fetched instanceof NextResponse) return fetched;
+    if (!fetched) {
+      // The manifest is the chunked backup's equivalent of the file: without it the chunks are an
+      // unordered heap and the snapshot is unrecoverable. Same answer as a deleted dump.
+      return NextResponse.json(
+        {
+          error:
+            "The pieces list for that backup is no longer on the server. The log row is still here, but there is nothing left to rebuild it from.",
+        },
+        { status: 410 },
+      );
+    }
+    rebuilt = fetched;
+    dumpPath = fetched;
+  } else if (row.kind === "INCREMENTAL") {
+    const manifest = await readManifest(root, row.id);
+    if (!manifest) {
+      // The manifest is the chunked backup's equivalent of the file: without it the chunks are an
+      // unordered heap and the snapshot is unrecoverable. Same answer as a deleted dump.
+      return NextResponse.json(
+        {
+          error:
+            "The pieces list for that backup is no longer on the server. The log row is still here, but there is nothing left to rebuild it from.",
+        },
+        { status: 410 },
+      );
+    }
+
+    await ensureRestoreDir();
+    /**
+     * Rebuilt inside `.restore/`, dotted, under an id of its own.
+     *
+     * Not the backup folder: the pruner sweeps that on a schedule and the backup list reads it, so a
+     * file there is either deleted underneath a live download or shown to somebody as a backup it is
+     * not. The id is fresh rather than `row.id` because two people may download the same backup at
+     * once — on a shared path the first to finish deletes the file the second is still streaming,
+     * and that download ends truncated with no error anywhere.
+     */
+    rebuilt = path.join(await restoreDir(), `.rebuilt-${randomUUID()}.dump`);
+    try {
+      await reassemble(root, manifest, rebuilt, (await currentTenant()).id);
+    } catch (err) {
+      await rm(rebuilt, { force: true }).catch(() => {});
+      // Its own answer rather than a 500: a pruned or half-copied store is a thing an operator can
+      // act on, and the error already says which piece and why.
+      if (err instanceof MissingChunkError) return NextResponse.json({ error: err.message }, { status: 410 });
+      throw err;
+    }
+    dumpPath = rebuilt;
+  } else {
+    // Only inside this workspace's own folder (security audit, 11 Nov 2026, SEC-59).
+    const file = backupFilePath(root, row.directory, row.filename);
+    const info = file ? await stat(file).catch(() => null) : null;
+    if (!file || !info?.isFile()) {
+      // Only from this workspace's own folder's backups: a row naming another folder reads as gone, as before.
+      const fetched = file ? await fromOffsite() : null;
+      if (fetched instanceof NextResponse) return fetched;
+      if (!fetched) {
+        return NextResponse.json(
+          { error: "The file for that backup is no longer on the server. The log row is still here, but the dump is gone." },
+          { status: 410 },
+        );
+      }
+      rebuilt = fetched;
+      dumpPath = fetched;
+    } else {
+      dumpPath = file;
+    }
+  }
+
+  // The sidecar sits beside the backup on the server, wherever the bytes to seal end up coming from.
+  const sidecarOf = dumpPath;
+
+  /**
+   * Encrypted at rest (src/lib/backup/at-rest.ts): opened into `.restore/` like a chunked one, under the
+   * same rule — this request made it, so this request deletes it.
+   */
+  if (row.kind !== "INCREMENTAL" && (await isSealedFile(dumpPath))) {
+    await ensureRestoreDir();
+    rebuilt = path.join(await restoreDir(), `.rebuilt-${randomUUID()}.dump`);
+    try {
+      await openBackupFileTo((await currentTenant()).id, dumpPath, rebuilt);
+    } catch (err) {
+      await rm(rebuilt, { force: true }).catch(() => {});
+      if (err instanceof SealedBackupError) return NextResponse.json({ error: err.message }, { status: 410 });
+      throw err;
+    }
+    dumpPath = rebuilt;
+  }
+
+  /** Idempotent, because the stream's `close` and `error` usually both arrive. */
+  let discarded = false;
+  const discardRebuilt = async () => {
+    if (!rebuilt || discarded) return;
+    discarded = true;
+    await rm(rebuilt, { force: true }).catch(() => {});
+  };
+
+  // A chunked backup never had a sidecar — there was no file for one to sit beside — and the facts
+  // it would have carried were recorded on the row when the dump was taken.
+  const sidecar = row.kind === "INCREMENTAL" ? null : await readSidecar(sidecarOf);
+
+  const [tenant, keys] = await Promise.all([currentTenant(), currentKeys()]);
+  let sealed;
+  try {
+    sealed = await sealToStream({
+      dumpPath,
+      passphrase,
+      meta: {
+        takenAt: row.startedAt,
+        schemaVersion: row.schemaVersion ?? sidecar?.schemaVersion ?? null,
+        secretFingerprint: sidecar?.secretFingerprint ?? row.secretFingerprint ?? keys.fingerprint,
+        via: row.via ?? sidecar?.via ?? null,
+        /**
+         * The workspace's keys travel inside the file, sealed under the passphrase.
+         *
+         * Without them this archive restores onto a fresh workspace as a database of unreadable
+         * ciphertext — the vault, the two-factor secrets, the M365 and e-invoice logins all present
+         * and all gibberish. With them, the passphrase is the only thing between this file and every
+         * one of those, which is the trade the operator made when they chose a sealed archive.
+         */
+        includeSecret: archiveKeyMaterial(keys),
+        // Signed by the platform for this workspace: what lets it be restored here without staff.
+        signFor: tenant.id,
+      },
+    });
+  } catch (err) {
+    await discardRebuilt();
+    if (err instanceof PassphraseError) return NextResponse.json({ error: err.message }, { status: 400 });
+    throw err;
+  }
+
+  // Both extensions, because the archive is the same thing either way: a complete snapshot, sealed.
+  // How it happened to be stored on this server is not a fact the downloaded file should carry.
+  const outName = `${row.filename.replace(/\.(dump|chunked)$/i, "")}${ARCHIVE_EXTENSION}`;
+
+  try {
+    // Before the stream, not after: the response is handed to the runtime and finishes whenever the
+    // client finishes reading it, so anything written afterwards races the download and is lost if
+    // the connection drops. A recorded download that did not complete is the right way round.
+    await logActivity({
+      kind: "EXPORT",
+      severity: "WARNING",
+      summary: `${user.name} downloaded a complete backup — ${outName}`,
+      metadata: {
+        backupId: row.id,
+        filename: outName,
+        kind: row.kind,
+        bytes: sealed.totalBytes,
+        takenAt: row.startedAt.toISOString(),
+      },
+    });
+  } catch (err) {
+    // Nothing below this point runs, so nothing else will ever reach the cleanup hook.
+    await discardRebuilt();
+    throw err;
+  }
+
+  // Security audit, 11 Nov 2026 (SEC-24): the super admin is told whenever somebody else takes the whole business
+  // away — the one person who can raise the alarm if it wasn't meant. Never holds the download up.
+  await notifySuperAdminOfDownload(user, outName).catch(() => {});
+
+  /**
+   * The rebuilt copy has to outlive this function and die with the stream.
+   *
+   * Deleting it here is the obvious mistake and the worst one: the body is read after the handler
+   * returns, so the download would truncate to whatever had already been pulled — silently, with a
+   * `Content-Length` promising the rest. Never deleting it is the other failure, a database-sized
+   * plaintext dump left behind per download.
+   *
+   * So cleanup hangs off the stream rather than off this function. `close` is the event a Readable
+   * always reaches — after a normal end, and after a destroy when the client hangs up mid-download —
+   * which makes it the only hook that covers both endings. `error` is attached beside it so a stream
+   * that fails before the runtime starts reading still gets swept, and because an `error` with no
+   * listener on a bare Readable is an uncaught exception rather than a failed download.
+   */
+  sealed.stream.once("close", () => void discardRebuilt());
+  sealed.stream.once("error", () => void discardRebuilt());
+
+  return new NextResponse(Readable.toWeb(sealed.stream) as ReadableStream, {
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(sealed.totalBytes),
+      "Content-Disposition": `attachment; filename="${outName}"`,
+      // Never in a shared cache, and never in the browser's either: this is the whole database.
+      "Cache-Control": "private, no-store",
+    },
+  });
+}

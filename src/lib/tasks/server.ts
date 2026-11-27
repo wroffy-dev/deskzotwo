@@ -1,0 +1,190 @@
+import type { Prisma } from "@prisma/client";
+import { db } from "@/lib/db";
+import { emitTask } from "@/lib/automate/emit-records";
+import { workspaceClock } from "@/lib/time/workspace";
+import { closes, dayKeyOf, earnsXp, nextOccurrence, onlyWorks, type TaskStatusKey } from "@/lib/tasks/rules";
+import { getDownlineUserIds } from "@/lib/org-chart";
+import { taskAccess } from "@/lib/authz/access";
+import { notifyUser } from "@/lib/notify";
+
+/**
+ * The task, when this person may work it — move it through its stages, tick its steps, attach files and
+ * log time: whoever it's assigned to, as long as they can see it, and anybody whose role may change it
+ * (owner, 17 Oct 2026: the assignee moves a task along even where their role can't change tasks —
+ * changing it still follows the role). Null when they can't.
+ */
+export async function workableTask(userId: string, id: string) {
+  if (typeof id !== "string" || !id) return null;
+  const task = await db.task.findFirst({ where: { AND: [{ id }, await taskAccess(userId, "view")] }, omit: ADVANCED });
+  if (!task) return null;
+  if (task.assignedToUserId === userId) return task;
+  return (await db.task.count({ where: { AND: [{ id }, await taskAccess(userId, "edit")] } })) > 0 ? task : null;
+}
+
+/**
+ * What this person may do with each of these tasks, as the list shows it: work it (`workableTask`), change
+ * it (the role's edit, unless it was given to them — `onlyWorks`), delete it (the role's delete, the same).
+ */
+export async function taskRights(userId: string, tasks: readonly { id: string; assignedToUserId: string | null; createdByUserId: string }[]) {
+  const ids = tasks.map((t) => t.id);
+  const [editable, deletable, given] = await Promise.all([
+    ids.length ? db.task.findMany({ where: { AND: [{ id: { in: ids } }, await taskAccess(userId, "edit")] }, select: { id: true } }).then((r) => new Set(r.map((t) => t.id))) : new Set<string>(),
+    ids.length ? db.task.findMany({ where: { AND: [{ id: { in: ids } }, await taskAccess(userId, "delete")] }, select: { id: true } }).then((r) => new Set(r.map((t) => t.id))) : new Set<string>(),
+    givenToWorkAll(userId, tasks),
+  ]);
+  return (task: { id: string; assignedToUserId: string | null; createdByUserId: string }) => {
+    const workOnly = given(task);
+    return {
+      workOnly,
+      canWork: editable.has(task.id) || task.assignedToUserId === userId,
+      canChange: editable.has(task.id) && !workOnly,
+      canDelete: deletable.has(task.id) && !workOnly,
+    };
+  };
+}
+
+/**
+ * `onlyWorks` (src/lib/tasks/rules.ts) for many tasks at once: the viewer's downline, read once, and
+ * which of the tasks' givers are still here.
+ */
+type GivenShape = { assignedToUserId: string | null; createdByUserId: string };
+export async function givenToWorkAll(userId: string, tasks: readonly GivenShape[]): Promise<(task: GivenShape) => boolean> {
+  const givers = [...new Set(tasks.filter((t) => t.assignedToUserId === userId && t.createdByUserId !== userId).map((t) => t.createdByUserId))];
+  if (givers.length === 0) return () => false;
+  // The workspace's owner changes any task, given to them or not (owner, 17 Oct 2026) — the org chart
+  // needn't run up to them for that.
+  if ((await db.user.findUnique({ where: { id: userId }, select: { isSuperAdmin: true } }))?.isSuperAdmin) return () => false;
+  const [downline, active] = await Promise.all([
+    getDownlineUserIds(userId),
+    db.user.findMany({ where: { id: { in: givers }, active: true }, select: { id: true } }).then((rows) => new Set(rows.map((r) => r.id))),
+  ]);
+  return (task) => onlyWorks(task, userId, downline, active.has(task.createdByUserId));
+}
+
+/** Whether this person only works this task: given to them by somebody who doesn't report to them. */
+export async function givenToWork(userId: string, task: { assignedToUserId: string | null; createdByUserId: string }): Promise<boolean> {
+  return (await givenToWorkAll(userId, [task]))(task);
+}
+
+/**
+ * Advanced tasks on the server (owner, 16 Oct 2026). Server only.
+ *
+ * The task's newer columns are left out of every read by default until each workspace has them
+ * (NOT_YET_EVERYWHERE, src/lib/tenancy/clients.ts); a read that wants them asks with `ADVANCED`.
+ */
+
+/** Put the newer columns back into a read. */
+export const ADVANCED = {
+  status: false,
+  priority: false,
+  startDate: false,
+  estimateMinutes: false,
+  departmentId: false,
+  challengeId: false,
+  xp: false,
+  xpSetById: false,
+  badge: false,
+  xpEarned: false,
+  xpEarnedById: false,
+  xpEarnedAt: false,
+  repeat: false,
+  repeatUntil: false,
+  repeatedFromId: false,
+} as const satisfies Prisma.TaskOmit;
+
+/** A calendar day as a stored day: its midnight UTC, as `dueDate` and `startDate` hold it. */
+export const storedDay = (day: string) => new Date(`${day}T00:00:00.000Z`);
+
+/**
+ * Moves a task to a status — the one way a task is closed or opened again, whether through the status
+ * menu, the board, or the old tick:
+ *
+ *   · Done and Cancelled set `done`; To do and In progress clear it.
+ *   · Done on or before its due day earns its XP for its assignee, unless they set it themselves; any
+ *     other move takes an earned XP back.
+ *   · A call's follow-up follows its task, as it always has.
+ *   · Done, a repeating task makes its next one — once.
+ *
+ * Asks nothing about who may: the caller has.
+ */
+export async function moveTask(taskId: string, status: TaskStatusKey): Promise<{ nextTaskId: string | null } | null> {
+  const today = (await workspaceClock()).today();
+  return db.$transaction(async (tx) => {
+    const task = await tx.task.findUnique({ where: { id: taskId }, omit: ADVANCED, include: { checklist: { orderBy: { sortOrder: "asc" } } } });
+    if (!task) return null;
+    const closing = closes(status);
+    let earns = status === "DONE" && earnsXp(task, today) && task.xpSetById !== task.assignedToUserId;
+    // Security audit round three, 14 Nov 2026 (R3-18, low): and a repeat chain earns once a day at most — the
+    // occurrence before this one having earned today means this one doesn't.
+    if (earns && task.repeatedFromId && !task.xpEarnedAt) {
+      const before = await tx.task.findUnique({ where: { id: task.repeatedFromId }, select: { xpEarnedAt: true } });
+      if (before?.xpEarnedAt && (await workspaceClock()).today(before.xpEarnedAt) === today) earns = false;
+    }
+    await tx.task.update({
+      where: { id: taskId },
+      data: {
+        status,
+        done: closing,
+        doneAt: closing ? (task.done ? task.doneAt : new Date()) : null,
+        ...(earns
+          ? { xpEarned: task.xp, xpEarnedById: task.assignedToUserId, xpEarnedAt: task.xpEarnedAt ?? new Date() }
+          : { xpEarned: null, xpEarnedById: null, xpEarnedAt: null }),
+      },
+    });
+    const call = await tx.callLog.findUnique({ where: { followUpTaskId: taskId }, select: { id: true } });
+    if (call) await tx.callLog.update({ where: { id: call.id }, data: { followUpDone: closing } });
+    // For Automate's workflows (src/lib/automate): done, the moment it becomes so.
+    if (status === "DONE" && task.status !== "DONE") await emitTask(tx, "task.completed", taskId, null);
+
+    if (status !== "DONE" || !task.repeat) return { nextTaskId: null };
+    if ((await tx.task.count({ where: { repeatedFromId: taskId } })) > 0) return { nextTaskId: null };
+    // The next one is a step on from its due day (or its start, or today), its start moved as far.
+    const from = task.dueDate ? dayKeyOf(task.dueDate) : task.startDate ? dayKeyOf(task.startDate) : today;
+    const nextDue = nextOccurrence(from, task.repeat);
+    if (task.repeatUntil && nextDue > dayKeyOf(task.repeatUntil)) return { nextTaskId: null };
+    const shift = storedDay(nextDue).getTime() - storedDay(from).getTime();
+    const next = await tx.task.create({
+      data: {
+        title: task.title,
+        description: task.description,
+        dueDate: task.dueDate || !task.startDate ? storedDay(nextDue) : null,
+        startDate: task.startDate ? new Date(task.startDate.getTime() + shift) : null,
+        assignedToUserId: task.assignedToUserId,
+        createdByUserId: task.createdByUserId,
+        companyId: task.companyId,
+        leadId: task.leadId,
+        ticketId: task.ticketId,
+        projectId: task.projectId,
+        priority: task.priority,
+        estimateMinutes: task.estimateMinutes,
+        departmentId: task.departmentId,
+        challengeId: task.challengeId,
+        xp: task.xp,
+        xpSetById: task.xpSetById,
+        badge: task.badge,
+        repeat: task.repeat,
+        repeatUntil: task.repeatUntil,
+        repeatedFromId: task.id,
+        checklist: { create: task.checklist.map((c) => ({ title: c.title, sortOrder: c.sortOrder })) },
+      },
+      select: { id: true },
+    });
+    return { nextTaskId: next.id };
+  });
+}
+
+/**
+ * A comment on a task, by `userId` — its maker and its assignee told, whoever of them didn't write it. The comment
+ * box's (src/actions/task-extras.ts) and the note a move to Cancelled or Need help leaves. Asks nothing about who
+ * may: the caller has.
+ */
+export async function postTaskComment(task: { id: string; title: string; assignedToUserId: string | null; createdByUserId: string }, userId: string, text: string) {
+  const comment = await db.taskComment.create({ data: { taskId: task.id, userId, body: text }, select: { id: true } });
+  const name = (await db.user.findUnique({ where: { id: userId }, select: { name: true } }))?.name ?? "Somebody";
+  for (const to of new Set([task.assignedToUserId, task.createdByUserId].filter((v): v is string => !!v && v !== userId))) {
+    // Whoever set it finds it under "Set by me"; whoever it's for, on their own list.
+    const link = to === task.assignedToUserId ? "/tasks" : "/tasks?assignedTo=byme";
+    await notifyUser({ userId: to, type: "TASK_COMMENT", title: `${name} commented on "${task.title}"`, message: text.slice(0, 200), link });
+  }
+  return comment;
+}

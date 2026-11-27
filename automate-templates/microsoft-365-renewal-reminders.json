@@ -1,0 +1,47 @@
+{
+  "deskzo": "automate-workflow",
+  "version": 1,
+  "exportedAt": "2026-11-01T00:00:00.000Z",
+  "name": "Microsoft 365 renewal reminders",
+  "description": "Emails the customer's main contact 60, 45, 30, 15, 10, 5 and 1 day before a Microsoft 365 subscription ends, using a saved email template.",
+  "definition": {
+    "schema": 1,
+    "trigger": {
+      "type": "renewal.due",
+      "filter": { "all": [{ "ref": "trigger.daysLeft", "op": "in", "value": [60, 45, 30, 15, 10, 5, 1] }] }
+    },
+    "steps": [
+      {
+        "id": "microsoft_365",
+        "name": "Only Microsoft 365 subscriptions",
+        "type": "condition",
+        "if": {
+          "any": [
+            { "ref": "trigger.order.itemName", "op": "contains", "value": "Microsoft 365" },
+            { "ref": "trigger.order.itemName", "op": "contains", "value": "Office 365" },
+            { "ref": "trigger.order.itemName", "op": "contains", "value": "M365" },
+            { "ref": "trigger.order.itemName", "op": "contains", "value": "O365" },
+            { "ref": "trigger.order.itemName", "op": "contains", "value": "Exchange Online" },
+            { "ref": "trigger.order.itemName", "op": "contains", "value": "Teams Essentials" }
+          ]
+        }
+      },
+      {
+        "id": "email_customer",
+        "name": "Email the customer from the template",
+        "type": "action",
+        "action": "email.send",
+        "input": {
+          "to": "company_contact",
+          "companyId": "{{trigger.company.id}}",
+          "from": "company",
+          "topic": "RENEWALS",
+          "orderId": "{{trigger.order.id}}",
+          "ccAccountManager": true
+        }
+      }
+    ],
+    "settings": { "onError": "continue" }
+  },
+  "cleared": ["Email template — choose one after importing"]
+}

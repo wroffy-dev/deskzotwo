@@ -1,0 +1,114 @@
+/**
+ * What the chat's server hands the browser, as plain JSON: times are ISO strings, nothing is a Prisma
+ * row. Shared by src/actions/chat.ts, the live stream (src/app/api/chat/stream) and the chat's
+ * components.
+ */
+
+export type ChatPerson = {
+  id: string;
+  name: string;
+  photoUpdatedAt: string | null;
+  /** Their department's name, to tell two Priyas apart in a picker. */
+  department: string | null;
+  /** Switched off: their chats stay readable, nothing new can be sent to them. */
+  active: boolean;
+};
+
+export type ChatMemberView = {
+  userId: string;
+  name: string;
+  photoUpdatedAt: string | null;
+  isAdmin: boolean;
+  joinedAt: string;
+  leftAt: string | null;
+  lastDeliveredAt: string | null;
+  lastReadAt: string | null;
+};
+
+export type ChatAttachmentView = { id: string; fileName: string; mimeType: string; size: number };
+
+/** One emoji on a message and who chose it. */
+export type ChatReactionView = { emoji: string; userIds: string[] };
+
+/** A message pinned to the top of its chat, as the bar there shows it. */
+export type ChatPinView = {
+  messageId: string;
+  pinnedAt: string;
+  pinnedByName: string | null;
+  senderName: string | null;
+  body: string;
+  attachmentCount: number;
+  createdAt: string;
+};
+
+export type ChatMessageView = {
+  id: string;
+  chatId: string;
+  kind: "TEXT" | "SYSTEM";
+  senderId: string | null;
+  senderName: string | null;
+  /** Empty once deleted for everyone. */
+  body: string;
+  replyTo: { id: string; senderName: string | null; body: string; deleted: boolean; attachmentCount: number } | null;
+  attachments: ChatAttachmentView[];
+  mentionIds: string[];
+  reactions: ChatReactionView[];
+  editedAt: string | null;
+  deletedAt: string | null;
+  createdAt: string;
+};
+
+/** One row of a person's chat list. */
+export type ChatSummary = {
+  id: string;
+  kind: "DIRECT" | "GROUP";
+  /** The group's name, or the other person's. */
+  title: string;
+  /** A direct chat's other person — their face and their presence. */
+  otherUserId: string | null;
+  otherPhotoUpdatedAt: string | null;
+  /** A group's picture, when its admins set one — when, as the image's cache-buster (owner, 26 Oct 2026). */
+  iconUpdatedAt: string | null;
+  otherActive: boolean;
+  memberCount: number;
+  preview: string;
+  lastMessageAt: string | null;
+  unread: number;
+  /** An unread message @mentions me. */
+  mentioned: boolean;
+  mutedUntil: string | null;
+  isAdmin: boolean;
+  /** I have left, or was removed: readable, nothing more. */
+  left: boolean;
+};
+
+/** Everything the live stream sends, to the people it concerns. */
+export type ChatEvent =
+  | { type: "ready"; online: string[] }
+  /**
+   * A new message. `muted`/`mentioned` are the recipient's own, so each is sent per person; `priority`, that it
+   * starts with "!" (src/lib/chat/rules.ts isPriority); `chatTitle` is the chat as they know it (the group, or
+   * the sender), for a desktop alert.
+   */
+  | { type: "message"; message: ChatMessageView; muted: boolean; mentioned: boolean; priority?: boolean; chatTitle?: string | null }
+  /** A message's reactions changed. */
+  | { type: "reactions"; chatId: string; messageId: string; reactions: ChatReactionView[] }
+  /** Something was pinned or unpinned: ask for the chat's pins again (each member sees only their part). */
+  | { type: "pins-changed"; chatId: string }
+  /** Edited, or deleted for everyone. */
+  | { type: "message-updated"; message: ChatMessageView }
+  /** Someone's reading position in a chat moved. */
+  | { type: "receipt"; chatId: string; userId: string; lastDeliveredAt: string | null; lastReadAt: string | null }
+  | { type: "typing"; chatId: string; userId: string; name: string }
+  | { type: "presence"; userId: string; online: boolean; lastSeenAt: string | null }
+  /** A chat's name or members changed, or it was created — reload its row. */
+  | { type: "chat-changed"; chatId: string }
+  /** My unread count, after something read elsewhere (another tab, the rail). */
+  | { type: "unread"; total: number }
+  /**
+   * A Customer inbox conversation changed (src/lib/inbox): its id only — each screen asks again as its own
+   * person, who may not be allowed to see it. Rides chat's one live connection rather than opening another.
+   */
+  | { type: "inbox"; conversationId: string; /** A customer just began it: screens that may see it chime. */ started?: boolean }
+  /** A website visitor is typing in that conversation: the screen asks for what (an action that checks who may see it). */
+  | { type: "inbox-typing"; conversationId: string };

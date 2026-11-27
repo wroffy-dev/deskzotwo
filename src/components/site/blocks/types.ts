@@ -1,0 +1,603 @@
+/**
+ * The public website's content model: site-wide settings, pages, and the typed blocks a page is made
+ * of. The platform console's CMS edits exactly these shapes; src/components/site/blocks renders them;
+ * src/lib/platform/site-content.ts hands them out (today the defaults in ../defaults.ts).
+ *
+ * ## Written to be edited by somebody other than a developer
+ *
+ *   · Every prop is plain data — strings, numbers, booleans, arrays of those. There is no HTML
+ *     anywhere: rich text is structured (`RichNode`), and React escapes every string it renders.
+ *   · Links are checked when rendered, not trusted when saved: only a path on this site
+ *     ("/pricing", "/#modules", "/contact?topic=demo") or an http(s) address becomes a link
+ *     (`safeHref` in ../links.ts); anything else is shown as plain text. Images the same (`safeSrc`).
+ *   · Icons and product previews are names from a fixed list, never components or markup.
+ *   · Text may carry tokens, replaced when shown: {siteName} {tagline} {displayDomain} {salesEmail}
+ *     {trialDays}. Unknown tokens are left as they are.
+ *   · Blocks never carry a workspace's data. The two that show live data — `pricingTable` (plans on
+ *     sale, from the control plane) and the forms — fetch or post it themselves.
+ */
+
+import type { ProductKey } from "@/lib/products";
+
+// ─── Links, actions, media ───────────────────────────────────────────────────────────────────────
+
+/** A path on this site, or an http(s) address. Anything else is not rendered as a link. */
+export type Href = string;
+
+export type SiteLink = { label: string; href: Href };
+
+/**
+ * A button. `signup` is the site's own call to action, which follows whether signing up is open
+ * (SiteSettings.signupCta): "Start free trial" while it is, "Request an invitation" while it is not.
+ * With `product` (a product's page, its pricing card), the trial is of that product alone: the button
+ * goes to /signup?product=books while signing up is open.
+ */
+export type SiteAction = { kind: "link"; label: string; href: Href } | { kind: "signup"; product?: ProductKey };
+
+export const ICON_NAMES = [
+  "sparkles",
+  "chart",
+  "receipt",
+  "package",
+  "book",
+  "users",
+  "headset",
+  "megaphone",
+  "layers",
+  "database",
+  "key",
+  "fingerprint",
+  "shield",
+  "scroll",
+  "door",
+  "lock",
+  "server",
+  "history",
+  "globe",
+  "rupee",
+  "card",
+  "truck",
+  "map-pin",
+  "file-text",
+  "calendar",
+  "mail",
+  "check",
+  "bot",
+  "building",
+  "gauge",
+] as const;
+export type IconName = (typeof ICON_NAMES)[number];
+
+/** The stylised product screens drawn in HTML and CSS (src/components/site/previews.tsx). */
+export const PREVIEW_KINDS = ["pipeline", "invoice", "attendance", "tickets"] as const;
+export type PreviewKind = (typeof PREVIEW_KINDS)[number];
+
+export type SiteMedia = { kind: "preview"; preview: PreviewKind } | { kind: "image"; src: Href; alt: string };
+
+// ─── Rich text ───────────────────────────────────────────────────────────────────────────────────
+
+/** A run of text, optionally bold, italic or a link. */
+export type RichSpan = { text: string; strong?: boolean; em?: boolean; href?: Href };
+/** Plain text, or runs of it. */
+export type RichInline = string | RichSpan[];
+
+export type RichNode =
+  | { type: "heading"; level: 2 | 3; text: string; anchor?: string }
+  | { type: "paragraph"; text: RichInline }
+  | { type: "list"; ordered?: boolean; items: RichInline[] }
+  | { type: "table"; columns: string[]; rows: RichInline[][] }
+  | { type: "note"; tone: "info" | "warning"; text: RichInline };
+
+// ─── Blocks ──────────────────────────────────────────────────────────────────────────────────────
+
+/** Shared by most blocks: an id to link to (`/#modules`), a small line above the heading, the heading and an introduction. */
+type SectionHead = { anchor?: string; eyebrow?: string; heading: string; intro?: string };
+
+/** The top of the home page: the page's one h1. */
+export type HeroProps = {
+  eyebrow?: string;
+  heading: string;
+  subheading?: string;
+  primary?: SiteAction;
+  secondary?: SiteAction;
+  /** A third, quieter way on — "Talk to sales" (owner, 15 Nov 2026). */
+  tertiary?: SiteAction;
+  /** Under the buttons while signing up is open ("Free for {trialDays} days…"). */
+  note?: string;
+  /** Under the buttons while signing up is by invitation. */
+  noteInviteOnly?: string;
+  media?: SiteMedia;
+  /**
+   * The product as tabs under the headline — Sales, Books, People, Support (owner, 15 Nov 2026). Two or more, and they
+   * take the place of `media`; fewer, and `media` shows as before.
+   */
+  previewTabs?: { label: string; preview: PreviewKind }[];
+  /**
+   * Words that take turns at the end of the heading (owner, 18 Nov 2026 — the new home page): "One workspace for your"
+   * then "sales", "invoices", "books"… Two or more, else the heading stands alone.
+   */
+  rotatingWords?: string[];
+};
+
+/** The top of an inner page: its h1, an introduction, and an optional notice (a draft, a caveat). */
+export type PageHeaderProps = {
+  eyebrow?: string;
+  heading: string;
+  intro?: string;
+  notice?: { tone: "info" | "warning"; text: string };
+};
+
+export type FeatureGridProps = SectionHead & {
+  columns?: 2 | 3 | 4;
+  items: { icon?: IconName; title: string; body: string; bullets?: string[]; link?: SiteLink }[];
+};
+
+/**
+ * The product's modules, grouped. `key` names a module in src/lib/modules.ts, which is where "sold in
+ * India only" comes from; an item without a key (or with an unknown one) is shown as written.
+ */
+export type ModuleGridProps = SectionHead & {
+  groups: { icon: IconName; title: string; summary?: string; modules: { key?: string; label: string; blurb: string }[] }[];
+  footnote?: string;
+};
+
+export type RichTextProps = { anchor?: string; heading?: string; content: RichNode[] };
+
+export type ImageTextProps = SectionHead & {
+  body?: string[];
+  bullets?: string[];
+  action?: SiteAction;
+  media: SiteMedia;
+  mediaSide?: "left" | "right";
+};
+
+export type StatsProps = { anchor?: string; heading?: string; items: { value: string; label: string }[] };
+
+export type FaqProps = SectionHead & { items: { question: string; answer: string[] }[] };
+
+export type CtaProps = {
+  anchor?: string;
+  heading: string;
+  body?: string;
+  primary?: SiteAction;
+  secondary?: SiteAction;
+  /** A full-width band in the brand colour, or a quieter panel. */
+  variant?: "band" | "panel";
+};
+
+/** Plans on sale, read live from the control plane for the country in the address (`?country=`). */
+export type PricingTableProps = {
+  anchor?: string;
+  /** Beside the country picker. */
+  countryLabel: string;
+  editionsHeading: string;
+  extrasHeading: string;
+  extrasIntro?: string;
+  /** Under the plans, e.g. "Every plan starts with a {trialDays}-day free trial." */
+  trialNote?: string;
+  /** Under the plans: what every plan includes. */
+  footnote?: string;
+  emptyHeading: string;
+  emptyBody: string;
+  emptyAction?: SiteAction;
+};
+
+export type SecurityHighlightsProps = SectionHead & {
+  items: { icon: IconName; title: string; body: string }[];
+  link?: SiteLink;
+};
+
+export type ContactTopicLabels = { demo: string; sales: string; support: string; other: string };
+
+export type ContactFormProps = {
+  anchor?: string;
+  heading: string;
+  intro?: string;
+  topics: ContactTopicLabels;
+  submitLabel: string;
+  successHeading: string;
+  successBody: string;
+  asideHeading?: string;
+  aside?: { title: string; body: string; link?: SiteLink }[];
+};
+
+/** Customers' logos. Empty by default: the site shows none until there are real ones. */
+export type LogoCloudProps = { anchor?: string; heading?: string; items: { name: string; imageUrl?: Href; href?: Href }[] };
+
+/** A customer's words. Not used by default: the site shows none until there are real ones. */
+export type TestimonialProps = { anchor?: string; quote: string; name: string; role?: string; company?: string; imageUrl?: Href };
+
+export type ProductPreviewsProps = SectionHead & { items: { preview: PreviewKind; title: string; body: string }[] };
+
+/**
+ * One cell of a comparison: "yes", "partial" or "no" (shown as an icon and "Yes", "Partly", "No"),
+ * or words of the editor's own, shown as written ("From ₹999 a month", "With an add-on").
+ */
+export type ComparisonMark = string;
+export const COMPARISON_MARKS = ["yes", "partial", "no"] as const;
+
+/**
+ * This product beside another, feature by feature — for the comparison pages. `competitor` is the
+ * other product's name as the page states it; `asOf` ("yyyy-mm-dd") is the day its public website
+ * was read, shown as "Information about {competitor} from its public website as of {asOf}". Each
+ * row may carry the page of the competitor's site it was read from (`source`, an http(s) address,
+ * linked `nofollow`); `disclaimer` is shown under the table.
+ */
+export type ComparisonTableProps = SectionHead & {
+  competitor: string;
+  asOf: string;
+  rows: { feature: string; us: ComparisonMark; them: ComparisonMark; note?: string; source?: Href }[];
+  disclaimer: string;
+};
+
+/**
+ * What a company pays for separate tools beside what Deskzo One costs (owner, 26 Oct 2026) — for the comparison
+ * pages. The visitor ticks the tools they use, sets how many people, and may change any price to what they
+ * really pay; Deskzo One's price is the live plan's, never typed here.
+ *
+ * Each tool's `price` is its list price in rupees a month before GST — for each person (`per: "user"`) or for
+ * the company (`per: "org"`) — read from the vendor's own pricing page (`source`) on `asOf`; `basis` says how
+ * ("Professional, billed yearly"). `selected` tools are ticked to start.
+ */
+export type StackSavingsTool = {
+  name: string;
+  /** What it does, in a word or two — "CRM", "Accounting & GST". */
+  replaces: string;
+  /** Billed monthly. 0: not listed in rupees — the visitor types their own (`basis` says why). */
+  price: number;
+  /** The month's price when billed yearly, where the vendor lists one — the Yearly switch uses it. */
+  priceYearly?: number;
+  per: "user" | "org";
+  /** A company price: the people it includes, and each person past them (billed monthly, and yearly). */
+  included?: number;
+  extra?: number;
+  extraYearly?: number;
+  basis?: string;
+  source: Href;
+  selected?: boolean;
+  logoUrl?: Href;
+};
+export type StackSavingsProps = SectionHead & {
+  /** People to start with: what the totals are worked out for, until the visitor changes it. */
+  people: number;
+  asOf: string;
+  tools: StackSavingsTool[];
+  disclaimer: string;
+};
+
+/** Cards linking to other pages on this site (never elsewhere) — "Related", "Read next". */
+export type RelatedLinksProps = SectionHead & { links: { label: string; href: Href; description?: string }[] };
+
+/** Short reasons to trust the product, one line each with an icon (owner, 15 Nov 2026). Read as claims. */
+export type TrustStripProps = { items: { icon?: IconName; text: string }[] };
+
+/**
+ * How the work flows from one record to the next (owner, 18 Nov 2026 — the new home page): steps along a line — Lead,
+ * Quote, Order, Invoice, Payment, Books — taking turns, each with a heading, a sentence and a few lines of the document
+ * it makes (sample figures). A visitor can pick a step.
+ */
+export type WorkflowProps = SectionHead & {
+  steps: { icon?: IconName; title: string; caption?: string; heading: string; body: string; lines: { label: string; value: string }[] }[];
+};
+
+/**
+ * {siteName} AI answering questions (owner, 18 Nov 2026 — the new home page): the questions as chips, and the answer
+ * to the chosen one typed out in a chat. The answer's first sentence is the figure, shown brighter. Sample answers.
+ */
+export type AiShowcaseProps = SectionHead & { questions: { question: string; answer: string }[]; note?: string };
+
+/**
+ * The AI teammates as characters (owner, 19 Nov 2026 — "lets show our agents on front end like dream team"): each
+ * one's drawn face, name, role and job, read from src/lib/ai/teammates.ts — a teammate added there is on the page
+ * without an edit — then a dark band for Deskzo AI itself, with the block's one link. Only the words around them are
+ * the page's.
+ */
+export type AiTeamProps = SectionHead & { note?: string; action?: SiteAction };
+/** "See Deskzo run your business" (owner, 22 Nov 2026): the visitor's website in, their workspace built live — live-demo.tsx. */
+export type LiveDemoProps = SectionHead & { placeholder?: string; note?: string };
+/** The six teammates at work on a made-up company's records, played back — no AI behind it (owner, 22 Nov 2026 — ai-team-demo.tsx). */
+export type AiTeamDemoProps = SectionHead & { note?: string };
+
+/** The ways to talk to us, as cards — book a demo, talk to sales, move from another system (owner, 15 Nov 2026). */
+export type ContactOptionsProps = SectionHead & { items: { icon?: IconName; title: string; body?: string; action: SiteAction }[] };
+
+/** A hub page's map of the pages under it: groups of links, each with a line on what it covers. */
+export type ModuleHighlightsProps = SectionHead & { groups: { title: string; items: { label: string; href: Href; description: string }[] }[] };
+
+/** Signing in: to a workspace by its name, or "find my workspaces" by email. */
+export type WorkspaceSigninProps = {
+  anchor?: string;
+  goHeading: string;
+  goBody?: string;
+  findHeading: string;
+  findBody?: string;
+  /** Shown after any "find my workspaces" request — the same whatever the address. */
+  confirmationHeading: string;
+  confirmationBody: string;
+};
+
+/** Setting up a workspace — the signup flow (src/components/platform/signup-flow.tsx) and what surrounds it. */
+export type SignupFormProps = {
+  heading: string;
+  body?: string;
+  bodyInviteOnly?: string;
+  asideHeading?: string;
+  asideItems?: string[];
+};
+
+/**
+ * The free email signature generator (src/components/site/signature-generator.tsx): built in the
+ * visitor's browser, never sent anywhere. Beside it, what the team product does — the upsell.
+ */
+export type SignatureGeneratorProps = {
+  anchor?: string;
+  heading?: string;
+  intro?: string;
+  upsellHeading: string;
+  upsellBody?: string;
+  upsellAction?: SiteAction;
+  privacyNote?: string;
+};
+
+/**
+ * A product beside Deskzo One, on the product's page (src/components/site/blocks/product-vs-suite-view.tsx):
+ * the two side by side with their prices for the visitor's country, monthly or yearly, each with its own
+ * trial, then every module compared. Only the words around it are written; the rest is products.ts's.
+ */
+export type ProductVsSuiteProps = {
+  anchor?: string;
+  /** The product this page sells — any but Deskzo One. */
+  product: ProductKey;
+  eyebrow?: string;
+  heading: string;
+  intro?: string;
+  /** Before the "Book a demo of …" link under the cards. */
+  demoNote?: string;
+};
+
+/**
+ * Every product, by its icon (src/components/site/blocks/product-strip.tsx; owner, 24 Oct 2026) — each its
+ * 3D icon, name and line, linking to its page. Only the words around it are written: the products, their
+ * order and their icons are src/lib/products.ts's and src/lib/brand/product-icons.ts's, so a product added
+ * there is in the strip without an edit.
+ */
+export type ProductStripProps = {
+  anchor?: string;
+  eyebrow?: string;
+  heading: string;
+  intro?: string;
+  /** Under the strip: "Compare every product". */
+  action?: SiteAction;
+};
+
+/**
+ * A module's guide in the Help Center (/help/<slug>, src/lib/help/guides.ts): one per module in
+ * src/lib/modules.ts, every one on the same outline, in this order — what it is for, who can use it,
+ * setting it up, everyday tasks step by step, each setting explained, questions and troubleshooting —
+ * and then which products include it, which is never written here: the block reads it from
+ * src/lib/products.ts and src/lib/modules.ts, so a product's name is never typed into a guide.
+ *
+ * The section headings are the block's own, so every guide reads the same way. The block's heading is
+ * the page's h1; a guide page has this block and no other top-of-page block.
+ */
+export type HelpGuideProps = {
+  /** The module it is for — a key in src/lib/modules.ts. One guide per module. */
+  module: string;
+  /** The page's h1: "Leads". */
+  heading: string;
+  /** One or two sentences under the heading — also the guide's line in the Help Center and in the app's Help panel. */
+  summary: string;
+  /** What the module is for. */
+  purpose: RichNode[];
+  /** Who can use it, in plain words. */
+  access: RichNode[];
+  /** The permissions that open or limit it (src/lib/permissions.ts keys), each in plain words. The block shows each one's name as the permission screen does. */
+  permissions: { key: string; text: string }[];
+  /** Setting it up: what is done once, and by whom. */
+  setup: RichNode[];
+  /** Everyday tasks, step by step. */
+  tasks: { title: string; anchor?: string; body: RichNode[] }[];
+  /** Each setting explained: its name, where it is ("Settings › Leads"), and what it changes. */
+  settings: { name: string; where?: string; body: RichNode[] }[];
+  /** Questions and troubleshooting. */
+  faq: { question: string; answer: RichNode[] }[];
+  /** Guides to read next, by module key. */
+  related?: string[];
+};
+
+/**
+ * The Help Center's index (/help): every published guide, grouped by the product that includes its
+ * module (src/lib/products.ts), with a search box. The guides are read from the site's published pages;
+ * only the words around them are written here.
+ */
+export type HelpIndexProps = {
+  anchor?: string;
+  /** In the search box. */
+  searchLabel: string;
+  /** Above the modules every product comes with. */
+  everyProductHeading: string;
+  /** Shown while no guide is published yet. */
+  emptyText: string;
+};
+
+export type BlockPropsMap = {
+  hero: HeroProps;
+  pageHeader: PageHeaderProps;
+  featureGrid: FeatureGridProps;
+  moduleGrid: ModuleGridProps;
+  richText: RichTextProps;
+  imageText: ImageTextProps;
+  stats: StatsProps;
+  faq: FaqProps;
+  cta: CtaProps;
+  pricingTable: PricingTableProps;
+  securityHighlights: SecurityHighlightsProps;
+  contactForm: ContactFormProps;
+  logoCloud: LogoCloudProps;
+  testimonial: TestimonialProps;
+  productPreviews: ProductPreviewsProps;
+  workspaceSignin: WorkspaceSigninProps;
+  signupForm: SignupFormProps;
+  comparisonTable: ComparisonTableProps;
+  stackSavings: StackSavingsProps;
+  relatedLinks: RelatedLinksProps;
+  moduleHighlights: ModuleHighlightsProps;
+  signatureGenerator: SignatureGeneratorProps;
+  productVsSuite: ProductVsSuiteProps;
+  helpGuide: HelpGuideProps;
+  helpIndex: HelpIndexProps;
+  productStrip: ProductStripProps;
+  trustStrip: TrustStripProps;
+  contactOptions: ContactOptionsProps;
+  workflow: WorkflowProps;
+  aiShowcase: AiShowcaseProps;
+  aiTeam: AiTeamProps;
+  liveDemo: LiveDemoProps;
+  aiTeamDemo: AiTeamDemoProps;
+};
+
+export type BlockType = keyof BlockPropsMap;
+
+/** Every block type, for the CMS's "add a block" menu. */
+export const BLOCK_TYPES = [
+  "hero",
+  "pageHeader",
+  "featureGrid",
+  "moduleGrid",
+  "richText",
+  "imageText",
+  "stats",
+  "faq",
+  "cta",
+  "pricingTable",
+  "securityHighlights",
+  "contactForm",
+  "logoCloud",
+  "testimonial",
+  "productPreviews",
+  "workspaceSignin",
+  "signupForm",
+  "comparisonTable",
+  "stackSavings",
+  "relatedLinks",
+  "moduleHighlights",
+  "signatureGenerator",
+  "productVsSuite",
+  "helpGuide",
+  "helpIndex",
+  "productStrip",
+  "trustStrip",
+  "contactOptions",
+  "workflow",
+  "aiShowcase",
+  "aiTeam",
+  "liveDemo",
+  "aiTeamDemo",
+] as const satisfies readonly BlockType[];
+// Every block type is in the list: this fails to compile if one is added to BlockPropsMap and not here.
+type Assert<T extends true> = T;
+export type EveryBlockTypeListed = Assert<[Exclude<BlockType, (typeof BLOCK_TYPES)[number]>] extends [never] ? true : false>;
+
+/** One block on a page. `id` is stable across edits (the CMS's key for it). */
+export type SiteBlock = { [K in BlockType]: { id: string; type: K; props: BlockPropsMap[K] } }[BlockType];
+
+// ─── Pages ───────────────────────────────────────────────────────────────────────────────────────
+
+export type SiteSeo = {
+  /** Put into the site's title template ("%s · {siteName}") unless `absoluteTitle`. */
+  title: string;
+  absoluteTitle?: boolean;
+  description: string;
+  ogTitle?: string;
+  ogDescription?: string;
+  ogImage?: Href;
+  /** Kept out of search engines (the signup page). */
+  noindex?: boolean;
+  /** Left out of /llms.txt (src/lib/seo/llms.ts); a noindex page is left out anyway. */
+  noLlms?: boolean;
+  /**
+   * The page's primary keywords, keyword 1 first (at most three; trimmed, no repeats): for the SEO
+   * Intelligence engine's placement checks and `<meta name="keywords">`. Absent when there are none —
+   * as in every page saved before they existed.
+   */
+  keywords?: string[];
+};
+
+/**
+ * A page. `slug` is its address: "home" is "/", anything else "/<slug>" (lower-case words and
+ * hyphens, "/" between levels). `title` is its name in the CMS and in lists; `seo.title` is what a
+ * browser tab and a search result show.
+ */
+export type SitePage = { slug: string; title: string; seo: SiteSeo; blocks: SiteBlock[] };
+
+// ─── Site-wide settings ──────────────────────────────────────────────────────────────────────────
+
+export type SocialNetwork = "linkedin" | "x" | "youtube" | "facebook" | "instagram" | "github" | "other";
+
+/** A link in a header menu's column: its words, where it goes, and a line on what is there. */
+export type NavMenuItem = { label: string; href: Href; description?: string };
+
+/**
+ * A header item that opens a panel of links (a "mega-menu"): columns, each a title and its links,
+ * and optionally one link along the panel's foot ("See every feature"). Told apart from a plain
+ * link by its `columns`.
+ */
+export type NavMenu = { label: string; columns: { title: string; items: NavMenuItem[] }[]; footer?: SiteLink };
+
+/** One item across the header: a link, or a menu. Settings saved before menus existed hold links only — still valid. */
+export type NavItem = SiteLink | NavMenu;
+
+/** The header's and footer's limits, which the CMS's validator and editor hold too. */
+export const NAV_LIMITS = { items: 8, columns: 5, columnItems: 10, description: 80, footerColumns: 6, footerLinks: 10 } as const;
+
+export type SiteSettings = {
+  siteName: string;
+  tagline: string;
+  /** The domain as the site writes it in text ("yourcompany.{displayDomain}"). Links use PLATFORM_DOMAIN. */
+  displayDomain: string;
+  /** Shown on the site. Contact requests are mailed to PLATFORM_SALES_EMAIL, not here. */
+  salesEmail: string;
+  /**
+   * Who answers for personal data (owner, 23 Oct 2026): the grievance officer the DPDP Act asks a Data
+   * Fiduciary to publish — in the privacy notice ({privacyOfficer}, {privacyEmail}) and the footer. A
+   * privacy request (src/lib/platform/privacy-requests.ts) is copied to this address. Empty until set.
+   */
+  privacy: { officer: string; email: string; phone: string; address: string };
+  /**
+   * The chat bubble on every page (owner, 24 Oct 2026): a workspace's Customer inbox, by the workspace's
+   * name and its website channel's key (src/lib/platform/site-chat.ts). Both empty: no chat.
+   */
+  chat: { workspace: string; key: string };
+  /**
+   * Demo booking (owner, 18 Nov 2026): a workspace's booking page — Deskzo's own — opened over the site by its "Book a
+   * demo" links (src/lib/platform/site-booking.ts). Both empty: those links go to the contact page.
+   */
+  booking: { workspace: string; page: string };
+  nav: NavItem[];
+  signinLink: SiteLink;
+  signupCta: { open: SiteLink; inviteOnly: SiteLink };
+  footer: { columns: { title: string; links: SiteLink[] }[]; note?: string };
+  social: { network: SocialNetwork; href: Href; label?: string }[];
+  seo: { titleTemplate: string; defaultTitle: string; description: string; ogImage?: Href };
+  /** The page for an address the site does not have. */
+  notFound: { heading: string; body: string; links: SiteLink[] };
+};
+
+// ─── Rendering ───────────────────────────────────────────────────────────────────────────────────
+
+/** What a block is rendered with besides its props — worked out per request, never stored. */
+export type SiteRenderContext = {
+  settings: SiteSettings;
+  /** Anybody may sign up (src/lib/platform/settings.ts signupOpen). */
+  signupOpen: boolean;
+  trialDays: number;
+  /** The address's query, for the blocks that read one: pricingTable (country, interval), contactForm (topic). */
+  searchParams: Record<string, string | undefined>;
+  /** ".<PLATFORM_DOMAIN>[:port]" — what follows a workspace's name in its address. */
+  workspaceSuffix: string;
+  /**
+   * Pages of the site switched off for now — the partner programme's, by its settings. Links to them
+   * are left out of the header, footer and link blocks rather than sent to the not-found page.
+   */
+  hiddenPaths?: readonly string[];
+};

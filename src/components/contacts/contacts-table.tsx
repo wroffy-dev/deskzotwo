@@ -1,0 +1,255 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { ScheduleMeetingButton } from "@/components/calendar/schedule-meeting-button";
+import { CompanyLink } from "@/components/companies/company-link";
+import { useRouter } from "next/navigation";
+import { MailCheck, MessageCircle } from "lucide-react";
+import type { ContactDesignation, CompanyRelationshipType } from "@prisma/client";
+import { bulkUpdateContacts } from "@/actions/contact";
+import { verifyContactEmails } from "@/actions/email-verification";
+import { contactRoleLabel, relationshipTypeLabels } from "@/lib/validation/company";
+import { DesignationInput } from "@/components/contacts/designation-input";
+import { LinkedInMark } from "@/components/companies/company-links";
+import { Badge, Card } from "@/components/ui/card";
+import { CallButton } from "@/components/calls/call-button";
+import { Button } from "@/components/ui/button";
+import { BulkBar, Checkbox, useRowSelection } from "@/components/ui/bulk-select";
+import { EmailAddress, type VerifiableContact } from "@/components/contacts/email-address";
+import { OutboundLink, externalHref, whatsappHref } from "@/components/ui/outbound-link";
+import { ContactReveal, contactWhatsappHref } from "@/components/contacts/contact-reveal";
+import { CustomFieldBodyCells, CustomFieldHeaderCells, type CustomColumn } from "@/components/custom-fields/custom-field-cells";
+import { companyPath } from "@/lib/record-links";
+import { useWording } from "@/components/terms/wording-provider";
+import { slot } from "@/lib/terms/dictionary";
+import { confirmAction } from "@/components/ui/confirm";
+
+type ContactRow = VerifiableContact & {
+  name: string;
+  designation: ContactDesignation;
+  /** From the workspace's list (src/lib/contacts/designations.ts); none for a record made before it. */
+  designationName?: string | null;
+  phone: string | null;
+  linkedinUrl?: string | null;
+  isPrimary: boolean;
+  /** Field access hid something of it from this person, and "Show" may reveal it (src/lib/contacts/masking.ts). */
+  revealable?: boolean;
+  /** When they left their company, for those who have (src/lib/contacts/left.ts). */
+  leftAt?: Date | string | null;
+  company: {
+    id: string;
+    companySeq: number;
+    name: string;
+    relationshipType: CompanyRelationshipType;
+    industry: { id: string; name: string } | null;
+  };
+};
+
+export function ContactsTable({
+  contacts,
+  customColumns = { columns: [], texts: {} },
+  canMeet = false,
+}: {
+  contacts: ContactRow[];
+  /** Calendar is on: a meeting can be scheduled with somebody who has an address. */
+  canMeet?: boolean;
+  /** The workspace's own fields marked "a column in the list" (src/lib/custom-fields/server.ts `listColumns`, `listedOnly`): no column picker here. */
+  customColumns?: { columns: CustomColumn[]; texts: Record<string, Record<string, string>> };
+}) {
+  const router = useRouter();
+  const w = useWording();
+  const selection = useRowSelection(contacts);
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [designationName, setDesignationName] = useState("");
+
+  function run(action: "update" | "delete") {
+    setError(null);
+    setNotice(null);
+    startTransition(async () => {
+      const result = await bulkUpdateContacts({ contactIds: selection.ids, designationName, action });
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      const { count, skipped } = result.data;
+      setNotice(
+        action === "delete"
+          ? `Deleted ${count} contact(s).${skipped > 0 ? ` ${skipped} kept — they're linked to a lead.` : ""}`
+          : `Updated ${count} contact(s).`,
+      );
+      setDesignationName("");
+      selection.clear();
+      router.refresh();
+    });
+  }
+
+  /**
+   * Checks every selected address. The selection is kept afterwards rather than cleared: the point
+   * of running it is to look at what came back, and losing the rows would defeat that.
+   */
+  function verifySelected() {
+    setError(null);
+    setNotice(null);
+    startTransition(async () => {
+      const result = await verifyContactEmails(selection.ids);
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      const { checked, skipped, results } = result.data;
+      const bad = results.filter((r) => r.status === "INVALID").length;
+      const risky = results.filter((r) => r.status === "RISKY").length;
+      setNotice(
+        `Checked ${checked}.` +
+          (bad > 0 ? ` ${bad} won't deliver.` : "") +
+          (risky > 0 ? ` ${risky} reach a shared or personal inbox.` : "") +
+          (skipped > 0 ? ` ${skipped} had no address.` : ""),
+      );
+      router.refresh();
+    });
+  }
+
+  return (
+    <div>
+      <BulkBar count={selection.count} onClear={selection.clear} error={error} notice={notice}>
+        {/* No caption in the bulk bar — the name rides on the control. */}
+        <div className="w-56">
+          <DesignationInput
+            value={designationName}
+            onChange={(e) => setDesignationName(e.target.value)}
+            aria-label="Designation to give them"
+            placeholder="Designation to give them"
+            className="h-9"
+          />
+        </div>
+        <Button size="sm" disabled={!designationName.trim() || isPending} onClick={() => run("update")}>
+          {isPending ? "Applying…" : "Apply"}
+        </Button>
+        <Button size="sm" variant="secondary" disabled={isPending} onClick={verifySelected}>
+          <MailCheck className="mr-1.5 h-3.5 w-3.5" />
+          Verify emails
+        </Button>
+        <Button
+          size="sm"
+          variant="danger"
+          disabled={isPending}
+          onClick={async () => {
+            if (await confirmAction(`Delete ${selection.count} contact(s)? This can't be undone.`)) run("delete");
+          }}
+        >
+          Delete
+        </Button>
+      </BulkBar>
+
+      <Card>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="border-b border-line bg-surface-sunken text-left text-xs uppercase tracking-wide text-muted">
+              <tr>
+                <th className="w-10 px-4 py-2.5">
+                  <Checkbox
+                    checked={selection.allSelected}
+                    onChange={selection.toggleAll}
+                    aria-label={slot(w, "Select all contacts on this page", "contact", "Select all {many:lower} on this page")}
+                  />
+                </th>
+                <th className="px-4 py-2.5">Name</th>
+                <th className="px-4 py-2.5">Designation</th>
+                <th className="px-4 py-2.5">{slot(w, "Company", "company", "{one}")}</th>
+                <th className="px-4 py-2.5">Relationship</th>
+                <th className="px-4 py-2.5">Email</th>
+                <th className="px-4 py-2.5">Phone</th>
+                <CustomFieldHeaderCells columns={customColumns.columns} className="px-4 py-2.5" />
+                <th className="px-4 py-2.5">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {contacts.map((c) => (
+                <tr key={c.id} className="border-b border-line last:border-0 hover:bg-surface-sunken">
+                  <td className="px-4 py-2.5">
+                    <Checkbox
+                      checked={selection.isSelected(c.id)}
+                      onChange={() => selection.toggle(c.id)}
+                      aria-label={`Select ${c.name}`}
+                    />
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <span className="font-medium text-text">{c.name}</span>
+                    {c.isPrimary && (
+                      <Badge tone="blue" className="ml-2">
+                        Primary
+                      </Badge>
+                    )}
+                    {c.leftAt && <Badge className="ml-2">Left</Badge>}
+                    {/* Masked for this person (src/lib/contacts/masking.ts): reveal it for the day. */}
+                    {c.revealable && (
+                      <span className="ml-1.5">
+                        <ContactReveal contactId={c.id} name={c.name} />
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-muted">{contactRoleLabel(c.designationName, c.designation) ?? "—"}</td>
+                  <td className="px-4 py-2.5">
+                    <CompanyLink href={`${companyPath(c.company.companySeq)}?tab=contacts`} className="text-text hover:underline">
+                      {c.company.name}
+                    </CompanyLink>
+                    {c.company.industry && <div className="text-xs text-subtle">{c.company.industry.name}</div>}
+                  </td>
+                  <td className="px-4 py-2.5 text-muted">{relationshipTypeLabels[c.company.relationshipType]}</td>
+                  <td className="px-4 py-2.5 text-muted">
+                    <EmailAddress contact={c} className="max-w-[16rem]" />
+                  </td>
+                  <td className={`px-4 py-2.5 text-muted${c.masked?.phone ? " font-mono text-xs" : ""}`}>{c.phone ?? "—"}</td>
+                  <CustomFieldBodyCells columns={customColumns.columns} texts={customColumns.texts[c.id]} className="px-4 py-2.5 text-muted" />
+                  <td className="px-4 py-2.5">
+                    <div className="flex items-center gap-3">
+                      {c.phone && (
+                        <CallButton
+                          companyId={c.company.id}
+                          companyName={c.company.name}
+                          contact={{ id: c.id, name: c.name, phone: c.phone }}
+                          size="icon"
+                          variant="ghost"
+                        />
+                      )}
+                      {canMeet && c.email && <ScheduleMeetingButton record={{ kind: "contact", id: c.id }} size="icon" variant="ghost" label={`Schedule a meeting with ${c.name}`} />}
+                      {c.phone && (
+                        <OutboundLink
+                          href={contactWhatsappHref(c) ?? whatsappHref(c.phone)}
+                          title={`WhatsApp ${c.name} (opens in a new tab)`}
+                          aria-label={`WhatsApp ${c.name}, opens in a new tab`}
+                          className="text-success hover:text-success"
+                        >
+                          <MessageCircle className="h-4 w-4" aria-hidden />
+                        </OutboundLink>
+                      )}
+                      {externalHref(c.linkedinUrl) && (
+                        <OutboundLink
+                          href={externalHref(c.linkedinUrl)!}
+                          title={`${c.name} on LinkedIn (opens in a new tab)`}
+                          aria-label={`${c.name} on LinkedIn, opens in a new tab`}
+                          className="text-subtle hover:text-brand"
+                        >
+                          <LinkedInMark />
+                        </OutboundLink>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {contacts.length === 0 && (
+                <tr>
+                  <td colSpan={8 + customColumns.columns.length} className="px-4 py-8 text-center text-subtle">
+                    {slot(w, "No contacts match this filter.", "contact", "No {many:lower} match this filter.")}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}

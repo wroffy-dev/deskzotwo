@@ -1,0 +1,349 @@
+/**
+ * Puts a staged dump back, in a process that outlives the request which asked for it.
+ *
+ *   npx tsx scripts/restore-worker.ts <staging-id>
+ *
+ * Not meant to be run by hand — `npm run db:restore` is the command for that, and it is the better
+ * one because it talks to you. This is what the Restore button spawns.
+ *
+ * ## Why this is a separate process at all
+ *
+ * A restore drops the schema out from under the connection pool the web process is holding. If the
+ * request that started it did the work itself, it would be executing `DROP SCHEMA` on a database it
+ * is simultaneously reading its own session from, and the response would never arrive: the socket
+ * dies with the tables. So the request stages the file, takes the lock, spawns this, and answers
+ * immediately. This one is detached, so killing the web process does not kill the restore, and the
+ * restore finishing does not depend on anybody keeping a browser tab open.
+ *
+ * ## Everything it knows is on disk
+ *
+ * There is no progress row in the database, because the database is the thing being replaced. The
+ * status file in `backups/.restore/` is the only record while this runs, and the lock beside it is
+ * what holds `src/proxy.ts` at a maintenance page meanwhile.
+ *
+ * ## The passphrase is not here
+ *
+ * By the time this starts, the archive has already been opened: the request verified the passphrase
+ * and wrote out a plain dump. That is deliberate. A passphrase passed on a command line is visible
+ * in `ps` to every user on the box, and one passed in the environment is readable from
+ * `/proc/<pid>/environ`. This process never has it and cannot leak it.
+ *
+ * ## Which workspace
+ *
+ * DESKZO_TENANT_ID, set by the route that spawns it, and nothing else: the worker never falls back
+ * to "the" database. Everything it does — the status file, the database it clears and rebuilds, the
+ * migrations after, the keys it installs — is that workspace's. After the data is back, the schema
+ * is brought up to this version (`prisma migrate deploy`), because a backup from before the last
+ * upgrade restores the tables as they were then.
+ */
+import "dotenv/config";
+import { open, readFile, rm, stat } from "node:fs/promises";
+import path from "node:path";
+import { parseDatabaseUrl } from "../src/lib/backup/policy";
+import { controlDb } from "../src/lib/platform/control-db";
+import { forgetRegistry, tenantById } from "../src/lib/tenancy/registry";
+import { runAsTenant } from "../src/lib/tenancy/resolve";
+import { installLogLabels } from "../src/lib/tenancy/log-labels";
+
+installLogLabels();
+import type { Tenant } from "../src/lib/tenancy/state";
+import { resolveDumpTool } from "../src/lib/backup/run";
+import { migrateDeploy, runRestore, stageForTool } from "../src/lib/backup/restore-tool";
+import { afterRestoreChores, clearOwnReferenceCopy, clearSchema, endEverySignIn, restoreDumpFile } from "../src/lib/backup/restore-steps";
+import {
+  clearStaged,
+  readRestoreStatus,
+  releaseLock,
+  stagingPath,
+  writeRestoreStatus,
+  type RestorePhase,
+  type RestoreStatus,
+} from "../src/lib/backup/maintenance";
+import { db } from "../src/lib/db";
+import { runBackup } from "../src/lib/backup/run";
+import { backupRoot } from "../src/lib/backup/maintenance";
+import { relistBackups } from "../src/lib/backup/relist";
+import { openBackupFileTo } from "../src/lib/backup/at-rest";
+
+/** How long the copy taken before a restore is kept, whatever the retention says. */
+const SAFETY_COPY_DAYS = 30;
+
+async function main(tenant: Tenant, id: string) {
+  const existing = await readRestoreStatus();
+  const dumpPath = await stagingPath(id, ".dump");
+  // Read now: clearing the staging area after the restore removes it.
+  const stagedKeys = await readFile(await stagingPath(id, ".keys"), "utf8").catch(() => null);
+
+  const status: RestoreStatus = {
+    id,
+    phase: "opening",
+    message: "Checking the staged backup…",
+    startedAt: existing?.id === id ? existing.startedAt : new Date().toISOString(),
+    finishedAt: null,
+    archiveName: existing?.id === id ? existing.archiveName : null,
+    takenAt: existing?.id === id ? existing.takenAt : null,
+    secretHandoffPath: existing?.id === id ? existing.secretHandoffPath : null,
+    keysFromBackup: false,
+    requestedById: existing?.id === id ? (existing.requestedById ?? null) : null,
+    safetyCopy: null,
+    rolledBack: false,
+    error: null,
+  };
+
+  const say = async (phase: RestorePhase, message: string) => {
+    status.phase = phase;
+    status.message = message;
+    await writeRestoreStatus(status);
+  };
+
+  const fail = async (error: string) => {
+    status.phase = "failed";
+    status.message = "The restore did not complete.";
+    status.error = error;
+    status.finishedAt = new Date().toISOString();
+    await writeRestoreStatus(status);
+    await releaseLock();
+    process.exit(1);
+  };
+
+  await say("opening", "Checking the staged backup…");
+
+  const info = await stat(dumpPath).catch(() => null);
+  if (!info?.isFile()) {
+    await fail("The staged backup is no longer on disk. Nothing has been changed.");
+    return;
+  }
+
+  /**
+   * The magic bytes, one last time.
+   *
+   * Already checked when the archive was opened, and checked again here because this is the last
+   * moment at which stopping is free. Everything after the drop is a database that has to be
+   * rebuilt from something, and "something" had better be a pg_dump.
+   */
+  const head = Buffer.alloc(5);
+  const handle = await open(dumpPath, "r");
+  try {
+    await handle.read(head, 0, 5, 0);
+  } finally {
+    await handle.close();
+  }
+  if (head.toString("latin1") !== "PGDMP") {
+    await fail("The staged file is not a pg_dump archive. Nothing has been changed.");
+    return;
+  }
+
+  const connection = parseDatabaseUrl(tenant.dbUrl);
+  if (!connection) {
+    await fail("This workspace's database address is not a Postgres URL. Nothing has been changed.");
+    return;
+  }
+
+  const tool = await resolveDumpTool("pg_restore");
+  if (!tool) {
+    await fail("pg_restore could not be found. Install the Postgres client tools or set PG_DUMP_PATH. Nothing has been changed.");
+    return;
+  }
+
+  /**
+   * Everything needed to rebuild is in place before anything is destroyed.
+   *
+   * `db:restore` learned this the hard way: it dropped the schema and then discovered it could not
+   * hand the archive to pg_restore, which left an empty database and a stack trace. Staging through
+   * a container is the only step that can fail for a reason unrelated to the data, so it happens on
+   * this side of the drop.
+   */
+  let staged: { pathForTool: string; cleanup: () => Promise<void> };
+  try {
+    staged = await stageForTool(tool, dumpPath);
+  } catch (err) {
+    await fail(`The archive could not be handed to pg_restore: ${(err as Error).message}. Nothing has been changed.`);
+    return;
+  }
+
+  /**
+   * The safety copy (owner, 22 Oct 2026): the workspace as it is now, taken before anything is cleared —
+   * the application is already behind the maintenance page, so nothing changes under it. Without it a
+   * restore that failed half way left an empty workspace, and one that finished could not be undone.
+   * Kept 30 days whatever the retention says. No copy, no restore.
+   */
+  await say("saving", "Taking a safety copy of the workspace as it is now…");
+  const safety = await runBackup({
+    kind: "FULL",
+    triggeredById: status.requestedById ?? null,
+    reason: `Before restoring ${status.archiveName ?? "a backup"}`,
+    keepUntil: new Date(Date.now() + SAFETY_COPY_DAYS * 86_400_000),
+  });
+  if (!safety.ok) {
+    await staged.cleanup();
+    await fail(`A safety copy of the workspace couldn't be taken, so nothing was restored and nothing has been changed: ${safety.error}`);
+    return;
+  }
+  status.safetyCopy = safety.filename;
+  const safetyPath = path.join(await backupRoot(), safety.filename);
+
+  /**
+   * After the drop, any failure puts the workspace back from the safety copy rather than leaving it empty
+   * or half restored. Only when that fails too does the workspace stay as the failure left it — and the
+   * message names the copy to restore by hand.
+   */
+  const rollBack = async (why: string) => {
+    await say("rolling-back", "The restore failed — putting the workspace back as it was…");
+    try {
+      try {
+        await clearSchema(db);
+      } finally {
+        await db.$disconnect().catch(() => {});
+      }
+      // The copy is encrypted at rest (src/lib/backup/at-rest.ts): opened beside the staged backup first.
+      const opened = await stagingPath(id, ".safety.dump");
+      await openBackupFileTo(tenant.id, safetyPath, opened);
+      try {
+        await restoreDumpFile(tool, opened, connection);
+      } finally {
+        await rm(opened, { force: true }).catch(() => {});
+      }
+      await relistBackups(await backupRoot()).catch(() => null);
+      status.rolledBack = true;
+      await fail(`${why}\nNothing was lost: the workspace was put back as it was just before the restore started, from the safety copy ${safety.filename}.`);
+    } catch (err) {
+      await fail(
+        `${why}\nPutting the workspace back from the safety copy failed too: ${(err as Error).message}. Restore ${safety.filename} from Settings › Backups (or npm run db:restore) before using the workspace.`,
+      );
+    }
+  };
+
+  await say("dropping", "Clearing the current database…");
+
+  /**
+   * Other connections are closed first, then the schema dropped and made again (src/lib/backup/restore-steps.ts
+   * `clearSchema`). The maintenance lock means no new work is arriving, so the web process's pool is disposable;
+   * Prisma reopens what it needs on the next query.
+   */
+  try {
+    await clearSchema(db);
+  } catch (err) {
+    await staged.cleanup();
+    await fail(
+      `The current schema could not be cleared: ${(err as Error).message}. The database may be in a partial state — restore again, or use npm run db:restore.`,
+    );
+    return;
+  } finally {
+    await db.$disconnect().catch(() => {});
+  }
+
+  await say("restoring", `Rebuilding from the backup via ${tool.via}…`);
+
+  try {
+    await runRestore(tool, staged.pathForTool, connection);
+  } catch (err) {
+    await staged.cleanup();
+    await rollBack((err as Error).message);
+    return;
+  } finally {
+    await staged.cleanup();
+  }
+
+  // The plain dump goes as soon as it is no longer needed. It is an unsealed copy of the whole
+  // business, and the archive it came from was encrypted precisely so one would not be lying about.
+  await clearStaged(id);
+
+  // A backup from before the shared reference database: its own copy emptied (restore-steps.ts `clearOwnReferenceCopy`).
+  try {
+    await clearOwnReferenceCopy(db);
+  } catch (err) {
+    await rollBack(`The backup was restored, but its own copy of the reference data could not be cleared: ${(err as Error).message}`);
+    return;
+  }
+
+  await say("restoring", "Bringing the database up to this version…");
+  try {
+    await migrateDeploy(tenant.dbUrl);
+  } catch (err) {
+    await rollBack(`The backup was restored, but its schema could not be brought up to this version: ${(err as Error).message.split("\n").slice(-3).join(" ")}`);
+    return;
+  }
+
+  // Every sign-in the backup carried ends (restore-steps.ts `endEverySignIn`): everybody signs in again.
+  try {
+    await endEverySignIn(db);
+  } catch (err) {
+    await rollBack(`The backup was restored, but the sessions it carried could not be ended: ${(err as Error).message}`);
+    return;
+  }
+
+  /**
+   * The backup's own keys, when it was taken under different ones (staged by the restore route,
+   * sealed for this workspace). Installed only now that the data they open is back: installed
+   * earlier, a failed restore would leave the old data under keys that do not open it.
+   */
+  if (stagedKeys && tenant.source === "control") {
+    await controlDb().$transaction(async (tx) => {
+      await tx.tenant.update({ where: { id: tenant.id }, data: { keyBundleCipher: stagedKeys.trim() } });
+      await tx.platformAuditLog.create({
+        data: { actorKind: "SYSTEM", actor: "restore-worker", action: "tenant.keys.from-backup", tenantId: tenant.id, detail: { restoreId: id } },
+      });
+    });
+    forgetRegistry();
+    status.keysFromBackup = true;
+  }
+
+  /**
+   * What lives beside the database, brought in line with what came back (src/lib/backup/restore-steps.ts
+   * `afterRestoreChores`): the backup list, the "Find my workspaces" index, the terminals' routes, Automate's held runs,
+   * the seat count. Reference data is not in a workspace's database or its backups any more (prisma/reference), so a
+   * restore neither rewinds nor reloads it. None of these is worth failing a finished restore over.
+   */
+  await say("restoring", "Bringing the backup list and sign-in records in line…");
+  await afterRestoreChores();
+
+  status.phase = "done";
+  status.message =
+    (status.secretHandoffPath
+      ? "Restored. The backup was taken under different keys — see the file named below before trusting the vault."
+      : status.keysFromBackup
+        ? "Restored, with the keys the backup was taken under."
+        : "Restored.");
+  status.finishedAt = new Date().toISOString();
+  await writeRestoreStatus(status);
+  await releaseLock();
+  process.exit(0);
+}
+
+async function start() {
+  const id = process.argv[2];
+  if (!id || !/^[a-z0-9-]{6,64}$/i.test(id)) {
+    console.error("restore-worker: a staging id is required.");
+    process.exit(1);
+  }
+  const tenantId = process.env.DESKZO_TENANT_ID?.trim();
+  const tenant = tenantId ? await tenantById(tenantId) : null;
+  if (!tenant) {
+    console.error(tenantId ? `restore-worker: no workspace ${tenantId}.` : "restore-worker: DESKZO_TENANT_ID is required — the workspace to restore.");
+    process.exit(1);
+  }
+  await runAsTenant(tenant, async () => {
+    try {
+      await main(tenant, id);
+    } catch (err) {
+      console.error(err);
+      try {
+        const status = await readRestoreStatus();
+        if (status) {
+          await writeRestoreStatus({
+            ...status,
+            phase: "failed",
+            message: "The restore did not complete.",
+            error: String((err as Error).message ?? err),
+            finishedAt: new Date().toISOString(),
+          });
+        }
+      } finally {
+        await releaseLock();
+      }
+      process.exit(1);
+    }
+  });
+}
+
+void start();
